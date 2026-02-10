@@ -100,7 +100,10 @@ def train(cfg: TrainConfig):
     tokens_per_step = cfg.batch_size * (max_seq_len - 1)
     total_steps = cfg.num_tokens // tokens_per_step
     warmup_steps = cfg.warmup_tokens // tokens_per_step
+    ckpt_every = total_steps // cfg.num_checkpoints if cfg.num_checkpoints > 0 else 0
     print(f"Token budget: {cfg.num_tokens:,} tokens -> {total_steps:,} steps ({tokens_per_step} tok/step)", flush=True)
+    if ckpt_every > 0:
+        print(f"Checkpointing every {ckpt_every} steps ({cfg.num_checkpoints} checkpoints)", flush=True)
 
     # Model config
     model_cfg = TransformerConfig(
@@ -122,17 +125,35 @@ def train(cfg: TrainConfig):
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
     ckpt_mgr = ocp.CheckpointManager(
         os.path.abspath(cfg.ckpt_dir),
-        options=ocp.CheckpointManagerOptions(max_to_keep=3),
+        options=ocp.CheckpointManagerOptions(max_to_keep=None),
     )
 
     # Resume from checkpoint if a flag is set *and* a checkpoint exists
     start_step = 0
+    schedule_meta_path = os.path.join(cfg.ckpt_dir, "schedule_meta.json")
     if ckpt_mgr.latest_step() is not None and cfg.resume:
+        # Restore original schedule parameters so the LR curve is unchanged
+        import json
+        if os.path.exists(schedule_meta_path):
+            with open(schedule_meta_path) as f:
+                meta = json.load(f)
+            orig_total_steps = meta["total_steps"]
+            orig_warmup_steps = meta["warmup_steps"]
+            print(f"Restoring schedule from original run: {orig_total_steps} total, {orig_warmup_steps} warmup steps")
+            # Rebuild state with the original schedule before restoring weights
+            rng, reinit_rng = jax.random.split(rng)
+            state = create_train_state(reinit_rng, cfg, model_cfg, orig_total_steps, orig_warmup_steps)
         step = ckpt_mgr.latest_step()
         restored = ckpt_mgr.restore(step, args=ocp.args.StandardRestore(state))
         state = restored
         start_step = int(state.step) # type: ignore
         print(f"Resumed from checkpoint at step {start_step}")
+
+    # Save schedule metadata (so resume can reconstruct the same LR curve)
+    if not os.path.exists(schedule_meta_path):
+        import json
+        with open(schedule_meta_path, "w") as f:
+            json.dump({"total_steps": total_steps, "warmup_steps": warmup_steps}, f)
 
     # Logger
     logger = TrainLogger(log_path=cfg.log_path)
@@ -178,7 +199,7 @@ def train(cfg: TrainConfig):
             logger.save()
             tqdm.write(f"  step {step + 1:>6d} | val_loss {avg_val:.4f}")
 
-        if (step + 1) % cfg.ckpt_every == 0:
+        if ckpt_every > 0 and (step + 1) % ckpt_every == 0:
             ckpt_mgr.save(step + 1, args=ocp.args.StandardSave(state))
             ckpt_mgr.wait_until_finished()
             logger.log_checkpoint(step + 1)

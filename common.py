@@ -22,7 +22,7 @@ class TrainConfig:
     val_fraction: float = 0.05
     log_every: int = 50
     val_every: int = 500
-    ckpt_every: int = 5000
+    num_checkpoints: int = 10
     ckpt_dir: str = "checkpoints"
     log_path: str = "train_log.json"
     seed: int = 42
@@ -104,10 +104,10 @@ def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser()
     for name, fld in TrainConfig.__dataclass_fields__.items():
         t = fld.type
-        if t == "bool":
+        if t is bool or t == "bool":
             parser.add_argument(f"--{name}", action="store_true", default=fld.default)
         else:
-            type_map = {"str": str, "int": int, "float": float}
+            type_map = {"str": str, "int": int, "float": float, str: str, int: int, float: float}
             parser.add_argument(f"--{name}", type=type_map.get(t, type(fld.default)), default=fld.default)
     args = parser.parse_args()
     return TrainConfig(**vars(args))

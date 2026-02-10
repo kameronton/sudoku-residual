@@ -33,6 +33,27 @@ def make_schedule(optimizer, cfg: TrainConfig, total_steps: int, warmup_steps: i
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def _save_checkpoint(ckpt_dir, step, model, optimizer, scheduler,
+                     model_cfg, sched_total_steps, sched_warmup_steps):
+    """Save checkpoint as step_{N}.pt and update latest.pt symlink."""
+    data = {
+        "step": step,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "model_cfg": model_cfg,
+        "sched_total_steps": sched_total_steps,
+        "sched_warmup_steps": sched_warmup_steps,
+    }
+    step_path = os.path.join(ckpt_dir, f"step_{step}.pt")
+    torch.save(data, step_path)
+    # Update latest.pt symlink
+    latest_path = os.path.join(ckpt_dir, "latest.pt")
+    tmp_link = latest_path + ".tmp"
+    os.symlink(os.path.basename(step_path), tmp_link)
+    os.replace(tmp_link, latest_path)
+
+
 def train(cfg: TrainConfig):
     # Seed everything
     random.seed(cfg.seed)
@@ -60,7 +81,10 @@ def train(cfg: TrainConfig):
     tokens_per_step = cfg.batch_size * (max_seq_len - 1)
     total_steps = cfg.num_tokens // tokens_per_step
     warmup_steps = cfg.warmup_tokens // tokens_per_step
+    ckpt_every = total_steps // cfg.num_checkpoints if cfg.num_checkpoints > 0 else 0
     print(f"Token budget: {cfg.num_tokens:,} tokens -> {total_steps:,} steps ({tokens_per_step} tok/step)", flush=True)
+    if ckpt_every > 0:
+        print(f"Checkpointing every {ckpt_every} steps ({cfg.num_checkpoints} checkpoints)", flush=True)
 
     # Model
     model_cfg = TransformerConfig(
@@ -77,18 +101,27 @@ def train(cfg: TrainConfig):
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = make_schedule(optimizer, cfg, total_steps, warmup_steps)
 
-    # Resume
+    # Resume — restore original schedule parameters so the LR curve is unchanged
     start_step = 0
     ckpt_path = os.path.join(cfg.ckpt_dir, "latest.pt")
+    sched_total_steps = total_steps
+    sched_warmup_steps = warmup_steps
     if cfg.resume and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
         start_step = ckpt["step"]
+        if "sched_total_steps" in ckpt:
+            sched_total_steps = ckpt["sched_total_steps"]
+            sched_warmup_steps = ckpt["sched_warmup_steps"]
+            print(f"Restoring schedule from original run: {sched_total_steps} total, {sched_warmup_steps} warmup steps")
+        # Build scheduler with original params, then restore its state
+        scheduler = make_schedule(optimizer, cfg, sched_total_steps, sched_warmup_steps)
+        scheduler.load_state_dict(ckpt["scheduler"])
         print(f"Resumed from checkpoint at step {start_step}")
+    else:
+        scheduler = make_schedule(optimizer, cfg, sched_total_steps, sched_warmup_steps)
 
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
 
@@ -168,27 +201,17 @@ def train(cfg: TrainConfig):
             tqdm.write(f"  step {step + 1:>6d} | val_loss {avg_val:.4f}")
             model.train()
 
-        if (step + 1) % cfg.ckpt_every == 0:
-            torch.save({
-                "step": step + 1,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "model_cfg": model_cfg,
-            }, ckpt_path)
+        if ckpt_every > 0 and (step + 1) % ckpt_every == 0:
+            _save_checkpoint(cfg.ckpt_dir, step + 1, model, optimizer, scheduler,
+                             model_cfg, sched_total_steps, sched_warmup_steps)
             logger.log_checkpoint(step + 1)
             tqdm.write(f"  checkpoint saved at step {step + 1}")
 
     pbar.close()
 
     # Final checkpoint
-    torch.save({
-        "step": total_steps,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "model_cfg": model_cfg,
-    }, ckpt_path)
+    _save_checkpoint(cfg.ckpt_dir, total_steps, model, optimizer, scheduler,
+                     model_cfg, sched_total_steps, sched_warmup_steps)
 
     logger.save()
 

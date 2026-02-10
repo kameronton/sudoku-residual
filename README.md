@@ -35,7 +35,7 @@ uv run python -m torch_backend.training --traces_path traces_random.npz --batch_
 
 Training uses a token-based budget (`--num_tokens`) with a tqdm progress bar showing throughput and loss. Use `--resume` to continue from the latest checkpoint in `checkpoints/`.
 
-Key flags: `--num_tokens`, `--warmup_tokens`, `--lr`, `--val_every`, `--log_every`, `--ckpt_every`.
+Key flags: `--num_tokens`, `--warmup_tokens`, `--lr`, `--val_every`, `--log_every`, `--num_checkpoints`.
 
 ### 3. Evaluate
 
