@@ -188,12 +188,15 @@ def evaluate_puzzle(trace: list[tuple[int, int, int]], puzzle: str, solution: st
               f"Wrong(consistent): {wrong_consistent} | Inconsistent: {inconsistent} | "
               f"Clue overwrite: {overwrites_clue} | Fill overwrite: {overwrites_fill} | "
               f"Missing: {missing}")
-        errors = [d for d in details if d[3] != "CORRECT"]
-        if errors:
-            print("  Model output:")
-            print_grid(grid)
-            for r, c, d, kind in errors:
-                print(f"    ({r},{c})={d}: {kind} (solution={solution[r*9+c]})")
+        print("  Trace:")
+        for i, (r, c, d, kind) in enumerate(details):
+            expected = solution[r * 9 + c]
+            if kind == "CORRECT":
+                print(f"    {i+1:3d}. ({r},{c})={d}  CORRECT")
+            else:
+                print(f"    {i+1:3d}. ({r},{c})={d}  {kind} (expected={expected})")
+        print("  Model output:")
+        print_grid(grid)
 
     return {
         "n_empties": n_empties,
