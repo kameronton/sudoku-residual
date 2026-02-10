@@ -14,7 +14,7 @@ import optax
 import orbax.checkpoint as ocp
 from flax.training import train_state
 
-from data import SudokuDataset, PAD_TOKEN, collate_batch
+from data import SudokuDataset, PAD_TOKEN, SEP_TOKEN, collate_batch
 from transformer import GPT2Model, TransformerConfig
 
 
@@ -65,13 +65,17 @@ def train_step(state, batch, vocab_size):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
 
+    # Mask: only compute loss for tokens after <sep>, excluding pad
+    # <sep> appears in inputs; the target at that position is the first solve token
+    sep_pos = jnp.argmax(inputs == SEP_TOKEN, axis=1, keepdims=True)  # (B, 1)
+    positions = jnp.arange(targets.shape[1])[None, :]  # (1, T-1)
+    mask = ((positions >= sep_pos) & (targets != PAD_TOKEN)).astype(jnp.float32)
+
     def loss_fn(params):
         logits = state.apply_fn({"params": params}, inputs)
-        # Cross-entropy loss, masking pad tokens in targets
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         one_hot = jax.nn.one_hot(targets, vocab_size)
         per_token_loss = -jnp.sum(one_hot * log_probs, axis=-1)  # (B, T-1)
-        mask = (targets != PAD_TOKEN).astype(jnp.float32)
         loss = jnp.sum(per_token_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
         return loss
 
@@ -84,11 +88,13 @@ def train_step(state, batch, vocab_size):
 def eval_step(state, batch, vocab_size):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
+    sep_pos = jnp.argmax(inputs == SEP_TOKEN, axis=1, keepdims=True)
+    positions = jnp.arange(targets.shape[1])[None, :]
+    mask = ((positions >= sep_pos) & (targets != PAD_TOKEN)).astype(jnp.float32)
     logits = state.apply_fn({"params": state.params}, inputs)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     one_hot = jax.nn.one_hot(targets, vocab_size)
     per_token_loss = -jnp.sum(one_hot * log_probs, axis=-1)
-    mask = (targets != PAD_TOKEN).astype(jnp.float32)
     loss = jnp.sum(per_token_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
     return loss
 
