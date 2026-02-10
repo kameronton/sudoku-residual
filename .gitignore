@@ -11,3 +11,10 @@ wheels/
 
 # Checkpoints and logs
 checkpoints/
+logs/
+
+# Ignore the plot image files
+*.png
+
+# Ignore the dataset
+sudoku-3m.csv
