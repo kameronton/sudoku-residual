@@ -50,24 +50,32 @@ _PEERS = {s: set(sum(_UNITS[s], [])) - {s} for s in _SQUARES}
 _SQ_INDEX = {s: i for i, s in enumerate(_SQUARES)}
 
 
-def _parse_grid(puzzle: str) -> dict[str, str] | None:
+def _parse_grid(
+    puzzle: str, trace: list | None = None, clue_set: set | None = None,
+) -> dict[str, str] | None:
     values = {s: _COLS for s in _SQUARES}
     for s, d in zip(_SQUARES, puzzle):
         if d in _COLS:
-            if not _assign(values, s, d):
+            if not _assign(values, s, d, trace, clue_set):
                 return None
     return values
 
 
-def _assign(values: dict, s: str, d: str) -> dict | None:
+def _assign(
+    values: dict, s: str, d: str,
+    trace: list | None = None, clue_set: set | None = None,
+) -> dict | None:
     other = values[s].replace(d, "")
     for d2 in other:
-        if not _eliminate(values, s, d2):
+        if not _eliminate(values, s, d2, trace, clue_set):
             return None
     return values
 
 
-def _eliminate(values: dict, s: str, d: str) -> dict | None:
+def _eliminate(
+    values: dict, s: str, d: str,
+    trace: list | None = None, clue_set: set | None = None,
+) -> dict | None:
     if d not in values[s]:
         return values
     values[s] = values[s].replace(d, "")
@@ -75,38 +83,37 @@ def _eliminate(values: dict, s: str, d: str) -> dict | None:
         return None
     if len(values[s]) == 1:
         d2 = values[s]
+        # Record resolution in causal order
+        if trace is not None and clue_set is not None and s not in clue_set:
+            idx = _SQ_INDEX[s]
+            r, c = divmod(idx, 9)
+            trace.append((r, c, int(d2)))
         for s2 in _PEERS[s]:
-            if not _eliminate(values, s2, d2):
+            if not _eliminate(values, s2, d2, trace, clue_set):
                 return None
     for u in _UNITS[s]:
         dplaces = [sq for sq in u if d in values[sq]]
         if len(dplaces) == 0:
             return None
         if len(dplaces) == 1:
-            if not _assign(values, dplaces[0], d):
+            if not _assign(values, dplaces[0], d, trace, clue_set):
                 return None
     return values
 
 
-def _search(values: dict, trace: list) -> dict | None:
+def _search(values: dict, trace: list, clue_set: set) -> dict | None:
     if values is None:
         return None
     if all(len(values[s]) == 1 for s in _SQUARES):
         return values
     # Choose square with fewest candidates (MRV)
     _, s = min((len(values[s]), s) for s in _SQUARES if len(values[s]) > 1)
-    before_unresolved = {sq for sq in _SQUARES if len(values[sq]) > 1}
     for d in values[s]:
         snapshot = len(trace)
         copy = {k: v for k, v in values.items()}
-        result = _assign(copy, s, d)
+        result = _assign(copy, s, d, trace, clue_set)
         if result is not None:
-            for sq in _SQUARES:
-                if sq in before_unresolved and len(result[sq]) == 1:
-                    idx = _SQ_INDEX[sq]
-                    r, c = divmod(idx, 9)
-                    trace.append((r, c, int(result[sq])))
-            out = _search(result, trace)
+            out = _search(result, trace, clue_set)
             if out is not None:
                 return out
         # Backtrack: discard trace entries from this failed branch
@@ -116,24 +123,18 @@ def _search(values: dict, trace: list) -> dict | None:
 
 def solve(puzzle: str) -> tuple[str, list[tuple[int, int, int]]] | None:
     """Solve an 81-char puzzle string. Returns (solution_str, constraint_guided_trace) or None."""
-    values = _parse_grid(puzzle)
+    trace: list[tuple[int, int, int]] = []
+    clue_set = {_SQUARES[i] for i, ch in enumerate(puzzle) if ch in _COLS}
+    values = _parse_grid(puzzle, trace, clue_set)
     if values is None:
         return None
-    # Collect fills from initial constraint propagation
-    trace: list[tuple[int, int, int]] = []
-    clue_set = {i for i, ch in enumerate(puzzle) if ch in _COLS}
-    for sq in _SQUARES:
-        idx = _SQ_INDEX[sq]
-        if idx not in clue_set and len(values[sq]) == 1:
-            r, c = divmod(idx, 9)
-            trace.append((r, c, int(values[sq])))
 
     if all(len(values[s]) == 1 for s in _SQUARES):
         solution = "".join(values[s] for s in _SQUARES)
         return solution, trace
 
     # Need search
-    result = _search(values, trace)
+    result = _search(values, trace, clue_set)
     if result is None:
         return None
     solution = "".join(result[s] for s in _SQUARES)
