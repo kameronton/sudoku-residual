@@ -1,6 +1,7 @@
 """Training loop for GPT-2 Sudoku model."""
 
 import argparse
+import json
 import os
 import random
 import time
@@ -33,6 +34,7 @@ class TrainConfig:
     val_every: int = 500
     ckpt_every: int = 5000
     ckpt_dir: str = "checkpoints"
+    log_path: str = "train_log.json"
     seed: int = 42
     # Model config
     n_layers: int = 6
@@ -42,9 +44,10 @@ class TrainConfig:
 
 
 class TrainLogger:
-    """Accumulates training statistics."""
+    """Accumulates training statistics and periodically saves to disk."""
 
-    def __init__(self):
+    def __init__(self, log_path: str = "train_log.json"):
+        self.log_path = log_path
         self.step_losses: list[float] = []
         self.step_tokens: list[int] = []
         self.step_times: list[float] = []
@@ -88,6 +91,21 @@ class TrainLogger:
             "final_loss": self.step_losses[-1] if self.step_losses else None,
             "final_val_loss": self.val_losses[-1][1] if self.val_losses else None,
         }
+
+    def save(self):
+        data = {
+            "step_losses": self.step_losses,
+            "step_tokens": self.step_tokens,
+            "step_times": self.step_times,
+            "val_losses": self.val_losses,
+            "checkpoints": self.checkpoints,
+            "total_tokens": self.total_tokens,
+            "summary": self.summary(),
+        }
+        tmp = self.log_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, self.log_path)
 
 
 def make_schedule(cfg: TrainConfig, total_steps: int, warmup_steps: int) -> optax.Schedule:
@@ -209,7 +227,7 @@ def train(cfg: TrainConfig):
         print(f"Resumed from checkpoint at step {start_step}")
 
     # Logger
-    logger = TrainLogger()
+    logger = TrainLogger(log_path=cfg.log_path)
     logger.total_tokens = start_step * tokens_per_step
 
     # Training loop with tqdm
@@ -249,6 +267,7 @@ def train(cfg: TrainConfig):
                 val_losses.append(float(vl))
             avg_val = np.mean(val_losses)
             logger.log_val(step + 1, float(avg_val))
+            logger.save()
             tqdm.write(f"  step {step + 1:>6d} | val_loss {avg_val:.4f}")
 
         if (step + 1) % cfg.ckpt_every == 0:
@@ -262,6 +281,8 @@ def train(cfg: TrainConfig):
     # Final checkpoint
     ckpt_mgr.save(total_steps, args=ocp.args.StandardSave(state))
     ckpt_mgr.wait_until_finished()
+
+    logger.save()
 
     # Print summary
     summary = logger.summary()
