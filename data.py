@@ -317,7 +317,7 @@ def prepare_data(data_path: str, trace_mode: str, output: str, max_puzzles: int 
             trace = gen_fn(puzzle, solution, cg_trace)
             seq = tokenize_trace(puzzle, solution, trace)
             sequences.append(seq)
-            if (i + 1) % 100_000 == 0:
+            if (i + 1) % 10_000 == 0:
                 print(f"  processed {i + 1} puzzles...")
 
     arr = np.stack(sequences)

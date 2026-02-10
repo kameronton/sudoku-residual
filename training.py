@@ -127,7 +127,7 @@ def train(cfg: TrainConfig):
         n_heads=cfg.n_heads,
         d_model=cfg.d_model,
         d_ff=cfg.d_ff,
-        max_seq_len=max_seq_len + 1 , # account for the sep token
+        max_seq_len=max_seq_len,
     )
 
     # Create train state
