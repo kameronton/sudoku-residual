@@ -41,6 +41,7 @@ class TrainConfig:
     n_heads: int = 4
     d_model: int = 128
     d_ff: int = 512
+    dtype: str = "float32"
 
 
 class TrainLogger:
@@ -141,7 +142,7 @@ def train_step(state, batch, vocab_size):
 
     def loss_fn(params):
         logits = state.apply_fn({"params": params}, inputs)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
         one_hot = jax.nn.one_hot(targets, vocab_size)
         per_token_loss = -jnp.sum(one_hot * log_probs, axis=-1)  # (B, T-1)
         loss = jnp.sum(per_token_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
@@ -202,6 +203,7 @@ def train(cfg: TrainConfig):
         d_model=cfg.d_model,
         d_ff=cfg.d_ff,
         max_seq_len=max_seq_len,
+        dtype=cfg.dtype,
     )
 
     # Create train state
