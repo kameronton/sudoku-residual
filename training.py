@@ -20,7 +20,8 @@ from transformer import GPT2Model, TransformerConfig
 
 @dataclass
 class TrainConfig:
-    traces_path: str = "traces_random.npz"
+    traces_path: str = "traces_constraint.npz"
+    resume: bool = False
     batch_size: int = 64
     num_steps: int = 100_000
     lr: float = 3e-4
@@ -109,12 +110,18 @@ def train(cfg: TrainConfig):
     val_indices = all_indices[n_train:]
     print(f"Dataset: {n} total, {n_train} train, {n_val} val", flush=True)
 
+    # Find the longest sequence in the dataset to determine max_seq_len for the model
+    max_seq_len = max(len(dataset[i]) for i in range(n))
+    print(f"Max sequence length in dataset: {max_seq_len}", flush=True)
+    assert max_seq_len <= 128, "Sequence length exceeds model max_seq_len"
+
     # Model config
     model_cfg = TransformerConfig(
         n_layers=cfg.n_layers,
         n_heads=cfg.n_heads,
         d_model=cfg.d_model,
         d_ff=cfg.d_ff,
+        max_seq_len=max_seq_len + 1 , # account for the sep token
     )
 
     # Create train state
@@ -130,13 +137,13 @@ def train(cfg: TrainConfig):
         options=ocp.CheckpointManagerOptions(max_to_keep=3),
     )
 
-    # Resume from checkpoint
+    # Resume from checkpoint if a flag is set *and* a checkpoint exists
     start_step = 0
-    if ckpt_mgr.latest_step() is not None:
+    if ckpt_mgr.latest_step() is not None and cfg.resume:
         step = ckpt_mgr.latest_step()
         restored = ckpt_mgr.restore(step, args=ocp.args.StandardRestore(state))
         state = restored
-        start_step = int(state.step)
+        start_step = int(state.step) # type: ignore
         print(f"Resumed from checkpoint at step {start_step}")
 
     # Training loop
@@ -145,7 +152,7 @@ def train(cfg: TrainConfig):
     for step in range(start_step, cfg.num_steps):
         # Sample batch
         batch_idx = np.random.choice(train_indices, size=cfg.batch_size, replace=False)
-        batch = jnp.array(collate_batch(dataset, batch_idx))
+        batch = jnp.array(collate_batch(dataset, batch_idx)) # type: ignore
 
         state, loss = train_step(state, batch, model_cfg.vocab_size)
 
@@ -159,7 +166,7 @@ def train(cfg: TrainConfig):
             val_losses = []
             for _ in range(min(10, max(1, n_val // cfg.batch_size))):
                 vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
-                vb = jnp.array(collate_batch(dataset, vi))
+                vb = jnp.array(collate_batch(dataset, vi)) # type: ignore
                 vl = eval_step(state, vb, model_cfg.vocab_size)
                 val_losses.append(float(vl))
             print(f"         val_loss {np.mean(val_losses):.4f}", flush=True)
