@@ -6,6 +6,9 @@ This is a repo that tests whether a transformer trained to solve sudokus has:
 
 ```bash
 uv sync
+
+# For PyTorch backend (MPS on Apple Silicon)
+uv sync --extra pytorch
 ```
 
 ## Usage
@@ -20,8 +23,14 @@ Trace modes: `random`, `constraint`, `human`.
 
 ### 2. Train
 
+#### JAX backend
 ```bash
-uv run python training.py --traces_path traces_random.npz --batch_size 64 --num_tokens 100000000
+uv run python -m jax_backend.training --traces_path traces_random.npz --batch_size 64 --num_tokens 100000000
+```
+
+#### PyTorch backend (MPS)
+```bash
+uv run python -m torch_backend.training --traces_path traces_random.npz --batch_size 64 --num_tokens 100000000
 ```
 
 Training uses a token-based budget (`--num_tokens`) with a tqdm progress bar showing throughput and loss. Use `--resume` to continue from the latest checkpoint in `checkpoints/`.
@@ -30,10 +39,14 @@ Key flags: `--num_tokens`, `--warmup_tokens`, `--lr`, `--val_every`, `--log_ever
 
 ### 3. Evaluate
 
-Load a checkpoint and evaluate the model on puzzles from the CSV:
-
+#### JAX backend
 ```bash
-uv run python evaluate.py --ckpt_dir checkpoints --data_path sudoku-3m.csv --n 100
+uv run python -m jax_backend.evaluate --ckpt_dir checkpoints --data_path sudoku-3m.csv --n 100
+```
+
+#### PyTorch backend
+```bash
+uv run python -m torch_backend.evaluate --ckpt_dir checkpoints --data_path sudoku-3m.csv --n 100
 ```
 
 Key flags: `--n` (number of puzzles), `--random_sample`, `--temperature`, `--quiet` (summary only).
