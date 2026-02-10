@@ -95,24 +95,22 @@ def _search(values: dict, trace: list) -> dict | None:
         return values
     # Choose square with fewest candidates (MRV)
     _, s = min((len(values[s]), s) for s in _SQUARES if len(values[s]) > 1)
+    before_unresolved = {sq for sq in _SQUARES if len(values[sq]) > 1}
     for d in values[s]:
+        snapshot = len(trace)
         copy = {k: v for k, v in values.items()}
         result = _assign(copy, s, d)
         if result is not None:
-            # Record newly resolved squares
-            before_unresolved = {sq for sq in _SQUARES if len(values[sq]) > 1}
-            after_resolved = [sq for sq in _SQUARES if len(result[sq]) == 1]
-            for sq in after_resolved:
-                if sq in before_unresolved:
+            for sq in _SQUARES:
+                if sq in before_unresolved and len(result[sq]) == 1:
                     idx = _SQ_INDEX[sq]
                     r, c = divmod(idx, 9)
                     trace.append((r, c, int(result[sq])))
             out = _search(result, trace)
             if out is not None:
                 return out
-            # Backtrack: remove trace entries added in this branch
-            # We need to be careful—just trim back
-            # Actually, let's track length
+        # Backtrack: discard trace entries from this failed branch
+        del trace[snapshot:]
     return None
 
 
@@ -135,19 +133,10 @@ def solve(puzzle: str) -> tuple[str, list[tuple[int, int, int]]] | None:
         return solution, trace
 
     # Need search
-    pre_len = len(trace)
     result = _search(values, trace)
     if result is None:
         return None
-    # Also pick up any squares resolved during search that we missed
     solution = "".join(result[s] for s in _SQUARES)
-    # Rebuild trace to make sure all empties are covered
-    covered = {(t[0], t[1]) for t in trace}
-    for i, ch in enumerate(puzzle):
-        if ch not in _COLS:
-            r, c = divmod(i, 9)
-            if (r, c) not in covered:
-                trace.append((r, c, int(solution[i])))
     return solution, trace
 
 
