@@ -13,7 +13,7 @@ def plot_loss_curve(log_file):
                 parts = line.split('|')
                 step_part = parts[0].strip()
                 val_loss_part = parts[1].strip()
-                step = int(step_part.split()[1]) * 10368 # tokens per stap
+                step = int(step_part.split()[1]) * 20736 # tokens per step
                 val_loss = float(val_loss_part.split()[1])
                 steps.append(step)
                 val_losses.append(val_loss)
@@ -24,9 +24,14 @@ def plot_loss_curve(log_file):
     plt.xlabel('Tokens Processed')
     plt.ylabel('Validation Loss')
     plt.grid()
-    plt.savefig('loss_curve.png')
+    plt.savefig(log_file.replace('.txt', '.png'))
     plt.show()
     # save the plot as loss_curve.png
 
 if __name__ == "__main__":
-    plot_loss_curve('train_log.txt')
+    # parse the name of the log file from command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='Plot loss curve from log file')
+    parser.add_argument('log_file', type=str, help='Path to the log file')
+    args = parser.parse_args()
+    plot_loss_curve(args.log_file)
