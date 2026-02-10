@@ -21,12 +21,34 @@ Trace modes: `random`, `constraint`, `human`.
 ### 2. Train
 
 ```bash
-uv run python training.py --traces_path traces_random.npz --batch_size 64 --num_steps 100000
+uv run python training.py --traces_path traces_random.npz --batch_size 64 --num_tokens 100000000
 ```
 
-Training auto-resumes from the latest checkpoint in `checkpoints/`.
+Training uses a token-based budget (`--num_tokens`) with a tqdm progress bar showing throughput and loss. Use `--resume` to continue from the latest checkpoint in `checkpoints/`.
 
-### 3. Sanity check
+Key flags: `--num_tokens`, `--warmup_tokens`, `--lr`, `--val_every`, `--log_every`, `--ckpt_every`.
+
+### 3. Evaluate
+
+Load a checkpoint and evaluate the model on puzzles from the CSV:
+
+```bash
+uv run python evaluate.py --ckpt_dir checkpoints --data_path sudoku-3m.csv --n 100
+```
+
+Key flags: `--n` (number of puzzles), `--random_sample`, `--temperature`, `--quiet` (summary only).
+
+### 4. Visualize traces
+
+Step through a solving trace to see how cells are filled:
+
+```bash
+uv run python visualize.py --data_path sudoku-3m.csv --index 0 --mode random --step
+```
+
+Modes: `random`, `constraint`, `human`. Use `--puzzle` to pass an 81-char puzzle string directly.
+
+### 5. Sanity check
 
 ```bash
 uv run python -c "from data import sanity_check; sanity_check()"
