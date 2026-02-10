@@ -16,7 +16,7 @@ import numpy as np
 SEP_TOKEN = 729
 PAD_TOKEN = 730
 VOCAB_SIZE = 731
-MAX_SEQ_LEN = 128
+MAX_SEQ_LEN = 82
 
 
 def encode_fill(row: int, col: int, digit: int) -> int:
@@ -270,7 +270,7 @@ def tokenize_trace(
 
 class SudokuDataset:
     def __init__(self, path: str):
-        data = np.load(path, mmap_mode="r")
+        data = np.load(path)
         self.sequences = data["sequences"]  # (N, MAX_SEQ_LEN)
 
     def __len__(self) -> int:
@@ -282,7 +282,7 @@ class SudokuDataset:
 
 def collate_batch(dataset: SudokuDataset, indices: Sequence[int]) -> np.ndarray:
     """Gather a batch from the dataset. Returns (batch_size, MAX_SEQ_LEN) int32 array."""
-    return np.stack([dataset[i] for i in indices])
+    return np.asarray(dataset.sequences[indices], dtype=np.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +316,7 @@ def prepare_data(data_path: str, trace_mode: str, output: str, max_puzzles: int 
             assert solution == solution_csv, f"Solver mismatch at row {i}"
             trace = gen_fn(puzzle, solution, cg_trace)
             seq = tokenize_trace(puzzle, solution, trace)
+            assert seq.shape == (MAX_SEQ_LEN,), f"Tokenization error at row {i}"
             sequences.append(seq)
             if (i + 1) % 10_000 == 0:
                 print(f"  processed {i + 1} puzzles...")

@@ -14,7 +14,7 @@ class TransformerConfig:
     d_model: int = 128
     d_ff: int = 512
     vocab_size: int = 731
-    max_seq_len: int = 128 # Since there are only 81 cells, we can use a shorter sequence length, even if we'll allow to backtrack eventually
+    max_seq_len: int = 82 # Since there are only 81 cells, we can use a shorter sequence length, even if we'll allow to backtrack eventually
 
 
 class CausalSelfAttention(nn.Module):

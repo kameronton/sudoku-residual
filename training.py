@@ -102,14 +102,14 @@ def make_schedule(cfg: TrainConfig, total_steps: int, warmup_steps: int) -> opta
 
 def create_train_state(rng, cfg: TrainConfig, model_cfg: TransformerConfig, total_steps: int, warmup_steps: int):
     model = GPT2Model(model_cfg)
-    dummy = jnp.ones((1, 256), dtype=jnp.int32)
+    dummy = jnp.ones((1, 82), dtype=jnp.int32)
     params = model.init(rng, dummy)["params"]
     schedule = make_schedule(cfg, total_steps, warmup_steps)
     tx = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-@partial(jax.jit, static_argnames=("vocab_size",))
+@partial(jax.jit, static_argnames=("vocab_size",), donate_argnums=(0,))
 def train_step(state, batch, vocab_size):
     """Single training step. batch is (B, T) int32 tokens."""
     inputs = batch[:, :-1]
@@ -169,7 +169,7 @@ def train(cfg: TrainConfig):
     # Find the longest sequence in the dataset to determine max_seq_len for the model
     max_seq_len = max(len(dataset[i]) for i in range(n))
     print(f"Max sequence length in dataset: {max_seq_len}", flush=True)
-    assert max_seq_len <= 128, "Sequence length exceeds model max_seq_len"
+    assert max_seq_len <= 82, "Sequence length exceeds model max_seq_len"
 
     # Compute token budget and steps
     tokens_per_step = cfg.batch_size * (max_seq_len - 1)
