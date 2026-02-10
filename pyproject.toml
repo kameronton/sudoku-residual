@@ -10,4 +10,5 @@ dependencies = [
     "numpy>=1.26",
     "optax>=0.2",
     "orbax-checkpoint>=0.6",
+    "tqdm>=4.66",
 ]

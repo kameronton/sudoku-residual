@@ -13,6 +13,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from flax.training import train_state
+from tqdm import tqdm
 
 from data import SudokuDataset, PAD_TOKEN, SEP_TOKEN, collate_batch
 from transformer import GPT2Model, TransformerConfig
@@ -23,9 +24,9 @@ class TrainConfig:
     traces_path: str = "traces_constraint.npz"
     resume: bool = False
     batch_size: int = 64
-    num_steps: int = 100_000
+    num_tokens: int = 100_000_000
     lr: float = 3e-4
-    warmup_steps: int = 1000
+    warmup_tokens: int = 1_000_000
     weight_decay: float = 0.1
     val_fraction: float = 0.05
     log_every: int = 50
@@ -40,21 +41,70 @@ class TrainConfig:
     d_ff: int = 512
 
 
-def make_schedule(cfg: TrainConfig) -> optax.Schedule:
+class TrainLogger:
+    """Accumulates training statistics."""
+
+    def __init__(self):
+        self.step_losses: list[float] = []
+        self.step_tokens: list[int] = []
+        self.step_times: list[float] = []
+        self.val_losses: list[tuple[int, float]] = []  # (step, loss)
+        self.checkpoints: list[int] = []
+        self.total_tokens: int = 0
+        self._t0: float = time.time()
+
+    def log_step(self, step: int, loss: float, n_tokens: int):
+        self.step_losses.append(loss)
+        self.step_tokens.append(n_tokens)
+        self.step_times.append(time.time())
+        self.total_tokens += n_tokens
+
+    def log_val(self, step: int, val_loss: float):
+        self.val_losses.append((step, val_loss))
+
+    def log_checkpoint(self, step: int):
+        self.checkpoints.append(step)
+
+    def recent_loss(self, n: int = 50) -> float:
+        if not self.step_losses:
+            return float("nan")
+        window = self.step_losses[-n:]
+        return sum(window) / len(window)
+
+    @property
+    def tokens_per_sec(self) -> float:
+        elapsed = time.time() - self._t0
+        if elapsed <= 0:
+            return 0.0
+        return self.total_tokens / elapsed
+
+    def summary(self) -> dict:
+        elapsed = time.time() - self._t0
+        return {
+            "total_steps": len(self.step_losses),
+            "total_tokens": self.total_tokens,
+            "wall_time_s": elapsed,
+            "tokens_per_sec": self.tokens_per_sec,
+            "final_loss": self.step_losses[-1] if self.step_losses else None,
+            "final_val_loss": self.val_losses[-1][1] if self.val_losses else None,
+        }
+
+
+def make_schedule(cfg: TrainConfig, total_steps: int, warmup_steps: int) -> optax.Schedule:
     return optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=cfg.lr,
-        warmup_steps=cfg.warmup_steps,
-        decay_steps=max(cfg.num_steps, cfg.warmup_steps + 1),
+        warmup_steps=warmup_steps,
+        decay_steps=max(total_steps, warmup_steps + 1),
         end_value=cfg.lr * 0.1,
     )
 
 
-def create_train_state(rng, cfg: TrainConfig, model_cfg: TransformerConfig):
+def create_train_state(rng, cfg: TrainConfig, model_cfg: TransformerConfig, total_steps: int, warmup_steps: int):
     model = GPT2Model(model_cfg)
     dummy = jnp.ones((1, 256), dtype=jnp.int32)
     params = model.init(rng, dummy)["params"]
-    schedule = make_schedule(cfg)
+    schedule = make_schedule(cfg, total_steps, warmup_steps)
     tx = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
@@ -121,6 +171,12 @@ def train(cfg: TrainConfig):
     print(f"Max sequence length in dataset: {max_seq_len}", flush=True)
     assert max_seq_len <= 128, "Sequence length exceeds model max_seq_len"
 
+    # Compute token budget and steps
+    tokens_per_step = cfg.batch_size * (max_seq_len - 1)
+    total_steps = cfg.num_tokens // tokens_per_step
+    warmup_steps = cfg.warmup_tokens // tokens_per_step
+    print(f"Token budget: {cfg.num_tokens:,} tokens -> {total_steps:,} steps ({tokens_per_step} tok/step)", flush=True)
+
     # Model config
     model_cfg = TransformerConfig(
         n_layers=cfg.n_layers,
@@ -132,7 +188,7 @@ def train(cfg: TrainConfig):
 
     # Create train state
     rng, init_rng = jax.random.split(rng)
-    state = create_train_state(init_rng, cfg, model_cfg)
+    state = create_train_state(init_rng, cfg, model_cfg, total_steps, warmup_steps)
     param_count = sum(x.size for x in jax.tree.leaves(state.params))
     print(f"Model parameters: {param_count:,}", flush=True)
 
@@ -152,21 +208,37 @@ def train(cfg: TrainConfig):
         start_step = int(state.step) # type: ignore
         print(f"Resumed from checkpoint at step {start_step}")
 
-    # Training loop
+    # Logger
+    logger = TrainLogger()
+    logger.total_tokens = start_step * tokens_per_step
+
+    # Training loop with tqdm
     print("Compiling train_step...", flush=True)
-    t0 = time.time()
-    for step in range(start_step, cfg.num_steps):
+    pbar = tqdm(
+        total=cfg.num_tokens,
+        initial=logger.total_tokens,
+        unit="tok",
+        unit_scale=True,
+        desc="Training",
+        smoothing=0.1,
+    )
+
+    for step in range(start_step, total_steps):
         # Sample batch
         batch_idx = np.random.choice(train_indices, size=cfg.batch_size, replace=False)
         batch = jnp.array(collate_batch(dataset, batch_idx)) # type: ignore
 
         state, loss = train_step(state, batch, model_cfg.vocab_size)
 
+        logger.log_step(step, float(loss), tokens_per_step)
+        pbar.update(tokens_per_step)
+
         if (step + 1) % cfg.log_every == 0:
-            loss_val = float(loss)  # blocks until computation finishes
-            elapsed = time.time() - t0
-            steps_done = step + 1 - start_step
-            print(f"step {step + 1:>6d} | loss {loss_val:.4f} | {steps_done / elapsed:.1f} steps/s", flush=True)
+            loss_val = float(loss)
+            tok_s = logger.tokens_per_sec
+            pbar.set_postfix_str(
+                f"loss={loss_val:.4f} | tok/s={tok_s / 1000:.1f}K | step={step + 1}"
+            )
 
         if (step + 1) % cfg.val_every == 0:
             val_losses = []
@@ -175,17 +247,33 @@ def train(cfg: TrainConfig):
                 vb = jnp.array(collate_batch(dataset, vi)) # type: ignore
                 vl = eval_step(state, vb, model_cfg.vocab_size)
                 val_losses.append(float(vl))
-            print(f"         val_loss {np.mean(val_losses):.4f}", flush=True)
+            avg_val = np.mean(val_losses)
+            logger.log_val(step + 1, float(avg_val))
+            tqdm.write(f"  step {step + 1:>6d} | val_loss {avg_val:.4f}")
 
         if (step + 1) % cfg.ckpt_every == 0:
             ckpt_mgr.save(step + 1, args=ocp.args.StandardSave(state))
             ckpt_mgr.wait_until_finished()
-            print(f"         checkpoint saved at step {step + 1}", flush=True)
+            logger.log_checkpoint(step + 1)
+            tqdm.write(f"  checkpoint saved at step {step + 1}")
+
+    pbar.close()
 
     # Final checkpoint
-    ckpt_mgr.save(cfg.num_steps, args=ocp.args.StandardSave(state))
+    ckpt_mgr.save(total_steps, args=ocp.args.StandardSave(state))
     ckpt_mgr.wait_until_finished()
-    print("Training complete.", flush=True)
+
+    # Print summary
+    summary = logger.summary()
+    print(f"\nTraining complete. Summary:")
+    print(f"  Steps: {summary['total_steps']:,}")
+    print(f"  Tokens: {summary['total_tokens']:,}")
+    print(f"  Wall time: {summary['wall_time_s']:.1f}s")
+    print(f"  Throughput: {summary['tokens_per_sec'] / 1000:.1f}K tok/s")
+    if summary['final_loss'] is not None:
+        print(f"  Final train loss: {summary['final_loss']:.4f}")
+    if summary['final_val_loss'] is not None:
+        print(f"  Final val loss: {summary['final_val_loss']:.4f}")
 
 
 def parse_args() -> TrainConfig:
