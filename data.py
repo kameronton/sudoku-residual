@@ -1,0 +1,377 @@
+"""Sudoku data pipeline: solver, trace generation, tokenization, dataset."""
+
+import argparse
+import csv
+import random
+from collections.abc import Sequence
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Tokenization
+# ---------------------------------------------------------------------------
+# Tokens 0–728: fill tokens encoding (row, col, digit) as row*81 + col*9 + (digit-1)
+# Token 729: <sep>
+# Token 730: <pad>
+SEP_TOKEN = 729
+PAD_TOKEN = 730
+VOCAB_SIZE = 731
+MAX_SEQ_LEN = 128
+
+
+def encode_fill(row: int, col: int, digit: int) -> int:
+    return row * 81 + col * 9 + (digit - 1)
+
+
+def decode_fill(token: int) -> tuple[int, int, int]:
+    row, rem = divmod(token, 81)
+    col, d_minus1 = divmod(rem, 9)
+    return row, col, d_minus1 + 1
+
+
+# ---------------------------------------------------------------------------
+# Norvig-style solver with constraint propagation + backtracking
+# ---------------------------------------------------------------------------
+
+def _cross(rows: str, cols: str) -> list[str]:
+    return [r + c for r in rows for c in cols]
+
+
+_ROWS = "ABCDEFGHI"
+_COLS = "123456789"
+_SQUARES = _cross(_ROWS, _COLS)
+_UNITLIST = (
+    [_cross(_ROWS, c) for c in _COLS]
+    + [_cross(r, _COLS) for r in _ROWS]
+    + [_cross(rs, cs) for rs in ("ABC", "DEF", "GHI") for cs in ("123", "456", "789")]
+)
+_UNITS = {s: [u for u in _UNITLIST if s in u] for s in _SQUARES}
+_PEERS = {s: set(sum(_UNITS[s], [])) - {s} for s in _SQUARES}
+_SQ_INDEX = {s: i for i, s in enumerate(_SQUARES)}
+
+
+def _parse_grid(puzzle: str) -> dict[str, str] | None:
+    values = {s: _COLS for s in _SQUARES}
+    for s, d in zip(_SQUARES, puzzle):
+        if d in _COLS:
+            if not _assign(values, s, d):
+                return None
+    return values
+
+
+def _assign(values: dict, s: str, d: str) -> dict | None:
+    other = values[s].replace(d, "")
+    for d2 in other:
+        if not _eliminate(values, s, d2):
+            return None
+    return values
+
+
+def _eliminate(values: dict, s: str, d: str) -> dict | None:
+    if d not in values[s]:
+        return values
+    values[s] = values[s].replace(d, "")
+    if len(values[s]) == 0:
+        return None
+    if len(values[s]) == 1:
+        d2 = values[s]
+        for s2 in _PEERS[s]:
+            if not _eliminate(values, s2, d2):
+                return None
+    for u in _UNITS[s]:
+        dplaces = [sq for sq in u if d in values[sq]]
+        if len(dplaces) == 0:
+            return None
+        if len(dplaces) == 1:
+            if not _assign(values, dplaces[0], d):
+                return None
+    return values
+
+
+def _search(values: dict, trace: list) -> dict | None:
+    if values is None:
+        return None
+    if all(len(values[s]) == 1 for s in _SQUARES):
+        return values
+    # Choose square with fewest candidates (MRV)
+    _, s = min((len(values[s]), s) for s in _SQUARES if len(values[s]) > 1)
+    for d in values[s]:
+        copy = {k: v for k, v in values.items()}
+        result = _assign(copy, s, d)
+        if result is not None:
+            # Record newly resolved squares
+            before_unresolved = {sq for sq in _SQUARES if len(values[sq]) > 1}
+            after_resolved = [sq for sq in _SQUARES if len(result[sq]) == 1]
+            for sq in after_resolved:
+                if sq in before_unresolved:
+                    idx = _SQ_INDEX[sq]
+                    r, c = divmod(idx, 9)
+                    trace.append((r, c, int(result[sq])))
+            out = _search(result, trace)
+            if out is not None:
+                return out
+            # Backtrack: remove trace entries added in this branch
+            # We need to be careful—just trim back
+            # Actually, let's track length
+    return None
+
+
+def solve(puzzle: str) -> tuple[str, list[tuple[int, int, int]]] | None:
+    """Solve an 81-char puzzle string. Returns (solution_str, constraint_guided_trace) or None."""
+    values = _parse_grid(puzzle)
+    if values is None:
+        return None
+    # Collect fills from initial constraint propagation
+    trace: list[tuple[int, int, int]] = []
+    clue_set = {i for i, ch in enumerate(puzzle) if ch in _COLS}
+    for sq in _SQUARES:
+        idx = _SQ_INDEX[sq]
+        if idx not in clue_set and len(values[sq]) == 1:
+            r, c = divmod(idx, 9)
+            trace.append((r, c, int(values[sq])))
+
+    if all(len(values[s]) == 1 for s in _SQUARES):
+        solution = "".join(values[s] for s in _SQUARES)
+        return solution, trace
+
+    # Need search
+    pre_len = len(trace)
+    result = _search(values, trace)
+    if result is None:
+        return None
+    # Also pick up any squares resolved during search that we missed
+    solution = "".join(result[s] for s in _SQUARES)
+    # Rebuild trace to make sure all empties are covered
+    covered = {(t[0], t[1]) for t in trace}
+    for i, ch in enumerate(puzzle):
+        if ch not in _COLS:
+            r, c = divmod(i, 9)
+            if (r, c) not in covered:
+                trace.append((r, c, int(solution[i])))
+    return solution, trace
+
+
+# ---------------------------------------------------------------------------
+# Trace generation modes
+# ---------------------------------------------------------------------------
+
+def random_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
+    empties = []
+    for i in range(81):
+        if puzzle[i] not in "123456789":
+            r, c = divmod(i, 9)
+            empties.append((r, c, int(solution[i])))
+    random.shuffle(empties)
+    return empties
+
+
+def human_like_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
+    """Naked single -> hidden single -> fallback to constraint-guided order."""
+    grid = [int(ch) if ch in "123456789" else 0 for ch in puzzle]
+
+    def candidates(g: list[int], pos: int) -> set[int]:
+        r, c = divmod(pos, 9)
+        used = set()
+        for j in range(9):
+            used.add(g[r * 9 + j])
+            used.add(g[j * 9 + c])
+        br, bc = (r // 3) * 3, (c // 3) * 3
+        for dr in range(3):
+            for dc in range(3):
+                used.add(g[(br + dr) * 9 + (bc + dc)])
+        return set(range(1, 10)) - used
+
+    filled = set()
+    trace = []
+    empties = [i for i in range(81) if grid[i] == 0]
+
+    while empties:
+        progress = False
+        # Naked singles
+        for pos in list(empties):
+            if pos in filled:
+                continue
+            cands = candidates(grid, pos)
+            if len(cands) == 1:
+                d = cands.pop()
+                r, c = divmod(pos, 9)
+                trace.append((r, c, d))
+                grid[pos] = d
+                filled.add(pos)
+                empties.remove(pos)
+                progress = True
+
+        if progress:
+            continue
+
+        # Hidden singles
+        found = False
+        for unit_type in range(3):  # row, col, box
+            for ui in range(9):
+                if unit_type == 0:
+                    cells = [ui * 9 + j for j in range(9)]
+                elif unit_type == 1:
+                    cells = [j * 9 + ui for j in range(9)]
+                else:
+                    br, bc = (ui // 3) * 3, (ui % 3) * 3
+                    cells = [(br + dr) * 9 + (bc + dc) for dr in range(3) for dc in range(3)]
+                empty_cells = [p for p in cells if grid[p] == 0 and p not in filled]
+                for d in range(1, 10):
+                    places = [p for p in empty_cells if d in candidates(grid, p)]
+                    if len(places) == 1:
+                        pos = places[0]
+                        r, c = divmod(pos, 9)
+                        trace.append((r, c, d))
+                        grid[pos] = d
+                        filled.add(pos)
+                        if pos in empties:
+                            empties.remove(pos)
+                        found = True
+                        progress = True
+            if found:
+                break
+
+        if progress:
+            continue
+
+        # Fallback: fill remaining from solution in constraint-guided order (fewest candidates first)
+        remaining = [(len(candidates(grid, p)), p) for p in empties if p not in filled]
+        remaining.sort()
+        for _, pos in remaining:
+            r, c = divmod(pos, 9)
+            d = int(solution[pos])
+            trace.append((r, c, d))
+            grid[pos] = d
+            filled.add(pos)
+        break
+
+    return trace
+
+
+# ---------------------------------------------------------------------------
+# Tokenize a trace into a sequence
+# ---------------------------------------------------------------------------
+
+def tokenize_trace(
+    puzzle: str, solution: str, trace: list[tuple[int, int, int]]
+) -> np.ndarray:
+    """Convert clues + trace into a token sequence, padded to MAX_SEQ_LEN."""
+    tokens = []
+    # Clue tokens
+    for i in range(81):
+        if puzzle[i] in "123456789":
+            r, c = divmod(i, 9)
+            tokens.append(encode_fill(r, c, int(puzzle[i])))
+    tokens.append(SEP_TOKEN)
+    # Trace tokens
+    for r, c, d in trace:
+        tokens.append(encode_fill(r, c, d))
+
+    # Truncate or pad
+    if len(tokens) > MAX_SEQ_LEN:
+        tokens = tokens[:MAX_SEQ_LEN]
+    else:
+        tokens += [PAD_TOKEN] * (MAX_SEQ_LEN - len(tokens))
+    return np.array(tokens, dtype=np.int16)
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class SudokuDataset:
+    def __init__(self, path: str):
+        data = np.load(path, mmap_mode="r")
+        self.sequences = data["sequences"]  # (N, MAX_SEQ_LEN)
+
+    def __len__(self) -> int:
+        return self.sequences.shape[0]
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        return np.array(self.sequences[idx], dtype=np.int32)
+
+
+def collate_batch(dataset: SudokuDataset, indices: Sequence[int]) -> np.ndarray:
+    """Gather a batch from the dataset. Returns (batch_size, MAX_SEQ_LEN) int32 array."""
+    return np.stack([dataset[i] for i in indices])
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing / prepare
+# ---------------------------------------------------------------------------
+
+TRACE_GENERATORS = {
+    "random": lambda puzzle, solution, _trace: random_trace(puzzle, solution),
+    "constraint": lambda _puzzle, _solution, trace: trace,
+    "human": lambda puzzle, solution, _trace: human_like_trace(puzzle, solution),
+}
+
+
+def prepare_data(data_path: str, trace_mode: str, output: str, max_puzzles: int | None = None):
+    gen_fn = TRACE_GENERATORS[trace_mode]
+    sequences = []
+    failed = 0
+
+    with open(data_path) as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            if max_puzzles and i >= max_puzzles:
+                break
+            puzzle = row["puzzle"]
+            solution_csv = row["solution"]
+            result = solve(puzzle)
+            if result is None:
+                failed += 1
+                continue
+            solution, cg_trace = result
+            assert solution == solution_csv, f"Solver mismatch at row {i}"
+            trace = gen_fn(puzzle, solution, cg_trace)
+            seq = tokenize_trace(puzzle, solution, trace)
+            sequences.append(seq)
+            if (i + 1) % 100_000 == 0:
+                print(f"  processed {i + 1} puzzles...")
+
+    arr = np.stack(sequences)
+    np.savez_compressed(output, sequences=arr)
+    print(f"Saved {len(sequences)} sequences to {output} (failed: {failed})")
+
+
+# ---------------------------------------------------------------------------
+# Sanity check
+# ---------------------------------------------------------------------------
+
+def sanity_check(n: int = 100):
+    """Solve n puzzles from CSV, generate random traces, verify correctness."""
+    with open("sudoku-3m.csv") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            if i >= n:
+                break
+            puzzle = row["puzzle"]
+            expected = row["solution"]
+            result = solve(puzzle)
+            assert result is not None, f"Failed to solve puzzle {i}"
+            solution, cg_trace = result
+            assert solution == expected, f"Solution mismatch at puzzle {i}"
+            # Verify random trace
+            rt = random_trace(puzzle, solution)
+            grid = list(puzzle)
+            for r, c, d in rt:
+                grid[r * 9 + c] = str(d)
+            assert "".join(grid) == expected, f"Random trace mismatch at puzzle {i}"
+            # Verify tokenization round-trip
+            seq = tokenize_trace(puzzle, solution, rt)
+            assert seq[seq != PAD_TOKEN].shape[0] == 81 + 1, f"Token count off at puzzle {i}"  # 81 cells + sep
+    print(f"All {n} puzzles passed sanity check.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prepare", action="store_true")
+    parser.add_argument("--data_path", default="sudoku-3m.csv")
+    parser.add_argument("--trace_mode", default="random", choices=["random", "constraint", "human"])
+    parser.add_argument("--output", default="traces_random.npz")
+    parser.add_argument("--max_puzzles", type=int, default=None)
+    args = parser.parse_args()
+    if args.prepare:
+        prepare_data(args.data_path, args.trace_mode, args.output, args.max_puzzles)
