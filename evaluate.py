@@ -30,7 +30,7 @@ def load_checkpoint(ckpt_dir: str, model_cfg: TransformerConfig):
     params = model.init(rng, dummy)["params"]
 
     train_cfg = TrainConfig()
-    schedule = make_schedule(train_cfg)
+    schedule = make_schedule(train_cfg, total_steps=1, warmup_steps=0)
     tx = optax.adamw(learning_rate=schedule, weight_decay=train_cfg.weight_decay)
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
