@@ -1,4 +1,4 @@
-"""Load a JAX checkpoint and evaluate the model on N puzzles."""
+"""Load a checkpoint and evaluate the model on N puzzles."""
 
 import argparse
 import csv
@@ -13,9 +13,8 @@ import orbax.checkpoint as ocp
 from flax.training import train_state
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill
-from jax_backend.transformer import GPT2Model, TransformerConfig
-from jax_backend.training import make_schedule
-from common import TrainConfig, encode_clues, evaluate_puzzle
+from model import GPT2Model, TransformerConfig
+from training import make_schedule, TrainConfig, encode_clues, evaluate_puzzle
 from visualize import print_grid
 
 
@@ -84,7 +83,7 @@ def generate_trace(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate JAX model on Sudoku puzzles")
+    parser = argparse.ArgumentParser(description="Evaluate model on Sudoku puzzles")
     parser.add_argument("--ckpt_dir", default="checkpoints")
     parser.add_argument("--data_path", default="sudoku-3m.csv")
     parser.add_argument("--n", type=int, default=10, help="Number of puzzles to evaluate")
