@@ -13,6 +13,3 @@ dependencies = [
     "orbax-checkpoint>=0.6",
     "tqdm>=4.66",
 ]
-
-[project.optional-dependencies]
-pytorch = ["torch>=2.0"]
