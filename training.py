@@ -16,7 +16,7 @@ import orbax.checkpoint as ocp
 from flax.training import train_state
 from tqdm import tqdm
 
-from data import SudokuDataset, PAD_TOKEN, SEP_TOKEN, collate_batch, encode_fill
+from data import PAD_TOKEN, SEP_TOKEN, encode_fill, MAX_SEQ_LEN
 from model import GPT2Model, TransformerConfig
 from visualize import print_grid
 
@@ -306,20 +306,23 @@ def train(cfg: TrainConfig):
     np.random.seed(cfg.seed)
     rng = jax.random.PRNGKey(cfg.seed)
 
-    # Load dataset
-    dataset = SudokuDataset(cfg.traces_path)
-    n = len(dataset)
+    # Load dataset — preload entire array onto device for zero-copy batch indexing
+    print("Loading dataset...", flush=True)
+    raw = np.load(cfg.traces_path)["sequences"]  # (N, MAX_SEQ_LEN) int16
+    n = raw.shape[0]
+    max_seq_len = raw.shape[1]
     n_val = max(1, int(n * cfg.val_fraction))
     n_train = n - n_val
     all_indices = np.arange(n)
     np.random.shuffle(all_indices)
     train_indices = all_indices[:n_train]
     val_indices = all_indices[n_train:]
-    print(f"Dataset: {n} total, {n_train} train, {n_val} val", flush=True)
 
-    # Find the longest sequence in the dataset to determine max_seq_len for the model
-    max_seq_len = max(len(dataset[i]) for i in range(n))
-    print(f"Max sequence length in dataset: {max_seq_len}", flush=True)
+    # Upload full dataset to device — avoids CPU→device transfer every step
+    device_sequences = jax.device_put(jnp.array(raw, dtype=jnp.int32))
+    del raw
+    print(f"Dataset: {n} total, {n_train} train, {n_val} val (preloaded to {jax.devices()[0].platform})", flush=True)
+    print(f"Max sequence length: {max_seq_len}", flush=True)
 
     # Compute token budget and steps
     tokens_per_step = cfg.batch_size * (max_seq_len - 1)
@@ -394,9 +397,9 @@ def train(cfg: TrainConfig):
     )
 
     for step in range(start_step, total_steps):
-        # Sample batch
+        # Sample batch — device-side gather, no CPU→device transfer
         batch_idx = np.random.choice(train_indices, size=cfg.batch_size, replace=False)
-        batch = jnp.array(collate_batch(dataset, batch_idx)) # type: ignore
+        batch = device_sequences[batch_idx]
 
         state, loss = train_step(state, batch, model_cfg.vocab_size)
 
@@ -414,7 +417,7 @@ def train(cfg: TrainConfig):
             val_losses = []
             for _ in range(min(10, max(1, n_val // cfg.batch_size))):
                 vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
-                vb = jnp.array(collate_batch(dataset, vi)) # type: ignore
+                vb = device_sequences[vi]
                 vl = eval_step(state, vb, model_cfg.vocab_size)
                 val_losses.append(float(vl))
             avg_val = np.mean(val_losses)
