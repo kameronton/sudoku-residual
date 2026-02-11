@@ -8,6 +8,21 @@ This is a repo that tests whether a transformer trained to solve sudokus has:
 uv sync
 ```
 
+### Google Colab (TPU)
+
+```bash
+!pip install uv
+!git clone https://github.com/<your-username>/sudoku-residual.git
+%cd sudoku-residual
+!uv sync --extra tpu
+```
+
+Then prefix all commands with `uv run`, same as below. Verify TPU is visible:
+
+```python
+!uv run python -c "import jax; print(jax.devices())"
+```
+
 ## Usage
 
 ### 1. Prepare traces (one-time)
