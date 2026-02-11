@@ -47,6 +47,7 @@ class TrainConfig:
     d_model: int = 128
     d_ff: int = 512
     dtype: str = "float32"
+    schedule_type: str = "linear"  # or "cosine"
     backend: str = "jax"
 
 
@@ -230,21 +231,32 @@ def evaluate_puzzle(trace: list[tuple[int, int, int]], puzzle: str, solution: st
 # Training functions
 # ---------------------------------------------------------------------------
 
-def make_schedule(cfg: TrainConfig, total_steps: int, warmup_steps: int) -> optax.Schedule:
-    return optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=cfg.lr,
-        warmup_steps=warmup_steps,
-        decay_steps=max(total_steps, warmup_steps + 1),
-        end_value=cfg.lr * 0.1,
-    )
+def make_schedule(cfg: TrainConfig, total_steps: int, warmup_steps: int, schedule_type: str = "linear") -> optax.Schedule:
+    if schedule_type == "linear":
+        return optax.linear_onecycle_schedule(
+            transition_steps=total_steps,
+            peak_value=cfg.lr,
+            pct_start=warmup_steps / max(total_steps, 1),
+            div_factor=10.0,
+            final_div_factor=100.0,
+            )
+    elif schedule_type == "cosine":
+        return optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=cfg.lr,
+            warmup_steps=warmup_steps,
+            decay_steps=max(total_steps, warmup_steps + 1),
+            end_value=cfg.lr * 0.1,
+        )
+    else:
+        raise ValueError(f"Unsupported schedule type: {schedule_type}")
 
 
 def create_train_state(rng, cfg: TrainConfig, model_cfg: TransformerConfig, total_steps: int, warmup_steps: int):
     model = GPT2Model(model_cfg)
     dummy = jnp.ones((1, 82), dtype=jnp.int32)
     params = model.init(rng, dummy)["params"]
-    schedule = make_schedule(cfg, total_steps, warmup_steps)
+    schedule = make_schedule(cfg, total_steps, warmup_steps, schedule_type=cfg.schedule_type)
     tx = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
