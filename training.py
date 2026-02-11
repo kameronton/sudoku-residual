@@ -403,11 +403,16 @@ def train(cfg: TrainConfig):
 
         state, loss = train_step(state, batch, model_cfg.vocab_size)
 
-        logger.log_step(step, float(loss), tokens_per_step)
+        # Only read loss from device when we need to display it — float()
+        # forces a blocking device→host sync that stalls the TPU pipeline.
+        logger.total_tokens += tokens_per_step
         pbar.update(tokens_per_step)
-
-        if (step + 1) % cfg.log_every == 0:
+        should_log = (step + 1) % cfg.log_every == 0
+        if should_log:
             loss_val = float(loss)
+            logger.step_losses.append(loss_val)
+
+        if should_log:
             tok_s = logger.tokens_per_sec
             pbar.set_postfix_str(
                 f"loss={loss_val:.4f} | tok/s={tok_s / 1000:.1f}K | step={step + 1}"
