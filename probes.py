@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import os
 
 import jax
 import jax.numpy as jnp
@@ -34,15 +35,12 @@ def load_puzzles(data_path: str, n: int) -> list[str]:
     return puzzles
 
 
-def collect_activations(forward_fn, params, puzzles: list[str], batch_size: int, layer: int):
-    """Get residual stream activations at the SEP token for a given layer.
+def collect_activations(forward_fn, params, puzzles: list[str], batch_size: int):
+    """Get residual stream activations at all layers and tokens.
 
-    Returns array of shape (n_puzzles, d_model).
+    Returns array of shape (n_puzzles, n_layers, seq_len, d_model).
     """
     tokenized = [encode_clues(p) for p in puzzles]
-    # SEP is the last token in each clue sequence
-    sep_positions = [len(t) - 1 for t in tokenized]
-
     max_length = max(len(t) for t in tokenized)
     padded = jnp.array(
         [t + [PAD_TOKEN] * (max_length - len(t)) for t in tokenized],
@@ -52,14 +50,40 @@ def collect_activations(forward_fn, params, puzzles: list[str], batch_size: int,
     all_acts = []
     for start in range(0, len(puzzles), batch_size):
         batch = padded[start : start + batch_size]
-        batch_sep = sep_positions[start : start + batch_size]
         _, intermediates = forward_fn(params, batch)
-        # intermediates[layer] has shape (n_layers, batch, seq_len, d_model) — pick the layer
-        layer_acts = np.array(intermediates[layer])  # (batch, seq_len, d_model)
-        for j, pos in enumerate(batch_sep):
-            all_acts.append(np.array(layer_acts[j, pos]))
+        # intermediates: (n_layers, batch, seq_len, d_model) -> (batch, n_layers, seq_len, d_model)
+        all_acts.append(np.array(intermediates.transpose(1, 0, 2, 3)))
 
-    return np.stack(all_acts).astype(np.float32)
+    return np.concatenate(all_acts, axis=0).astype(np.float32)
+
+
+def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str]):
+    """Save activations and puzzles together."""
+    # Encode puzzles as fixed-length byte strings
+    puzzle_arr = np.array(puzzles, dtype=f"U{len(puzzles[0])}")
+    np.savez_compressed(path, activations=activations, puzzles=puzzle_arr)
+    print(f"Saved probe dataset to {path} ({activations.shape})")
+
+
+def load_probe_dataset(path: str):
+    """Load cached activations and puzzles."""
+    data = np.load(path)
+    activations = data["activations"]
+    puzzles = list(data["puzzles"])
+    print(f"Loaded probe dataset from {path} ({activations.shape})")
+    return activations, puzzles
+
+
+def get_activations_at(activations: np.ndarray, puzzles: list[str], layer: int):
+    """Extract activations at the SEP token for a given layer.
+
+    activations: (n_puzzles, n_layers, seq_len, d_model)
+    Returns: (n_puzzles, d_model)
+    """
+    tokenized = [encode_clues(p) for p in puzzles]
+    sep_positions = [len(t) - 1 for t in tokenized]
+    layer_acts = activations[:, layer, :, :]  # (n_puzzles, seq_len, d_model)
+    return np.array([layer_acts[i, pos] for i, pos in enumerate(sep_positions)])
 
 
 def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False):
@@ -156,6 +180,7 @@ def main():
     parser = argparse.ArgumentParser(description="Linear probes on residual stream")
     parser.add_argument("--ckpt_dir", default="checkpoints")
     parser.add_argument("--data_path", default="sudoku-3m.csv")
+    parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cache activations + puzzles")
     parser.add_argument("--n_puzzles", type=int, default=6400)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--layer", type=int, default=-1, help="Layer index (-1 = last)")
@@ -167,25 +192,32 @@ def main():
     parser.add_argument("--dtype", default="bfloat16")
     args = parser.parse_args()
 
-    model_cfg = TransformerConfig(
-        n_layers=args.n_layers, n_heads=args.n_heads,
-        d_model=args.d_model, d_ff=args.d_ff, dtype=args.dtype,
-    )
-    params, model = load_checkpoint(args.ckpt_dir, model_cfg)
-    forward_fn = make_forward_fn(model)
-    print("Model loaded")
+    if os.path.exists(args.cache_path):
+        activations, puzzles = load_probe_dataset(args.cache_path)
+    else:
+        model_cfg = TransformerConfig(
+            n_layers=args.n_layers, n_heads=args.n_heads,
+            d_model=args.d_model, d_ff=args.d_ff, dtype=args.dtype,
+        )
+        params, model = load_checkpoint(args.ckpt_dir, model_cfg)
+        forward_fn = make_forward_fn(model)
+        print("Model loaded")
 
-    puzzles = load_puzzles(args.data_path, args.n_puzzles)
-    print(f"Loaded {len(puzzles)} puzzles")
+        puzzles = load_puzzles(args.data_path, args.n_puzzles)
+        print(f"Loaded {len(puzzles)} puzzles")
 
-    activations = collect_activations(forward_fn, params, puzzles, args.batch_size, args.layer)
-    print(f"Activations shape: {activations.shape}")
+        activations = collect_activations(forward_fn, params, puzzles, args.batch_size)
+        save_probe_dataset(args.cache_path, activations, puzzles)
+
+    # Extract SEP-token activations for the chosen layer
+    sep_acts = get_activations_at(activations, puzzles, args.layer)
+    print(f"Probing layer {args.layer}, activations shape: {sep_acts.shape}")
 
     accuracies = []
     empty_pcts = []
     for cell in range(81):
         print(f"Cell {cell:2d}/81", end="\r")
-        acc, y_test, preds = probe_cell(activations, puzzles, cell)
+        acc, y_test, preds = probe_cell(sep_acts, puzzles, cell)
         accuracies.append(acc)
         n_empty = sum(1 for p in puzzles if p[cell] not in "123456789")
         empty_pcts.append(n_empty / len(puzzles) * 100)
