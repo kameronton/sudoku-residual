@@ -18,3 +18,4 @@ logs/
 
 # Ignore the dataset
 sudoku-3m.csv
+*.npz

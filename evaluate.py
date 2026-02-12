@@ -95,11 +95,13 @@ def main():
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--d_ff", type=int, default=512)
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16", "float16"])
     args = parser.parse_args()
 
     model_cfg = TransformerConfig(
         n_layers=args.n_layers, n_heads=args.n_heads,
         d_model=args.d_model, d_ff=args.d_ff,
+        dtype=args.dtype,
     )
     params, model = load_checkpoint(args.ckpt_dir, model_cfg)
     forward_fn = make_forward_fn(model)

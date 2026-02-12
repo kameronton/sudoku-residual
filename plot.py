@@ -11,7 +11,7 @@ def plot_loss_curve(log_file, tokens_per_step):
 
     # Train losses — one entry per log interval
     train_losses = data["step_losses"]
-    train_tokens = np.arange(1, len(train_losses) + 1) * tokens_per_step
+    # train_tokens = np.arange(1, len(train_losses) + 1) * tokens_per_step
 
     # Val losses — stored as [step, loss] pairs
     val_entries = data["val_losses"]
@@ -20,8 +20,8 @@ def plot_loss_curve(log_file, tokens_per_step):
     val_tokens = val_steps * tokens_per_step
 
     plt.figure(figsize=(10, 6))
-    plt.plot(train_tokens, train_losses, alpha=0.5, label="Train loss")
-    plt.plot(val_tokens, val_losses, linewidth=2, label="Val loss")
+    plt.plot(val_tokens, train_losses, alpha=0.5, label="Train loss")
+    plt.plot(val_tokens, val_losses, alpha=0.5, linewidth=2, label="Val loss")
     plt.xlabel("Tokens processed")
     plt.ylabel("Loss")
     plt.title("Training and Validation Loss")
