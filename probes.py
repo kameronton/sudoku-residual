@@ -129,49 +129,45 @@ def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbo
     return acc, y_test_labels[filled], preds[filled]
 
 
-def plot_cell_accuracies(accuracies: list[float], empty_pcts: list[float], layer: int):
-    """Plot accuracy distribution and 9x9 heatmap."""
+def plot_all_layers(all_accuracies: dict[int, list[float]], empty_pcts: list[float]):
+    """Plot 9x9 heatmap per layer with shared colorbar."""
     import matplotlib.pyplot as plt
 
-    accs = np.array(accuracies)
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+    n_layers = len(all_accuracies)
+    ncols = min(n_layers, 3)
+    nrows = (n_layers + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols + 2, 6 * nrows))
+    if n_layers == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
 
-    # Density plot
-    ax1.hist(accs, bins=20, density=True, edgecolor="black", alpha=0.7)
-    ax1.axvline(accs.mean(), color="red", linestyle="--", label=f"mean={accs.mean():.3f}")
-    ax1.set_xlabel("Accuracy (filled cells)")
-    ax1.set_ylabel("Density")
-    ax1.set_title(f"Probe accuracy distribution (layer {layer})")
-    ax1.legend()
-
-    # 9x9 heatmap
-    grid = accs.reshape(9, 9)
-    im = ax2.imshow(grid, cmap="RdYlGn", vmin=0, vmax=1)
-    ax2.set_title(f"Per-cell probe accuracy (layer {layer})")
-    ax2.set_xticks(range(9))
-    ax2.set_yticks(range(9))
-    # Annotate each cell with accuracy and empty %
     empty_grid = np.array(empty_pcts).reshape(9, 9)
-    for r in range(9):
-        for c in range(9):
-            ax2.text(c, r - 0.12, f"{grid[r, c]:.2f}", ha="center", va="center", fontsize=8)
-            ax2.text(c, r + 0.18, f"{empty_grid[r, c]:.0f}% empty", ha="center", va="center", fontsize=5.5, color="gray")
-    # Draw 3x3 box borders
-    for i in range(0, 10, 3):
-        ax2.axhline(i - 0.5, color="black", linewidth=2)
-        ax2.axvline(i - 0.5, color="black", linewidth=2)
-    fig.colorbar(im, ax=ax2, shrink=0.8)
+    ims = []
+    for idx, (layer, accs) in enumerate(sorted(all_accuracies.items())):
+        ax = axes[idx]
+        grid = np.array(accs).reshape(9, 9)
+        im = ax.imshow(grid, cmap="RdYlGn", vmin=0, vmax=1)
+        ims.append(im)
+        avg = np.mean(accs)
+        ax.set_title(f"Layer {layer} (mean={avg:.3f})")
+        ax.set_xticks(range(9))
+        ax.set_yticks(range(9))
+        for r in range(9):
+            for c in range(9):
+                ax.text(c, r - 0.12, f"{grid[r, c]:.2f}", ha="center", va="center", fontsize=7)
+                ax.text(c, r + 0.18, f"{empty_grid[r, c]:.0f}%", ha="center", va="center", fontsize=5, color="gray")
+        for i in range(0, 10, 3):
+            ax.axhline(i - 0.5, color="black", linewidth=2)
+            ax.axvline(i - 0.5, color="black", linewidth=2)
 
-    # Accuracy vs cell index
-    ax3.plot(range(81), accs, marker=".", markersize=4)
-    ax3.axhline(accs.mean(), color="red", linestyle="--", label=f"mean={accs.mean():.3f}")
-    ax3.set_xlabel("Cell index")
-    ax3.set_ylabel("Accuracy (filled cells)")
-    ax3.set_title(f"Probe accuracy by cell index (layer {layer})")
-    ax3.legend()
+    # Hide unused axes
+    for idx in range(n_layers, len(axes)):
+        axes[idx].set_visible(False)
 
-    plt.tight_layout()
-    plt.savefig("probe_accuracies.png", dpi=150)
+    fig.suptitle("Per-cell probe accuracy by layer", fontsize=14, y=1.02)
+    fig.tight_layout()
+    fig.colorbar(ims[0], ax=axes[:n_layers].tolist(), shrink=0.6, label="Accuracy", pad=0.02)
+    fig.savefig("probe_accuracies.png", dpi=150, bbox_inches="tight")
     print("Saved probe_accuracies.png")
     plt.show()
 
@@ -183,8 +179,6 @@ def main():
     parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cache activations + puzzles")
     parser.add_argument("--n_puzzles", type=int, default=6400)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--layer", type=int, default=-1, help="Layer index (-1 = last)")
-    parser.add_argument("--cell", type=int, default=0, help="Cell index to probe (0-80)")
     parser.add_argument("--n_layers", type=int, default=6)
     parser.add_argument("--n_heads", type=int, default=6)
     parser.add_argument("--d_model", type=int, default=384)
@@ -209,22 +203,26 @@ def main():
         activations = collect_activations(forward_fn, params, puzzles, args.batch_size)
         save_probe_dataset(args.cache_path, activations, puzzles)
 
-    # Extract SEP-token activations for the chosen layer
-    sep_acts = get_activations_at(activations, puzzles, args.layer)
-    print(f"Probing layer {args.layer}, activations shape: {sep_acts.shape}")
-
-    accuracies = []
+    n_layers = activations.shape[1]
     empty_pcts = []
     for cell in range(81):
-        print(f"Cell {cell:2d}/81", end="\r")
-        acc, y_test, preds = probe_cell(sep_acts, puzzles, cell)
-        accuracies.append(acc)
         n_empty = sum(1 for p in puzzles if p[cell] not in "123456789")
         empty_pcts.append(n_empty / len(puzzles) * 100)
-    avg = sum(accuracies) / len(accuracies)
-    print(f"Average accuracy over all cells (filled): {avg:.3f}")
 
-    plot_cell_accuracies(accuracies, empty_pcts, args.layer)
+    all_accuracies = {}
+    for layer in range(n_layers):
+        sep_acts = get_activations_at(activations, puzzles, layer)
+        print(f"\nLayer {layer}, activations shape: {sep_acts.shape}")
+        accuracies = []
+        for cell in range(81):
+            print(f"  Layer {layer} | Cell {cell:2d}/81", end="\r")
+            acc, _, _ = probe_cell(sep_acts, puzzles, cell)
+            accuracies.append(acc)
+        avg = sum(accuracies) / len(accuracies)
+        print(f"  Layer {layer} | Mean accuracy (filled): {avg:.3f}")
+        all_accuracies[layer] = accuracies
+
+    plot_all_layers(all_accuracies, empty_pcts)
 
 
 if __name__ == "__main__":
