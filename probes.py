@@ -1,0 +1,199 @@
+"""Linear probes on residual stream activations at the SEP token."""
+
+import argparse
+import csv
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+
+from data import SEP_TOKEN, PAD_TOKEN, encode_fill, MAX_SEQ_LEN
+from model import GPT2Model, TransformerConfig
+from training import encode_clues
+from evaluate import load_checkpoint
+
+
+def make_forward_fn(model: GPT2Model):
+    @jax.jit
+    def forward(params, tokens):
+        return model.apply({"params": params}, tokens, return_intermediates=True)
+    return forward
+
+
+def load_puzzles(data_path: str, n: int) -> list[str]:
+    puzzles = []
+    with open(data_path) as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            if i >= n:
+                break
+            puzzles.append(row["puzzle"])
+    return puzzles
+
+
+def collect_activations(forward_fn, params, puzzles: list[str], batch_size: int, layer: int):
+    """Get residual stream activations at the SEP token for a given layer.
+
+    Returns array of shape (n_puzzles, d_model).
+    """
+    tokenized = [encode_clues(p) for p in puzzles]
+    # SEP is the last token in each clue sequence
+    sep_positions = [len(t) - 1 for t in tokenized]
+
+    max_length = max(len(t) for t in tokenized)
+    padded = jnp.array(
+        [t + [PAD_TOKEN] * (max_length - len(t)) for t in tokenized],
+        dtype=jnp.int32,
+    )
+
+    all_acts = []
+    for start in range(0, len(puzzles), batch_size):
+        batch = padded[start : start + batch_size]
+        batch_sep = sep_positions[start : start + batch_size]
+        _, intermediates = forward_fn(params, batch)
+        # intermediates[layer] has shape (n_layers, batch, seq_len, d_model) — pick the layer
+        layer_acts = np.array(intermediates[layer])  # (batch, seq_len, d_model)
+        for j, pos in enumerate(batch_sep):
+            all_acts.append(np.array(layer_acts[j, pos]))
+
+    return np.stack(all_acts).astype(np.float32)
+
+
+def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False):
+    """Train a ridge regression to predict the digit at a given cell from activations.
+
+    Targets are 9-dim one-hot (digits 1-9), empty cells get zero vector. Predicted class = argmax + 1.
+    """
+    labels = np.array([int(p[cell_idx]) if p[cell_idx] in "123456789" else 0 for p in puzzles])
+    # 9-class one-hot: digits 1-9 map to cols 0-8, empty (0) maps to zero vector
+    targets = np.zeros((len(labels), 9))
+    filled_mask = labels > 0
+    targets[filled_mask] = np.eye(9)[labels[filled_mask] - 1]
+
+    X_train, X_test, y_train_oh, y_test = train_test_split(
+        activations, targets, test_size=0.2, random_state=42,
+    )
+    # Split labels in parallel for statistics (using same random_state)
+    _, _, labels_train, labels_test = train_test_split(
+        activations, labels, test_size=0.2, random_state=42,
+    )
+    y_test_labels = y_test.argmax(axis=1) + 1  # back to 1-9
+
+    if verbose:
+        n_filled = filled_mask.sum()
+        print(f"\n  Dataset: {n_filled} filled, {len(labels) - n_filled} empty out of {len(labels)}")
+        print(f"  {'Class':>5}  {'Train':>6}  {'Test':>6}  {'Train%':>7}  {'Test%':>7}")
+        for d in range(0, 10):
+            n_tr = (labels_train == d).sum()
+            n_te = (labels_test == d).sum()
+            pct_tr = n_tr / len(labels_train) * 100
+            pct_te = n_te / len(labels_test) * 100
+            label = "empty" if d == 0 else str(d)
+            print(f"  {label:>5}  {n_tr:>6}  {n_te:>6}  {pct_tr:>6.1f}%  {pct_te:>6.1f}%")
+
+    ridge = Ridge(alpha=1.0)
+    ridge.fit(X_train, y_train_oh)
+    preds = ridge.predict(X_test).argmax(axis=1) + 1  # back to 1-9
+
+    # Evaluate only on filled cells (empty cells have zero-vector targets, not meaningful)
+    filled = labels_test != 0
+    acc = accuracy_score(y_test_labels[filled], preds[filled]) if filled.any() else float("nan")
+
+    return acc, y_test_labels[filled], preds[filled]
+
+
+def plot_cell_accuracies(accuracies: list[float], empty_pcts: list[float], layer: int):
+    """Plot accuracy distribution and 9x9 heatmap."""
+    import matplotlib.pyplot as plt
+
+    accs = np.array(accuracies)
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+
+    # Density plot
+    ax1.hist(accs, bins=20, density=True, edgecolor="black", alpha=0.7)
+    ax1.axvline(accs.mean(), color="red", linestyle="--", label=f"mean={accs.mean():.3f}")
+    ax1.set_xlabel("Accuracy (filled cells)")
+    ax1.set_ylabel("Density")
+    ax1.set_title(f"Probe accuracy distribution (layer {layer})")
+    ax1.legend()
+
+    # 9x9 heatmap
+    grid = accs.reshape(9, 9)
+    im = ax2.imshow(grid, cmap="RdYlGn", vmin=0, vmax=1)
+    ax2.set_title(f"Per-cell probe accuracy (layer {layer})")
+    ax2.set_xticks(range(9))
+    ax2.set_yticks(range(9))
+    # Annotate each cell with accuracy and empty %
+    empty_grid = np.array(empty_pcts).reshape(9, 9)
+    for r in range(9):
+        for c in range(9):
+            ax2.text(c, r - 0.12, f"{grid[r, c]:.2f}", ha="center", va="center", fontsize=8)
+            ax2.text(c, r + 0.18, f"{empty_grid[r, c]:.0f}% empty", ha="center", va="center", fontsize=5.5, color="gray")
+    # Draw 3x3 box borders
+    for i in range(0, 10, 3):
+        ax2.axhline(i - 0.5, color="black", linewidth=2)
+        ax2.axvline(i - 0.5, color="black", linewidth=2)
+    fig.colorbar(im, ax=ax2, shrink=0.8)
+
+    # Accuracy vs cell index
+    ax3.plot(range(81), accs, marker=".", markersize=4)
+    ax3.axhline(accs.mean(), color="red", linestyle="--", label=f"mean={accs.mean():.3f}")
+    ax3.set_xlabel("Cell index")
+    ax3.set_ylabel("Accuracy (filled cells)")
+    ax3.set_title(f"Probe accuracy by cell index (layer {layer})")
+    ax3.legend()
+
+    plt.tight_layout()
+    plt.savefig("probe_accuracies.png", dpi=150)
+    print("Saved probe_accuracies.png")
+    plt.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Linear probes on residual stream")
+    parser.add_argument("--ckpt_dir", default="checkpoints")
+    parser.add_argument("--data_path", default="sudoku-3m.csv")
+    parser.add_argument("--n_puzzles", type=int, default=6400)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--layer", type=int, default=-1, help="Layer index (-1 = last)")
+    parser.add_argument("--cell", type=int, default=0, help="Cell index to probe (0-80)")
+    parser.add_argument("--n_layers", type=int, default=6)
+    parser.add_argument("--n_heads", type=int, default=6)
+    parser.add_argument("--d_model", type=int, default=384)
+    parser.add_argument("--d_ff", type=int, default=1536)
+    parser.add_argument("--dtype", default="bfloat16")
+    args = parser.parse_args()
+
+    model_cfg = TransformerConfig(
+        n_layers=args.n_layers, n_heads=args.n_heads,
+        d_model=args.d_model, d_ff=args.d_ff, dtype=args.dtype,
+    )
+    params, model = load_checkpoint(args.ckpt_dir, model_cfg)
+    forward_fn = make_forward_fn(model)
+    print("Model loaded")
+
+    puzzles = load_puzzles(args.data_path, args.n_puzzles)
+    print(f"Loaded {len(puzzles)} puzzles")
+
+    activations = collect_activations(forward_fn, params, puzzles, args.batch_size, args.layer)
+    print(f"Activations shape: {activations.shape}")
+
+    accuracies = []
+    empty_pcts = []
+    for cell in range(81):
+        print(f"Cell {cell:2d}/81", end="\r")
+        acc, y_test, preds = probe_cell(activations, puzzles, cell)
+        accuracies.append(acc)
+        n_empty = sum(1 for p in puzzles if p[cell] not in "123456789")
+        empty_pcts.append(n_empty / len(puzzles) * 100)
+    avg = sum(accuracies) / len(accuracies)
+    print(f"Average accuracy over all cells (filled): {avg:.3f}")
+
+    plot_cell_accuracies(accuracies, empty_pcts, args.layer)
+
+
+if __name__ == "__main__":
+    main()
