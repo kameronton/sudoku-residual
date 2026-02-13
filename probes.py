@@ -142,29 +142,65 @@ def get_activations_at_token(activations: np.ndarray, sequences: list[list[int]]
         return np.array([layer_acts[i, pos] for i, pos in enumerate(positions)])
 
 
-def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False):
-    """Train a ridge regression to predict the digit at a given cell from activations.
+def _cell_candidates(puzzle: str, cell_idx: int) -> list[int]:
+    """Compute candidate digits for a cell from the puzzle string (empty cell only)."""
+    r, c = divmod(cell_idx, 9)
+    used = set()
+    for j in range(9):
+        ch = puzzle[r * 9 + j]
+        if ch in "123456789":
+            used.add(int(ch))
+        ch = puzzle[j * 9 + c]
+        if ch in "123456789":
+            used.add(int(ch))
+    br, bc = (r // 3) * 3, (c // 3) * 3
+    for dr in range(3):
+        for dc in range(3):
+            ch = puzzle[(br + dr) * 9 + (bc + dc)]
+            if ch in "123456789":
+                used.add(int(ch))
+    return [1 if d not in used else 0 for d in range(1, 10)]
 
-    Targets are 9-dim one-hot (digits 1-9), empty cells get zero vector. Predicted class = argmax + 1.
+
+def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False, mode: str = "state_filled"):
+    """Train a ridge probe to predict a per-cell target from activations.
+
+    Modes:
+    - "filled": binary classification (filled vs empty), evaluated on all cells.
+    - "state_filled": 9-class digit classification, evaluated only on filled cells.
+    - "candidates": 9-dim binary candidate sets, evaluated only on empty cells.
     """
+    n = len(puzzles)
     labels = np.array([int(p[cell_idx]) if p[cell_idx] in "123456789" else 0 for p in puzzles])
-    # 9-class one-hot: digits 1-9 map to cols 0-8, empty (0) maps to zero vector
-    targets = np.zeros((len(labels), 9))
     filled_mask = labels > 0
-    targets[filled_mask] = np.eye(9)[labels[filled_mask] - 1]
 
-    X_train, X_test, y_train_oh, y_test = train_test_split(
-        activations, targets, test_size=0.2, random_state=42,
-    )
-    # Split labels in parallel for statistics (using same random_state)
-    _, _, labels_train, labels_test = train_test_split(
-        activations, labels, test_size=0.2, random_state=42,
-    )
-    y_test_labels = y_test.argmax(axis=1) + 1  # back to 1-9
+    if mode == "filled":
+        # Binary: 2-class one-hot [empty, filled]
+        targets = np.eye(2)[(labels > 0).astype(int)]
+    elif mode == "state_filled":
+        # 9-class one-hot for filled cells; zero vector for empty
+        targets = np.zeros((n, 9))
+        targets[filled_mask] = np.eye(9)[labels[filled_mask] - 1]
+    elif mode == "candidates":
+        # 9-dim binary candidate vectors for empty cells; zero vector for filled
+        targets = np.zeros((n, 9))
+        empty_mask = ~filled_mask
+        for i in np.where(empty_mask)[0]:
+            targets[i] = _cell_candidates(puzzles[i], cell_idx)
+    else:
+        raise ValueError(f"Unsupported target mode: {mode}")
+
+    # Single split using indices to keep labels/targets aligned
+    indices = np.arange(n)
+    idx_train, idx_test = train_test_split(indices, test_size=0.2, random_state=42)
+
+    X_train, X_test = activations[idx_train], activations[idx_test]
+    y_train, y_test = targets[idx_train], targets[idx_test]
+    labels_train, labels_test = labels[idx_train], labels[idx_test]
 
     if verbose:
         n_filled = filled_mask.sum()
-        print(f"\n  Dataset: {n_filled} filled, {len(labels) - n_filled} empty out of {len(labels)}")
+        print(f"\n  Dataset: {n_filled} filled, {n - n_filled} empty out of {n}")
         print(f"  {'Class':>5}  {'Train':>6}  {'Test':>6}  {'Train%':>7}  {'Test%':>7}")
         for d in range(0, 10):
             n_tr = (labels_train == d).sum()
@@ -175,14 +211,32 @@ def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbo
             print(f"  {label:>5}  {n_tr:>6}  {n_te:>6}  {pct_tr:>6.1f}%  {pct_te:>6.1f}%")
 
     ridge = Ridge(alpha=1.0)
-    ridge.fit(X_train, y_train_oh)
-    preds = ridge.predict(X_test).argmax(axis=1) + 1  # back to 1-9
+    ridge.fit(X_train, y_train)
+    raw_preds = ridge.predict(X_test)
 
-    # Evaluate only on filled cells (empty cells have zero-vector targets, not meaningful)
-    filled = labels_test != 0
-    acc = accuracy_score(y_test_labels[filled], preds[filled]) if filled.any() else float("nan")
-
-    return acc, y_test_labels[filled], preds[filled]
+    if mode == "filled":
+        preds = raw_preds.argmax(axis=1)  # 0=empty, 1=filled
+        y_true = (labels_test > 0).astype(int)
+        acc = accuracy_score(y_true, preds)
+        return acc, y_true, preds
+    elif mode == "state_filled":
+        # Evaluate only on filled cells
+        filled_test = labels_test > 0
+        if not filled_test.any():
+            return float("nan"), np.array([]), np.array([])
+        preds = raw_preds[filled_test].argmax(axis=1) + 1  # back to 1-9
+        y_true = labels_test[filled_test]
+        acc = accuracy_score(y_true, preds)
+        return acc, y_true, preds
+    elif mode == "candidates":
+        # Evaluate only on empty cells; threshold at 0.5 for binary predictions
+        empty_test = labels_test == 0
+        if not empty_test.any():
+            return float("nan"), np.array([]), np.array([])
+        binary_preds = (raw_preds[empty_test] > 0.5).astype(int)
+        y_true = y_test[empty_test]
+        acc = accuracy_score(y_true.ravel(), binary_preds.ravel())  # per-digit accuracy
+        return acc, y_true, binary_preds
 
 
 def plot_all_layers(all_accuracies: dict[int, list[float]], empty_pcts: list[float], output_path: str = "probe_accuracies.png"):
