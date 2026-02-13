@@ -1,4 +1,4 @@
-"""Linear probes on residual stream activations at the SEP token."""
+"""Linear probes on residual stream activations."""
 
 import argparse
 import csv
@@ -11,13 +11,13 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
 
-from data import SEP_TOKEN, PAD_TOKEN, encode_fill, MAX_SEQ_LEN
+from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN
 from model import GPT2Model, TransformerConfig
 from training import encode_clues
-from evaluate import load_checkpoint
+from evaluate import load_checkpoint, generate_traces_batched, traces_to_sequences, make_forward_fn as make_gen_forward_fn
 
 
-def make_forward_fn(model: GPT2Model):
+def make_intermediates_fn(model: GPT2Model):
     @jax.jit
     def forward(params, tokens):
         return model.apply({"params": params}, tokens, return_intermediates=True)
@@ -35,55 +35,76 @@ def load_puzzles(data_path: str, n: int) -> list[str]:
     return puzzles
 
 
-def collect_activations(forward_fn, params, puzzles: list[str], batch_size: int):
-    """Get residual stream activations at all layers and tokens.
 
-    Returns array of shape (n_puzzles, n_layers, seq_len, d_model).
+
+def collect_activations(intermediates_fn, params, sequences: list[list[int]], batch_size: int):
+    """Forward pass on complete sequences to get activations at all layers/tokens.
+
+    Returns array of shape (n_puzzles, n_layers, max_seq_len, d_model).
     """
-    tokenized = [encode_clues(p) for p in puzzles]
-    max_length = max(len(t) for t in tokenized)
+    max_length = max(len(s) for s in sequences)
     padded = jnp.array(
-        [t + [PAD_TOKEN] * (max_length - len(t)) for t in tokenized],
+        [s + [PAD_TOKEN] * (max_length - len(s)) for s in sequences],
         dtype=jnp.int32,
     )
 
     all_acts = []
-    for start in range(0, len(puzzles), batch_size):
+    for start in range(0, len(sequences), batch_size):
+        print(f"  Forward pass {start}/{len(sequences)}", end="\r")
         batch = padded[start : start + batch_size]
-        _, intermediates = forward_fn(params, batch)
+        _, intermediates = intermediates_fn(params, batch)
         # intermediates: (n_layers, batch, seq_len, d_model) -> (batch, n_layers, seq_len, d_model)
         all_acts.append(np.array(intermediates.transpose(1, 0, 2, 3)))
+    print()
 
     return np.concatenate(all_acts, axis=0).astype(np.float32)
 
 
-def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str]):
-    """Save activations and puzzles together."""
-    # Encode puzzles as fixed-length byte strings
+def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], sequences: list[list[int]]):
+    """Save activations, puzzles, and token sequences together."""
     puzzle_arr = np.array(puzzles, dtype=f"U{len(puzzles[0])}")
-    np.savez_compressed(path, activations=activations, puzzles=puzzle_arr)
-    print(f"Saved probe dataset to {path} ({activations.shape})")
+    # Pad sequences to same length for storage
+    max_len = max(len(s) for s in sequences)
+    seq_arr = np.full((len(sequences), max_len), PAD_TOKEN, dtype=np.int16)
+    for i, s in enumerate(sequences):
+        seq_arr[i, :len(s)] = s
+    np.savez_compressed(path, activations=activations, puzzles=puzzle_arr, sequences=seq_arr)
+    size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
+    print(f"Saved probe dataset to {path} ({activations.shape}, {size_mb:.0f} MB)")
 
 
 def load_probe_dataset(path: str):
-    """Load cached activations and puzzles."""
+    """Load cached activations, puzzles, and sequences."""
     data = np.load(path)
     activations = data["activations"]
     puzzles = list(data["puzzles"])
+    seq_arr = data["sequences"]
+    # Convert back to list of lists, stripping padding
+    sequences = []
+    for row in seq_arr:
+        seq = row[row != PAD_TOKEN].tolist()
+        sequences.append(seq)
     print(f"Loaded probe dataset from {path} ({activations.shape})")
-    return activations, puzzles
+    return activations, puzzles, sequences
 
 
-def get_activations_at(activations: np.ndarray, puzzles: list[str], layer: int):
-    """Extract activations at the SEP token for a given layer.
+def get_activations_at_token(activations: np.ndarray, sequences: list[list[int]], layer: int, token_type: str = "sep"):
+    """Extract activations at a specific token position for a given layer.
 
     activations: (n_puzzles, n_layers, seq_len, d_model)
+    token_type: "sep" for SEP token position
     Returns: (n_puzzles, d_model)
     """
-    tokenized = [encode_clues(p) for p in puzzles]
-    sep_positions = [len(t) - 1 for t in tokenized]
-    layer_acts = activations[:, layer, :, :]  # (n_puzzles, seq_len, d_model)
-    return np.array([layer_acts[i, pos] for i, pos in enumerate(sep_positions)])
+    if token_type == "sep":
+        positions = []
+        for seq in sequences:
+            pos = seq.index(SEP_TOKEN)
+            positions.append(pos)
+    else:
+        raise ValueError(f"Unknown token_type: {token_type}")
+
+    layer_acts = activations[:, layer, :, :]
+    return np.array([layer_acts[i, pos] for i, pos in enumerate(positions)])
 
 
 def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False):
@@ -187,21 +208,31 @@ def main():
     args = parser.parse_args()
 
     if os.path.exists(args.cache_path):
-        activations, puzzles = load_probe_dataset(args.cache_path)
+        activations, puzzles, sequences = load_probe_dataset(args.cache_path)
     else:
         model_cfg = TransformerConfig(
             n_layers=args.n_layers, n_heads=args.n_heads,
             d_model=args.d_model, d_ff=args.d_ff, dtype=args.dtype,
         )
         params, model = load_checkpoint(args.ckpt_dir, model_cfg)
-        forward_fn = make_forward_fn(model)
         print("Model loaded")
 
         puzzles = load_puzzles(args.data_path, args.n_puzzles)
         print(f"Loaded {len(puzzles)} puzzles")
 
-        activations = collect_activations(forward_fn, params, puzzles, args.batch_size)
-        save_probe_dataset(args.cache_path, activations, puzzles)
+        # Step 1: batched autoregressive trace generation
+        gen_fn = make_gen_forward_fn(model)
+        print("Generating traces...")
+        traces = generate_traces_batched(gen_fn, params, puzzles, args.batch_size)
+        sequences = traces_to_sequences(puzzles, traces)
+        avg_len = np.mean([len(s) for s in sequences])
+        print(f"Average sequence length: {avg_len:.1f}")
+
+        # Step 2: single batched forward pass for activations
+        print("Collecting activations...")
+        intermediates_fn = make_intermediates_fn(model)
+        activations = collect_activations(intermediates_fn, params, sequences, args.batch_size)
+        save_probe_dataset(args.cache_path, activations, puzzles, sequences)
 
     n_layers = activations.shape[1]
     empty_pcts = []
@@ -211,7 +242,7 @@ def main():
 
     all_accuracies = {}
     for layer in range(n_layers):
-        sep_acts = get_activations_at(activations, puzzles, layer)
+        sep_acts = get_activations_at_token(activations, sequences, layer, "sep")
         print(f"\nLayer {layer}, activations shape: {sep_acts.shape}")
         accuracies = []
         for cell in range(81):

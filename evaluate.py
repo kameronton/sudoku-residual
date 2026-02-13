@@ -12,7 +12,7 @@ import optax
 import orbax.checkpoint as ocp
 from flax.training import train_state
 
-from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill
+from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
 from model import GPT2Model, TransformerConfig
 from training import make_schedule, TrainConfig, encode_clues, evaluate_puzzle
 from visualize import print_grid
@@ -82,6 +82,87 @@ def generate_trace(
     return trace
 
 
+def generate_traces_batched(
+    forward_fn, params, puzzles: list[str], batch_size: int = 64, temperature: float = 0.0,
+) -> list[list[tuple[int, int, int]]]:
+    """Batched autoregressive trace generation for multiple puzzles.
+
+    Returns a list of traces (one per puzzle), where each trace is a list of (row, col, digit).
+    """
+    n = len(puzzles)
+    all_traces: list[list[tuple[int, int, int]]] = [[] for _ in range(n)]
+
+    for batch_start in range(0, n, batch_size):
+        batch_puzzles = puzzles[batch_start : batch_start + batch_size]
+        bs = len(batch_puzzles)
+
+        # Encode clues for each puzzle in the batch
+        token_lists = [encode_clues(p) for p in batch_puzzles]
+        lengths = [len(t) for t in token_lists]
+        max_empties = [sum(1 for ch in p if ch not in "123456789") for p in batch_puzzles]
+        done = [False] * bs
+        steps_taken = [0] * bs
+
+        # Pad to MAX_SEQ_LEN
+        sequences = jnp.full((bs, MAX_SEQ_LEN), PAD_TOKEN, dtype=jnp.int32)
+        for i, toks in enumerate(token_lists):
+            sequences = sequences.at[i, :len(toks)].set(jnp.array(toks, dtype=jnp.int32))
+        cur_lengths = list(lengths)
+
+        max_steps = MAX_SEQ_LEN - min(lengths)
+        for _ in range(max_steps):
+            if all(done):
+                break
+
+            logits = forward_fn(params, sequences)
+
+            for i in range(bs):
+                if done[i]:
+                    continue
+                pos = cur_lengths[i]
+                if pos >= MAX_SEQ_LEN:
+                    done[i] = True
+                    continue
+
+                next_logits = logits[i, pos - 1, :]
+                if temperature <= 0:
+                    token = int(jnp.argmax(next_logits))
+                else:
+                    next_logits = next_logits / temperature
+                    token = int(jax.random.categorical(
+                        jax.random.PRNGKey(pos), next_logits
+                    ))
+
+                if token in (PAD_TOKEN, SEP_TOKEN) or token < 0 or token > 728:
+                    done[i] = True
+                    continue
+
+                r, c, d = decode_fill(token)
+                all_traces[batch_start + i].append((r, c, d))
+                sequences = sequences.at[i, pos].set(token)
+                cur_lengths[i] += 1
+                steps_taken[i] += 1
+
+                if steps_taken[i] >= max_empties[i]:
+                    done[i] = True
+
+        print(f"  Generated {min(batch_start + bs, n)}/{n}", end="\r")
+
+    print()
+    return all_traces
+
+
+def traces_to_sequences(puzzles: list[str], traces: list[list[tuple[int, int, int]]]) -> list[list[int]]:
+    """Convert puzzles + traces into full token sequences."""
+    sequences = []
+    for puzzle, trace in zip(puzzles, traces):
+        tokens = encode_clues(puzzle)
+        for r, c, d in trace:
+            tokens.append(encode_fill(r, c, d))
+        sequences.append(tokens)
+    return sequences
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate model on Sudoku puzzles")
     parser.add_argument("--ckpt_dir", default="checkpoints")
@@ -90,6 +171,7 @@ def main():
     parser.add_argument("--offset", type=int, default=0, help="Start index in CSV")
     parser.add_argument("--random_sample", action="store_true", help="Sample random puzzles")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--quiet", action="store_true", help="Only show summary")
     parser.add_argument("--n_layers", type=int, default=6)
     parser.add_argument("--n_heads", type=int, default=4)
@@ -122,14 +204,15 @@ def main():
         puzzles = random.sample(puzzles, min(args.n, len(puzzles)))
     puzzles = puzzles[:args.n]
 
-    print(f"Compiling...", flush=True)
+    print(f"Generating traces (batch_size={args.batch_size})...", flush=True)
+    puzzle_strs = [p for p, _ in puzzles]
+    traces = generate_traces_batched(forward_fn, params, puzzle_strs, args.batch_size, args.temperature)
 
     all_stats = []
-    for idx, (puzzle, solution) in enumerate(puzzles):
+    for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
         if not args.quiet:
             print(f"\nPuzzle {idx + 1}/{len(puzzles)}:")
             print_grid(list(puzzle))
-        trace = generate_trace(forward_fn, params, puzzle, args.temperature)
         stats = evaluate_puzzle(trace, puzzle, solution, verbose=not args.quiet)
         all_stats.append(stats)
 
