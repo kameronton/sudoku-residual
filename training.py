@@ -1,6 +1,7 @@
 """Training loop and utilities for GPT-2 Sudoku model."""
 
 import argparse
+import dataclasses
 import json
 import os
 import random
@@ -27,7 +28,7 @@ from visualize import print_grid
 
 @dataclass
 class TrainConfig:
-    traces_path: str = "traces_constraint.npz"
+    traces_path: str = "traces.npz"
     resume: bool = False
     batch_size: int = 64
     num_tokens: int = 100_000_000
@@ -358,28 +359,29 @@ def train(cfg: TrainConfig):
 
     # Resume from checkpoint if a flag is set *and* a checkpoint exists
     start_step = 0
-    schedule_meta_path = os.path.join(cfg.ckpt_dir, "schedule_meta.json")
     if ckpt_mgr.latest_step() is not None and cfg.resume:
-        # Restore original schedule parameters so the LR curve is unchanged
-        if os.path.exists(schedule_meta_path):
-            with open(schedule_meta_path) as f:
-                meta = json.load(f)
-            orig_total_steps = meta["total_steps"]
-            orig_warmup_steps = meta["warmup_steps"]
-            print(f"Restoring schedule from original run: {orig_total_steps} total, {orig_warmup_steps} warmup steps")
-            # Rebuild state with the original schedule before restoring weights
-            rng, reinit_rng = jax.random.split(rng)
-            state = create_train_state(reinit_rng, cfg, model_cfg, orig_total_steps, orig_warmup_steps)
         step = ckpt_mgr.latest_step()
-        restored = ckpt_mgr.restore(step, args=ocp.args.StandardRestore(state))
-        state = restored
-        start_step = int(state.step) # type: ignore
+        # First restore train_config + step to get original schedule params
+        meta = ckpt_mgr.restore(step, args=ocp.args.Composite(
+            step=ocp.args.JsonRestore(),
+            train_config=ocp.args.JsonRestore(),
+        ))
+        orig_cfg = meta.train_config
+        orig_total_steps = orig_cfg["num_tokens"] // (cfg.batch_size * (max_seq_len - 1))
+        orig_warmup_steps = orig_cfg["warmup_tokens"] // (cfg.batch_size * (max_seq_len - 1))
+        print(f"Restoring schedule from original run: {orig_total_steps} total, {orig_warmup_steps} warmup steps")
+        # Rebuild state with the original schedule before restoring weights
+        rng, reinit_rng = jax.random.split(rng)
+        state = create_train_state(reinit_rng, cfg, model_cfg, orig_total_steps, orig_warmup_steps)
+        # Now restore params + opt_state
+        restored = ckpt_mgr.restore(step, args=ocp.args.Composite(
+            params=ocp.args.StandardRestore(state.params),
+            opt_state=ocp.args.StandardRestore(state.opt_state),
+            step=ocp.args.JsonRestore(),
+        ))
+        state = state.replace(params=restored.params, opt_state=restored.opt_state, step=restored.step)
+        start_step = int(restored.step)
         print(f"Resumed from checkpoint at step {start_step}")
-
-    # Save schedule metadata (so resume can reconstruct the same LR curve)
-    if not os.path.exists(schedule_meta_path):
-        with open(schedule_meta_path, "w") as f:
-            json.dump({"total_steps": total_steps, "warmup_steps": warmup_steps}, f)
 
     # Logger
     logger = TrainLogger(log_path=cfg.log_path)
@@ -431,7 +433,13 @@ def train(cfg: TrainConfig):
             tqdm.write(f"  step {step + 1:>6d} | val_loss {avg_val:.4f}")
 
         if ckpt_every > 0 and (step + 1) % ckpt_every == 0:
-            ckpt_mgr.save(step + 1, args=ocp.args.StandardSave(state))
+            ckpt_mgr.save(step + 1, args=ocp.args.Composite(
+                params=ocp.args.StandardSave(state.params),
+                opt_state=ocp.args.StandardSave(state.opt_state),
+                step=ocp.args.JsonSave(int(state.step)),
+                model_config=ocp.args.JsonSave(dataclasses.asdict(model_cfg)),
+                train_config=ocp.args.JsonSave(dataclasses.asdict(cfg)),
+            ))
             ckpt_mgr.wait_until_finished()
             logger.log_checkpoint(step + 1)
             tqdm.write(f"  checkpoint saved at step {step + 1}")
@@ -439,7 +447,13 @@ def train(cfg: TrainConfig):
     pbar.close()
 
     # Final checkpoint
-    ckpt_mgr.save(total_steps, args=ocp.args.StandardSave(state))
+    ckpt_mgr.save(total_steps, args=ocp.args.Composite(
+                params=ocp.args.StandardSave(state.params),
+                opt_state=ocp.args.StandardSave(state.opt_state),
+                step=ocp.args.JsonSave(int(state.step)),
+                model_config=ocp.args.JsonSave(dataclasses.asdict(model_cfg)),
+                train_config=ocp.args.JsonSave(dataclasses.asdict(cfg)),
+            ))
     ckpt_mgr.wait_until_finished()
 
     logger.save()

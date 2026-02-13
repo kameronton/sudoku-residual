@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN
-from model import GPT2Model, TransformerConfig
+from model import GPT2Model
 from training import encode_clues
 from evaluate import load_checkpoint, generate_traces_batched, traces_to_sequences, make_forward_fn as make_gen_forward_fn
 
@@ -237,21 +237,12 @@ def main():
     parser.add_argument("--output", default="probe_accuracies.png")
     parser.add_argument("--n_puzzles", type=int, default=6400)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--n_layers", type=int, default=6)
-    parser.add_argument("--n_heads", type=int, default=6)
-    parser.add_argument("--d_model", type=int, default=384)
-    parser.add_argument("--d_ff", type=int, default=1536)
-    parser.add_argument("--dtype", default="bfloat16")
     args = parser.parse_args()
 
     if os.path.exists(args.cache_path):
         activations, puzzles, sequences = load_probe_dataset(args.cache_path)
     else:
-        model_cfg = TransformerConfig(
-            n_layers=args.n_layers, n_heads=args.n_heads,
-            d_model=args.d_model, d_ff=args.d_ff, dtype=args.dtype,
-        )
-        params, model = load_checkpoint(args.ckpt_dir, model_cfg)
+        params, model = load_checkpoint(args.ckpt_dir)
         print("Model loaded")
 
         puzzles = load_puzzles(args.data_path, args.n_puzzles)

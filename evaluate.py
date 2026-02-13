@@ -8,35 +8,35 @@ import random
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import orbax.checkpoint as ocp
-from flax.training import train_state
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
 from model import GPT2Model, TransformerConfig
-from training import make_schedule, TrainConfig, encode_clues, evaluate_puzzle
+from training import encode_clues, evaluate_puzzle
 from visualize import print_grid
 
 
-def load_checkpoint(ckpt_dir: str, model_cfg: TransformerConfig):
-    """Restore params from the latest checkpoint. Returns (params, apply_fn)."""
-    model = GPT2Model(model_cfg)
-    rng = jax.random.PRNGKey(0)
-    dummy = jnp.ones((1, MAX_SEQ_LEN), dtype=jnp.int32)
-    params = model.init(rng, dummy)["params"]
+def load_checkpoint(ckpt_dir: str, model_cfg: TransformerConfig = None):
+    """Restore params from the latest checkpoint. Returns (params, model).
 
-    train_cfg = TrainConfig()
-    schedule = make_schedule(train_cfg, total_steps=1, warmup_steps=0)
-    tx = optax.adamw(learning_rate=schedule, weight_decay=train_cfg.weight_decay)
-    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-
+    If model_cfg is None, loads config from the checkpoint.
+    """
     ckpt_mgr = ocp.CheckpointManager(os.path.abspath(ckpt_dir))
     step = ckpt_mgr.latest_step()
     if step is None:
         raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
-    state = ckpt_mgr.restore(step, args=ocp.args.StandardRestore(state))
-    print(f"Loaded checkpoint at step {int(state.step)}", flush=True)
-    return state.params, model
+    if model_cfg is None:
+        meta = ckpt_mgr.restore(step, args=ocp.args.Composite(
+            model_config=ocp.args.JsonRestore(),
+        ))
+        model_cfg = TransformerConfig(**meta.model_config)
+    model = GPT2Model(model_cfg)
+    params = model.init(jax.random.PRNGKey(0), jnp.ones((1, model_cfg.max_seq_len), jnp.int32))["params"]
+    restored = ckpt_mgr.restore(step, args=ocp.args.Composite(
+        params=ocp.args.StandardRestore(params),
+    ))
+    print(f"Loaded checkpoint at step {step}", flush=True)
+    return restored.params, model
 
 
 def make_forward_fn(model):
@@ -173,18 +173,20 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--quiet", action="store_true", help="Only show summary")
-    parser.add_argument("--n_layers", type=int, default=6)
-    parser.add_argument("--n_heads", type=int, default=4)
-    parser.add_argument("--d_model", type=int, default=128)
-    parser.add_argument("--d_ff", type=int, default=512)
-    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--n_layers", type=int, default=None)
+    parser.add_argument("--n_heads", type=int, default=None)
+    parser.add_argument("--d_model", type=int, default=None)
+    parser.add_argument("--d_ff", type=int, default=None)
+    parser.add_argument("--dtype", type=str, default=None, choices=["float32", "bfloat16", "float16"])
     args = parser.parse_args()
 
-    model_cfg = TransformerConfig(
-        n_layers=args.n_layers, n_heads=args.n_heads,
-        d_model=args.d_model, d_ff=args.d_ff,
-        dtype=args.dtype,
-    )
+    model_cfg = None
+    if any(v is not None for v in [args.n_layers, args.n_heads, args.d_model, args.d_ff, args.dtype]):
+        model_cfg = TransformerConfig(
+            n_layers=args.n_layers or 6, n_heads=args.n_heads or 4,
+            d_model=args.d_model or 128, d_ff=args.d_ff or 512,
+            dtype=args.dtype or "float32",
+        )
     params, model = load_checkpoint(args.ckpt_dir, model_cfg)
     forward_fn = make_forward_fn(model)
 
