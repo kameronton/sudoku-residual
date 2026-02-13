@@ -196,6 +196,26 @@ def first_inconsistent_cell(
     return None
 
 
+def plot_mistake_position_distribution(
+    steps_from_end: list[int], output_path: str,
+) -> None:
+    """Plot histogram of how many steps from the end of the trace the first mistake occurs."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    max_val = max(steps_from_end)
+    bins = min(max_val + 1, 50)
+    ax.hist(steps_from_end, bins=bins, edgecolor="black", linewidth=0.5)
+    ax.set_xlabel("Steps from end of trace")
+    ax.set_ylabel("Count")
+    ax.set_title(f"First mistake position ({len(steps_from_end)} puzzles with errors)")
+    ax.invert_xaxis()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved mistake position distribution to {output_path}")
+
+
 def plot_first_mistake_heatmap(
     positions: list[tuple[int, int]], output_path: str,
 ) -> None:
@@ -246,28 +266,36 @@ def main():
     parser.add_argument("--d_ff", type=int, default=None)
     parser.add_argument("--dtype", type=str, default=None, choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--mistake-map", action="store_true", help="Plot first-mistake heatmap from cached traces")
+    parser.add_argument("--mistake-position", action="store_true", help="Plot distribution of first-mistake position (steps from end)")
     parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cached probe dataset")
-    parser.add_argument("--output", default="first_mistake_heatmap.png", help="Output path for mistake heatmap")
+    parser.add_argument("--output", default=None, help="Output path for plots")
     args = parser.parse_args()
 
     # Use cached traces if --cache_path was explicitly provided
     use_cache = '--cache_path' in sys.argv or '--cache-path' in sys.argv
 
-    if args.mistake_map:
+    if args.mistake_map or args.mistake_position:
         from probes import load_probe_dataset
         activations, puzzles, sequences = load_probe_dataset(args.cache_path)
         traces = sequences_to_traces(sequences)
         positions = []
+        steps_from_end = []
         for puzzle, trace in zip(puzzles, traces):
             result = first_inconsistent_cell(trace, puzzle)
             if result is not None:
-                r, c, _ = result
+                r, c, step_idx = result
                 positions.append((r, c))
+                steps_from_end.append(len(trace) - step_idx)
         print(f"Found first mistakes in {len(positions)}/{len(puzzles)} puzzles")
-        if positions:
-            plot_first_mistake_heatmap(positions, args.output)
-        else:
+        if not positions:
             print("No mistakes found — nothing to plot.")
+            return
+        if args.mistake_map:
+            out = args.output or "first_mistake_heatmap.png"
+            plot_first_mistake_heatmap(positions, out)
+        if args.mistake_position:
+            out = args.output or "first_mistake_position.png"
+            plot_mistake_position_distribution(steps_from_end, out)
         return
 
     if use_cache:
