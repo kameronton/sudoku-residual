@@ -4,6 +4,7 @@ import argparse
 import csv
 import os
 import random
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -12,7 +13,7 @@ import orbax.checkpoint as ocp
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
 from model import GPT2Model, TransformerConfig
-from training import encode_clues, evaluate_puzzle
+from training import encode_clues, evaluate_puzzle, _is_consistent
 from visualize import print_grid
 
 
@@ -163,6 +164,72 @@ def traces_to_sequences(puzzles: list[str], traces: list[list[tuple[int, int, in
     return sequences
 
 
+def sequences_to_traces(sequences: list[list[int]]) -> list[list[tuple[int, int, int]]]:
+    """Extract trace tokens from sequences (everything after SEP_TOKEN)."""
+    traces = []
+    for seq in sequences:
+        trace = []
+        after_sep = False
+        for tok in seq:
+            if tok == SEP_TOKEN:
+                after_sep = True
+                continue
+            if after_sep and 0 <= tok <= 728:
+                trace.append(decode_fill(tok))
+        traces.append(trace)
+    return traces
+
+
+def first_inconsistent_cell(
+    trace: list[tuple[int, int, int]], puzzle: str,
+) -> tuple[int, int, int] | None:
+    """Replay trace on puzzle grid, return (row, col, step_idx) of first inconsistency, or None."""
+    grid = list(puzzle)
+    for step_idx, (r, c, d) in enumerate(trace):
+        pos = r * 9 + c
+        if grid[pos] not in ".0":
+            # Overwriting a clue or previous fill — treat as inconsistency
+            return (r, c, step_idx)
+        if not _is_consistent(grid, r, c, d):
+            return (r, c, step_idx)
+        grid[pos] = str(d)
+    return None
+
+
+def plot_first_mistake_heatmap(
+    positions: list[tuple[int, int]], output_path: str,
+) -> None:
+    """Plot 9x9 heatmap of first-mistake positions and save to file."""
+    import matplotlib.pyplot as plt
+
+    counts = np.zeros((9, 9), dtype=int)
+    for r, c in positions:
+        counts[r, c] += 1
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(counts, cmap="Reds", origin="upper")
+    # Annotate cells
+    for i in range(9):
+        for j in range(9):
+            v = counts[i, j]
+            if v > 0:
+                ax.text(j, i, str(v), ha="center", va="center", fontsize=9,
+                        color="white" if v > counts.max() / 2 else "black")
+    # Sudoku box lines
+    for k in range(0, 10, 3):
+        lw = 2
+        ax.axhline(k - 0.5, color="black", linewidth=lw)
+        ax.axvline(k - 0.5, color="black", linewidth=lw)
+    ax.set_xticks(range(9))
+    ax.set_yticks(range(9))
+    ax.set_title(f"First mistake location ({len(positions)} puzzles with errors)")
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved heatmap to {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate model on Sudoku puzzles")
     parser.add_argument("--ckpt_dir", default="checkpoints")
@@ -178,45 +245,96 @@ def main():
     parser.add_argument("--d_model", type=int, default=None)
     parser.add_argument("--d_ff", type=int, default=None)
     parser.add_argument("--dtype", type=str, default=None, choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--mistake-map", action="store_true", help="Plot first-mistake heatmap from cached traces")
+    parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cached probe dataset")
+    parser.add_argument("--output", default="first_mistake_heatmap.png", help="Output path for mistake heatmap")
     args = parser.parse_args()
 
-    model_cfg = None
-    if any(v is not None for v in [args.n_layers, args.n_heads, args.d_model, args.d_ff, args.dtype]):
-        model_cfg = TransformerConfig(
-            n_layers=args.n_layers or 6, n_heads=args.n_heads or 4,
-            d_model=args.d_model or 128, d_ff=args.d_ff or 512,
-            dtype=args.dtype or "float32",
-        )
-    params, model = load_checkpoint(args.ckpt_dir, model_cfg)
-    forward_fn = make_forward_fn(model)
+    # Use cached traces if --cache_path was explicitly provided
+    use_cache = '--cache_path' in sys.argv or '--cache-path' in sys.argv
 
-    # Load puzzles
-    puzzles = []
-    with open(args.data_path) as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            if args.random_sample:
-                puzzles.append((row["puzzle"], row["solution"]))
-            elif args.offset <= i < args.offset + args.n:
-                puzzles.append((row["puzzle"], row["solution"]))
-            if not args.random_sample and i >= args.offset + args.n:
-                break
+    if args.mistake_map:
+        from probes import load_probe_dataset
+        activations, puzzles, sequences = load_probe_dataset(args.cache_path)
+        traces = sequences_to_traces(sequences)
+        positions = []
+        for puzzle, trace in zip(puzzles, traces):
+            result = first_inconsistent_cell(trace, puzzle)
+            if result is not None:
+                r, c, _ = result
+                positions.append((r, c))
+        print(f"Found first mistakes in {len(positions)}/{len(puzzles)} puzzles")
+        if positions:
+            plot_first_mistake_heatmap(positions, args.output)
+        else:
+            print("No mistakes found — nothing to plot.")
+        return
 
-    if args.random_sample:
-        puzzles = random.sample(puzzles, min(args.n, len(puzzles)))
-    puzzles = puzzles[:args.n]
+    if use_cache:
+        from probes import load_probe_dataset
+        activations, puzzles_cached, sequences = load_probe_dataset(args.cache_path)
+        traces = sequences_to_traces(sequences)
 
-    print(f"Generating traces (batch_size={args.batch_size})...", flush=True)
-    puzzle_strs = [p for p, _ in puzzles]
-    traces = generate_traces_batched(forward_fn, params, puzzle_strs, args.batch_size, args.temperature)
+        # Look up solutions from CSV
+        solution_map = {}
+        with open(args.data_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                solution_map[row["puzzle"]] = row["solution"]
 
-    all_stats = []
-    for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
-        if not args.quiet:
-            print(f"\nPuzzle {idx + 1}/{len(puzzles)}:")
-            print_grid(list(puzzle))
-        stats = evaluate_puzzle(trace, puzzle, solution, verbose=not args.quiet)
-        all_stats.append(stats)
+        puzzles = []
+        for p in puzzles_cached:
+            sol = solution_map.get(p)
+            if sol is None:
+                raise ValueError(f"Solution not found in {args.data_path} for puzzle: {p[:20]}...")
+            puzzles.append((p, sol))
+
+        all_stats = []
+        for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
+            if not args.quiet:
+                print(f"\nPuzzle {idx + 1}/{len(puzzles)}:")
+                print_grid(list(puzzle))
+            stats = evaluate_puzzle(trace, puzzle, solution, verbose=not args.quiet)
+            all_stats.append(stats)
+
+    else:
+        model_cfg = None
+        if any(v is not None for v in [args.n_layers, args.n_heads, args.d_model, args.d_ff, args.dtype]):
+            model_cfg = TransformerConfig(
+                n_layers=args.n_layers or 6, n_heads=args.n_heads or 4,
+                d_model=args.d_model or 128, d_ff=args.d_ff or 512,
+                dtype=args.dtype or "float32",
+            )
+        params, model = load_checkpoint(args.ckpt_dir, model_cfg)
+        forward_fn = make_forward_fn(model)
+
+        # Load puzzles
+        puzzles = []
+        with open(args.data_path) as f:
+            reader = csv.DictReader(f)
+            for i, row in enumerate(reader):
+                if args.random_sample:
+                    puzzles.append((row["puzzle"], row["solution"]))
+                elif args.offset <= i < args.offset + args.n:
+                    puzzles.append((row["puzzle"], row["solution"]))
+                if not args.random_sample and i >= args.offset + args.n:
+                    break
+
+        if args.random_sample:
+            puzzles = random.sample(puzzles, min(args.n, len(puzzles)))
+        puzzles = puzzles[:args.n]
+
+        print(f"Generating traces (batch_size={args.batch_size})...", flush=True)
+        puzzle_strs = [p for p, _ in puzzles]
+        traces = generate_traces_batched(forward_fn, params, puzzle_strs, args.batch_size, args.temperature)
+
+        all_stats = []
+        for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
+            if not args.quiet:
+                print(f"\nPuzzle {idx + 1}/{len(puzzles)}:")
+                print_grid(list(puzzle))
+            stats = evaluate_puzzle(trace, puzzle, solution, verbose=not args.quiet)
+            all_stats.append(stats)
 
     # Summary
     n = len(all_stats)
