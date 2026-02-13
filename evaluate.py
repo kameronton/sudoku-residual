@@ -275,19 +275,14 @@ def main():
         activations, puzzles_cached, sequences = load_probe_dataset(args.cache_path)
         traces = sequences_to_traces(sequences)
 
-        # Look up solutions from CSV
-        solution_map = {}
-        with open(args.data_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                solution_map[row["puzzle"]] = row["solution"]
-
+        # Solve puzzles to get solutions
+        from data import solve
         puzzles = []
         for p in puzzles_cached:
-            sol = solution_map.get(p)
-            if sol is None:
-                raise ValueError(f"Solution not found in {args.data_path} for puzzle: {p[:20]}...")
-            puzzles.append((p, sol))
+            result = solve(p)
+            if result is None:
+                raise ValueError(f"Solver failed for puzzle: {p[:20]}...")
+            puzzles.append((p, result[0]))
 
         all_stats = []
         for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
