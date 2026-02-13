@@ -95,16 +95,51 @@ def get_activations_at_token(activations: np.ndarray, sequences: list[list[int]]
     token_type: "sep" for SEP token position
     Returns: (n_puzzles, d_model)
     """
-    if token_type == "sep":
-        positions = []
-        for seq in sequences:
-            pos = seq.index(SEP_TOKEN)
-            positions.append(pos)
-    else:
-        raise ValueError(f"Unknown token_type: {token_type}")
-
     layer_acts = activations[:, layer, :, :]
-    return np.array([layer_acts[i, pos] for i, pos in enumerate(positions)])
+    
+    if ":" in token_type: # concatenating two tokens, checking if the information is distributed
+        token1, token2 = token_type.split(":")
+
+        if token1 == "sep":
+            positions1 = []
+            for seq in sequences:
+                pos = seq.index(SEP_TOKEN)
+                positions1.append(pos)
+        else:
+            raise ValueError(f"Unsupported token_type: {token1}")
+        
+        if token2.startswith("sep") or token1.isdigit():
+            positions2 = []
+            if token2.startswith("sep"):
+                shift = int(token2[3:])
+                for seq in sequences:
+                    pos = seq.index(SEP_TOKEN) + shift
+                    positions2.append(pos)
+            elif token2.isdigit():
+                positions2 = [int(token2) for seq in sequences]
+        else:
+            raise ValueError(f"Unknown token_type: {token1}")
+        
+        return np.array([ np.concat([layer_acts[i, pos1], layer_acts[i, pos2]]) for i, (pos1, pos2) in enumerate(zip(positions1, positions2))])
+    
+    else:
+        if token_type == "sep":
+            positions = []
+            for seq in sequences:
+                pos = seq.index(SEP_TOKEN)
+                positions.append(pos)
+        elif token_type.startswith("sep"):
+            shift = int(token_type[3:])
+            positions = []
+            for seq in sequences:
+                pos = seq.index(SEP_TOKEN) + shift
+                positions.append(pos)
+        elif token_type.isdigit():
+            positions = [int(token_type) for seq in sequences]
+        else:
+            raise ValueError(f"Unknown token_type: {token_type}")
+
+        return np.array([layer_acts[i, pos] for i, pos in enumerate(positions)])
 
 
 def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False):
@@ -150,7 +185,7 @@ def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbo
     return acc, y_test_labels[filled], preds[filled]
 
 
-def plot_all_layers(all_accuracies: dict[int, list[float]], empty_pcts: list[float]):
+def plot_all_layers(all_accuracies: dict[int, list[float]], empty_pcts: list[float], output_path: str = "probe_accuracies.png"):
     """Plot 9x9 heatmap per layer with shared colorbar."""
     import matplotlib.pyplot as plt
 
@@ -188,8 +223,8 @@ def plot_all_layers(all_accuracies: dict[int, list[float]], empty_pcts: list[flo
     fig.suptitle("Per-cell probe accuracy by layer", fontsize=14, y=1.02)
     fig.tight_layout()
     fig.colorbar(ims[0], ax=axes[:n_layers].tolist(), shrink=0.6, label="Accuracy", pad=0.02)
-    fig.savefig("probe_accuracies.png", dpi=150, bbox_inches="tight")
-    print("Saved probe_accuracies.png")
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved {output_path}")
     plt.show()
 
 
@@ -198,6 +233,8 @@ def main():
     parser.add_argument("--ckpt_dir", default="checkpoints")
     parser.add_argument("--data_path", default="sudoku-3m.csv")
     parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cache activations + puzzles")
+    parser.add_argument("--token_type", default="sep")
+    parser.add_argument("--output", default="probe_accuracies.png")
     parser.add_argument("--n_puzzles", type=int, default=6400)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--n_layers", type=int, default=6)
@@ -242,7 +279,7 @@ def main():
 
     all_accuracies = {}
     for layer in range(n_layers):
-        sep_acts = get_activations_at_token(activations, sequences, layer, "sep")
+        sep_acts = get_activations_at_token(activations, sequences, layer, args.token_type)
         print(f"\nLayer {layer}, activations shape: {sep_acts.shape}")
         accuracies = []
         for cell in range(81):
@@ -253,7 +290,7 @@ def main():
         print(f"  Layer {layer} | Mean accuracy (filled): {avg:.3f}")
         all_accuracies[layer] = accuracies
 
-    plot_all_layers(all_accuracies, empty_pcts)
+    plot_all_layers(all_accuracies, empty_pcts, args.output)
 
 
 if __name__ == "__main__":
