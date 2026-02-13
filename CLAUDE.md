@@ -25,6 +25,12 @@ uv run python training.py --traces_path traces_constraint.npz --batch_size 512 -
 # Evaluation — autoregressive generation on held-out puzzles
 uv run python evaluate.py --ckpt_dir checkpoints --data_path sudoku-3m.csv --n 100
 
+# Evaluation from cached probe dataset (no checkpoint needed)
+uv run python evaluate.py --cache_path probe_acts.npz --data_path sudoku-3m.csv --quiet
+
+# First-mistake heatmap from cached traces
+uv run python evaluate.py --mistake-map --cache_path probe_acts.npz
+
 # Probing — linear probes on residual stream activations
 uv run python probes.py --ckpt_dir checkpoints --data_path sudoku-3m.csv --n_puzzles 1000
 uv run python probes.py --single-cell --ckpt_dir checkpoints   # single cell filled/empty probe
@@ -94,6 +100,8 @@ Also includes single-cell and multi-cell binary probe experiments that test whet
 ### Evaluation (`evaluate.py`)
 
 Loads a checkpoint, autoregressively generates solving traces for puzzles from CSV, and reports per-puzzle and aggregate statistics: cell accuracy, solve rate, consistency errors, clue/fill overwrites.
+
+Also supports evaluation from cached probe datasets (`--cache_path`) without needing a checkpoint — solutions are computed via the solver in `data.py`. The `--mistake-map` flag plots a 9×9 heatmap of where first inconsistencies occur across puzzles.
 
 ## Key Design Decisions
 

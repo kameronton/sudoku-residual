@@ -51,6 +51,18 @@ uv run python evaluate.py --ckpt_dir checkpoints --data_path sudoku-3m.csv --n 1
 
 Key flags: `--n` (number of puzzles), `--random_sample`, `--temperature`, `--quiet` (summary only).
 
+You can also evaluate from a cached probe dataset (no checkpoint needed):
+
+```bash
+uv run python evaluate.py --cache_path probe_acts.npz --data_path sudoku-3m.csv --quiet
+```
+
+To plot a heatmap of where the model's first mistakes occur:
+
+```bash
+uv run python evaluate.py --mistake-map --cache_path probe_acts.npz
+```
+
 ### 4. Visualize traces
 
 Step through a solving trace to see how cells are filled:
