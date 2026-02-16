@@ -98,7 +98,28 @@ Probe modes (`--mode`):
 - `state_filled` — what digit is in each filled cell? (default)
 - `candidates` — which digits are legal for each empty cell? (reports F1)
 
+The `--step` flag controls which point in the solving trace to probe:
+- `--step 0` (default) — probe at the `<sep>` token; ground truth = initial board (clues only)
+- `--step N` (N ≥ 1) — probe at sep+N; ground truth = board state after N trace fills
+
+```bash
+# Probe the initial board state (default)
+uv run python probes.py --cache_path probe_acts.npz
+
+# Probe after 10 fills — does the model track the evolving board?
+uv run python probes.py --step 10 --cache_path probe_acts.npz
+```
+
+Filtering flags:
+- `--filter {solved,unsolved}` — restrict both training and evaluation to a subset of puzzles
+- `--eval-filter {solved,unsolved}` — train on all puzzles (80/20 split), evaluate only on the specified subset of held-out data
+
+```bash
+# Train on all, report accuracy separately for solved vs unsolved
+uv run python probes.py --eval-filter solved --cache_path probe_acts.npz
+uv run python probes.py --eval-filter unsolved --cache_path probe_acts.npz
+```
+
 Other useful flags:
-- `--token_type sep` (default) — probe the `<sep>` token activations; alternatives depend on your experiment
 - `--per-digit` — produce a per-digit F1 heatmap (only with `--mode candidates`)
 - `--output probe_accuracies.png` — path for the output plot

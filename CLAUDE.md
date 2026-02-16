@@ -33,8 +33,11 @@ uv run python evaluate.py --mistake-map --cache_path probe_acts.npz
 
 # Probing — linear probes on residual stream activations
 uv run python probes.py --ckpt_dir checkpoints --data_path sudoku-3m.csv --n_puzzles 1000
-uv run python probes.py --single-cell --ckpt_dir checkpoints   # single cell filled/empty probe
-uv run python probes.py --multi-cell --ckpt_dir checkpoints    # multi-cell probe across grid
+uv run python probes.py --step 0 --cache_path probe_acts.npz   # probe at SEP (initial board)
+uv run python probes.py --step 10 --cache_path probe_acts.npz  # probe after 10 fills
+uv run python probes.py --eval-filter solved --cache_path probe_acts.npz   # train on all, eval on solved
+uv run python probes.py --eval-filter unsolved --cache_path probe_acts.npz # train on all, eval on unsolved
+uv run python probes.py --step 5 --filter solved --cache_path probe_acts.npz  # only solved puzzles, step 5
 
 # Visualization (step-through mode)
 uv run python visualize.py --data_path sudoku-3m.csv --index 0 --mode random --step
@@ -88,14 +91,20 @@ GPT-2 architecture with pre-norm (LayerNorm before attention/FFN). Causal maskin
 
 ### Probing (`probes.py`)
 
-Extracts residual stream activations at each layer, trains linear classifiers to predict:
-- **Filled mask**: which cells have clues (81-dim binary)
-- **Digit values**: what digit is in each cell (81-dim regression or per-cell classification)
-- **Candidate sets**: which digits are legal for each empty cell (81×9 binary)
+Extracts residual stream activations at each layer, trains linear classifiers (Ridge regression) to predict per-cell targets:
+- **Filled mask** (`--mode filled`): binary filled/empty classification
+- **Digit values** (`--mode state_filled`): 9-class digit classification on filled cells
+- **Candidate sets** (`--mode candidates`): 9-dim binary candidate vectors on empty cells
 
-Activation aggregation strategies: SEP token, mean over clues, concat(mean, max, SEP).
+The `--step` flag controls which token position to probe and what ground truth to use:
+- `--step 0` (default): probe at the SEP token, ground truth = initial board (clues only)
+- `--step N` (N ≥ 1): probe at sep+N, ground truth = board state after N trace fills
 
-Also includes single-cell and multi-cell binary probe experiments that test whether specific cell fill status is linearly decodable from activations at each layer.
+Filtering options:
+- `--filter {solved,unsolved}`: restrict both training and evaluation to a puzzle subset
+- `--eval-filter {solved,unsolved}`: train on all puzzles, evaluate only on the specified subset
+
+Core functions are split for reuse: `build_probe_targets` (data prep), `fit_probe` (Ridge fit), `eval_probe` (evaluation). `probe_cell` wraps all three with a train/test split.
 
 ### Evaluation (`evaluate.py`)
 

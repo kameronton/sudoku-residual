@@ -11,10 +11,10 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 
-from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN
+from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, solve
 from model import GPT2Model
-from training import encode_clues
-from evaluate import load_checkpoint, generate_traces_batched, traces_to_sequences, make_forward_fn as make_gen_forward_fn
+from training import encode_clues, evaluate_puzzle
+from evaluate import load_checkpoint, generate_traces_batched, traces_to_sequences, sequences_to_traces, make_forward_fn as make_gen_forward_fn
 
 
 def make_intermediates_fn(model: GPT2Model):
@@ -88,59 +88,6 @@ def load_probe_dataset(path: str):
     return activations, puzzles, sequences
 
 
-def get_activations_at_token(activations: np.ndarray, sequences: list[list[int]], layer: int, token_type: str = "sep"):
-    """Extract activations at a specific token position for a given layer.
-
-    activations: (n_puzzles, n_layers, seq_len, d_model)
-    token_type: "sep" for SEP token position
-    Returns: (n_puzzles, d_model)
-    """
-    layer_acts = activations[:, layer, :, :]
-    
-    if ":" in token_type: # concatenating two tokens, checking if the information is distributed
-        token1, token2 = token_type.split(":")
-
-        if token1 == "sep":
-            positions1 = []
-            for seq in sequences:
-                pos = seq.index(SEP_TOKEN)
-                positions1.append(pos)
-        else:
-            raise ValueError(f"Unsupported token_type: {token1}")
-        
-        if token2.startswith("sep") or token1.isdigit():
-            positions2 = []
-            if token2.startswith("sep"):
-                shift = int(token2[3:])
-                for seq in sequences:
-                    pos = seq.index(SEP_TOKEN) + shift
-                    positions2.append(pos)
-            elif token2.isdigit():
-                positions2 = [int(token2) for seq in sequences]
-        else:
-            raise ValueError(f"Unknown token_type: {token1}")
-        
-        return np.array([ np.concat([layer_acts[i, pos1], layer_acts[i, pos2]]) for i, (pos1, pos2) in enumerate(zip(positions1, positions2))])
-    
-    else:
-        if token_type == "sep":
-            positions = []
-            for seq in sequences:
-                pos = seq.index(SEP_TOKEN)
-                positions.append(pos)
-        elif token_type.startswith("sep"):
-            shift = int(token_type[3:])
-            positions = []
-            for seq in sequences:
-                pos = seq.index(SEP_TOKEN) + shift
-                positions.append(pos)
-        elif token_type.isdigit():
-            positions = [int(token_type) for seq in sequences]
-        else:
-            raise ValueError(f"Unknown token_type: {token_type}")
-
-        return np.array([layer_acts[i, pos] for i, pos in enumerate(positions)])
-
 
 def _cell_candidates(puzzle: str, cell_idx: int) -> list[int]:
     """Compute candidate digits for a cell from the puzzle string (empty cell only)."""
@@ -162,27 +109,23 @@ def _cell_candidates(puzzle: str, cell_idx: int) -> list[int]:
     return [1 if d not in used else 0 for d in range(1, 10)]
 
 
-def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False, mode: str = "candidates"):
-    """Train a ridge probe to predict a per-cell target from activations.
+def build_probe_targets(puzzles: list[str], cell_idx: int, mode: str):
+    """Build target vectors and labels for a cell probe.
 
-    Modes:
-    - "filled": binary classification (filled vs empty), evaluated on all cells.
-    - "state_filled": 9-class digit classification, evaluated only on filled cells.
-    - "candidates": 9-dim binary candidate sets, evaluated only on empty cells.
+    Returns (targets, labels) where:
+    - labels: (n,) int array, digit 1-9 for filled cells, 0 for empty
+    - targets: (n, k) float array, format depends on mode
     """
     n = len(puzzles)
     labels = np.array([int(p[cell_idx]) if p[cell_idx] in "123456789" else 0 for p in puzzles])
     filled_mask = labels > 0
 
     if mode == "filled":
-        # Binary: 2-class one-hot [empty, filled]
         targets = np.eye(2)[(labels > 0).astype(int)]
     elif mode == "state_filled":
-        # 9-class one-hot for filled cells; zero vector for empty
         targets = np.zeros((n, 9))
         targets[filled_mask] = np.eye(9)[labels[filled_mask] - 1]
     elif mode == "candidates":
-        # 9-dim binary candidate vectors for empty cells; zero vector for filled
         targets = np.zeros((n, 9))
         empty_mask = ~filled_mask
         for i in np.where(empty_mask)[0]:
@@ -190,16 +133,69 @@ def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbo
     else:
         raise ValueError(f"Unsupported target mode: {mode}")
 
-    # Single split using indices to keep labels/targets aligned
-    indices = np.arange(n)
+    return targets, labels
+
+
+def fit_probe(X_train: np.ndarray, y_train: np.ndarray, alpha: float = 1.0) -> Ridge:
+    """Fit a Ridge probe on training data."""
+    ridge = Ridge(alpha=alpha)
+    ridge.fit(X_train, y_train)
+    return ridge
+
+
+def eval_probe(ridge: Ridge, X_test: np.ndarray, y_test: np.ndarray, labels_test: np.ndarray, mode: str):
+    """Evaluate a fitted probe on test data.
+
+    Returns (metric, y_true, preds, per_digit).
+    """
+    raw_preds = ridge.predict(X_test)
+
+    if mode == "filled":
+        preds = raw_preds.argmax(axis=1)
+        y_true = (labels_test > 0).astype(int)
+        acc = accuracy_score(y_true, preds)
+        return acc, y_true, preds, None
+    elif mode == "state_filled":
+        filled_test = labels_test > 0
+        if not filled_test.any():
+            return float("nan"), np.array([]), np.array([]), None
+        preds = raw_preds[filled_test].argmax(axis=1) + 1
+        y_true = labels_test[filled_test]
+        acc = accuracy_score(y_true, preds)
+        return acc, y_true, preds, None
+    elif mode == "candidates":
+        empty_test = labels_test == 0
+        if not empty_test.any():
+            return float("nan"), np.array([]), np.array([]), np.full(9, float("nan"))
+        binary_preds = (raw_preds[empty_test] > 0.5).astype(int)
+        y_true = y_test[empty_test]
+        per_digit = np.array([
+            f1_score(y_true[:, d], binary_preds[:, d], zero_division=0.0)
+            for d in range(9)
+        ])
+        f1 = per_digit.mean()
+        return f1, y_true, binary_preds, per_digit
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+
+def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False, mode: str = "candidates"):
+    """Train and evaluate a ridge probe for a single cell. Convenience wrapper.
+
+    Modes:
+    - "filled": binary classification (filled vs empty), evaluated on all cells.
+    - "state_filled": 9-class digit classification, evaluated only on filled cells.
+    - "candidates": 9-dim binary candidate sets, evaluated only on empty cells.
+    """
+    targets, labels = build_probe_targets(puzzles, cell_idx, mode)
+
+    indices = np.arange(len(puzzles))
     idx_train, idx_test = train_test_split(indices, test_size=0.2, random_state=42)
 
-    X_train, X_test = activations[idx_train], activations[idx_test]
-    y_train, y_test = targets[idx_train], targets[idx_test]
-    labels_train, labels_test = labels[idx_train], labels[idx_test]
-
     if verbose:
-        n_filled = filled_mask.sum()
+        n_filled = (labels > 0).sum()
+        n = len(puzzles)
+        labels_train, labels_test = labels[idx_train], labels[idx_test]
         print(f"\n  Dataset: {n_filled} filled, {n - n_filled} empty out of {n}")
         print(f"  {'Class':>5}  {'Train':>6}  {'Test':>6}  {'Train%':>7}  {'Test%':>7}")
         for d in range(0, 10):
@@ -210,38 +206,8 @@ def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbo
             label = "empty" if d == 0 else str(d)
             print(f"  {label:>5}  {n_tr:>6}  {n_te:>6}  {pct_tr:>6.1f}%  {pct_te:>6.1f}%")
 
-    ridge = Ridge(alpha=1.0)
-    ridge.fit(X_train, y_train)
-    raw_preds = ridge.predict(X_test)
-
-    if mode == "filled":
-        preds = raw_preds.argmax(axis=1)  # 0=empty, 1=filled
-        y_true = (labels_test > 0).astype(int)
-        acc = accuracy_score(y_true, preds)
-        return acc, y_true, preds, None
-    elif mode == "state_filled":
-        # Evaluate only on filled cells
-        filled_test = labels_test > 0
-        if not filled_test.any():
-            return float("nan"), np.array([]), np.array([]), None
-        preds = raw_preds[filled_test].argmax(axis=1) + 1  # back to 1-9
-        y_true = labels_test[filled_test]
-        acc = accuracy_score(y_true, preds)
-        return acc, y_true, preds, None
-    elif mode == "candidates":
-        # Evaluate only on empty cells; threshold at 0.5 for binary predictions
-        empty_test = labels_test == 0
-        if not empty_test.any():
-            return float("nan"), np.array([]), np.array([]), np.full(9, float("nan"))
-        binary_preds = (raw_preds[empty_test] > 0.5).astype(int)
-        y_true = y_test[empty_test]
-        # Per-digit F1
-        per_digit = np.array([
-            f1_score(y_true[:, d], binary_preds[:, d], zero_division=0.0)
-            for d in range(9)
-        ])
-        f1 = per_digit.mean()
-        return f1, y_true, binary_preds, per_digit
+    ridge = fit_probe(activations[idx_train], targets[idx_train])
+    return eval_probe(ridge, activations[idx_test], targets[idx_test], labels[idx_test], mode)
 
 
 def plot_all_layers(
@@ -365,19 +331,67 @@ def plot_all_layers_per_digit(
     plt.show()
 
 
+def build_grid_at_step(puzzle: str, trace: list[tuple[int, int, int]], step: int) -> str:
+    """Replay the first step+1 fill actions on the puzzle grid. Returns 81-char grid string."""
+    grid = list(puzzle)
+    for i in range(min(step + 1, len(trace))):
+        r, c, d = trace[i]
+        grid[r * 9 + c] = str(d)
+    return "".join(grid)
+
+
+def get_activations_at_positions(activations: np.ndarray, positions: list[int], layer: int) -> np.ndarray:
+    """Extract activations at specific per-puzzle positions for a given layer.
+
+    activations: (n_puzzles, n_layers, seq_len, d_model)
+    positions: list of length n_puzzles, position index per puzzle
+    Returns: (n_puzzles, d_model)
+    """
+    layer_acts = activations[:, layer, :, :]
+    return np.array([layer_acts[i, pos] for i, pos in enumerate(positions)])
+
+
+def _compute_solve_mask(puzzles, traces):
+    """Return boolean array: True for puzzles the model solved correctly."""
+    mask = np.zeros(len(puzzles), dtype=bool)
+    for i, (puzzle, trace) in enumerate(zip(puzzles, traces)):
+        result = solve(puzzle)
+        if result is None:
+            continue
+        stats = evaluate_puzzle(trace, puzzle, result[0], verbose=False)
+        mask[i] = stats["puzzle_solved"]
+    return mask
+
+
+def _subset_by_indices(keep, activations, puzzles, sequences, traces=None):
+    """Return subsetted copies of all arrays/lists by index list."""
+    activations = activations[keep]
+    puzzles = [puzzles[i] for i in keep]
+    sequences = [sequences[i] for i in keep]
+    if traces is not None:
+        traces = [traces[i] for i in keep]
+        return activations, puzzles, sequences, traces
+    return activations, puzzles, sequences
+
+
 def main():
     parser = argparse.ArgumentParser(description="Linear probes on residual stream")
     parser.add_argument("--ckpt_dir", default="checkpoints")
     parser.add_argument("--data_path", default="sudoku-3m.csv")
     parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cache activations + puzzles")
-    parser.add_argument("--token_type", default="sep")
     parser.add_argument("--output", default="probe_accuracies.png")
     parser.add_argument("--n_puzzles", type=int, default=6400)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--mode", default="state_filled", choices=["filled", "state_filled", "candidates"])
     parser.add_argument("--per-digit", action="store_true", help="Per-digit F1 heatmap (candidates mode only)")
+    parser.add_argument("--step", type=int, default=0, help="Trace step to probe at (0 = SEP/initial board, 1 = after first fill, ...)")
+    parser.add_argument("--filter", choices=["all", "solved", "unsolved"], default="all",
+                        help="Filter puzzles for both train and eval")
+    parser.add_argument("--eval-filter", choices=["all", "solved", "unsolved"], default="all",
+                        help="Train on all, evaluate only on this subset of held-out data")
     args = parser.parse_args()
 
+    # --- Load data ---
     if os.path.exists(args.cache_path):
         activations, puzzles, sequences = load_probe_dataset(args.cache_path)
     else:
@@ -387,7 +401,6 @@ def main():
         puzzles = load_puzzles(args.data_path, args.n_puzzles)
         print(f"Loaded {len(puzzles)} puzzles")
 
-        # Step 1: batched autoregressive trace generation
         gen_fn = make_gen_forward_fn(model)
         print("Generating traces...")
         traces = generate_traces_batched(gen_fn, params, puzzles, args.batch_size)
@@ -395,42 +408,113 @@ def main():
         avg_len = np.mean([len(s) for s in sequences])
         print(f"Average sequence length: {avg_len:.1f}")
 
-        # Step 2: single batched forward pass for activations
         print("Collecting activations...")
         intermediates_fn = make_intermediates_fn(model)
         activations = collect_activations(intermediates_fn, params, sequences, args.batch_size)
         save_probe_dataset(args.cache_path, activations, puzzles, sequences)
 
+    traces = sequences_to_traces(sequences)
+
+    # --- Filter puzzles (affects both train and eval) ---
+    if args.filter != "all":
+        print(f"Filtering puzzles by solve status: {args.filter}")
+        solve_mask = _compute_solve_mask(puzzles, traces)
+        if args.filter == "solved":
+            keep = np.where(solve_mask)[0]
+        else:
+            keep = np.where(~solve_mask)[0]
+        activations, puzzles, sequences, traces = _subset_by_indices(keep, activations, puzzles, sequences, traces)
+        print(f"  Kept {len(puzzles)} {args.filter} puzzles")
+
+    # --- Build probe grids and positions at the given step ---
+    step = args.step
+    if step > 0:
+        keep = [i for i, t in enumerate(traces) if len(t) >= step]
+        if len(keep) < len(traces):
+            print(f"Filtered to {len(keep)}/{len(traces)} puzzles with >= {step} trace steps")
+            activations, puzzles, sequences, traces = _subset_by_indices(keep, activations, puzzles, sequences, traces)
+
+        if not puzzles:
+            print("No puzzles remaining after filtering.")
+            return
+
+    # step=0: original puzzle at SEP; step=N: board after N fills at sep+N
+    if step == 0:
+        probe_grids = puzzles
+    else:
+        probe_grids = [build_grid_at_step(p, t, step - 1) for p, t in zip(puzzles, traces)]
+    probe_positions = [seq.index(SEP_TOKEN) + step for seq in sequences]
+
+    # --- Compute eval mask (train on all, eval on subset) ---
+    eval_mask = None
+    if args.eval_filter != "all":
+        print(f"Eval filter: {args.eval_filter} (train on all, evaluate on {args.eval_filter})")
+        solve_mask = _compute_solve_mask(puzzles, traces)
+        if args.eval_filter == "solved":
+            eval_mask = solve_mask
+        else:
+            eval_mask = ~solve_mask
+        n_eval = eval_mask.sum()
+        print(f"  {n_eval}/{len(puzzles)} puzzles in eval set")
+        if n_eval == 0:
+            print("No puzzles in eval set.")
+            return
+
+    # --- Probing loop ---
     n_layers = activations.shape[1]
     empty_pcts = []
     for cell in range(81):
-        n_empty = sum(1 for p in puzzles if p[cell] not in "123456789")
-        empty_pcts.append(n_empty / len(puzzles) * 100)
+        n_empty = sum(1 for g in probe_grids if g[cell] not in "123456789")
+        empty_pcts.append(n_empty / len(probe_grids) * 100)
 
     all_accuracies = {}
     all_per_digit = {}
     for layer in range(n_layers):
-        sep_acts = get_activations_at_token(activations, sequences, layer, args.token_type)
-        print(f"\nLayer {layer}, activations shape: {sep_acts.shape}")
+        acts = get_activations_at_positions(activations, probe_positions, layer)
+        print(f"\nLayer {layer}, activations shape: {acts.shape}")
+
         accuracies = []
         per_digit_layer = []
         for cell in range(81):
             print(f"  Layer {layer} | Cell {cell:2d}/81", end="\r")
-            acc, _, _, per_digit = probe_cell(sep_acts, puzzles, cell, mode=args.mode)
-            accuracies.append(acc)
+
+            if eval_mask is not None:
+                # Train on 80% of all, eval on solved/unsolved subset of held-out 20%
+                targets, labels = build_probe_targets(probe_grids, cell, args.mode)
+                indices = np.arange(len(probe_grids))
+                idx_train, idx_test = train_test_split(indices, test_size=0.2, random_state=42)
+                ridge = fit_probe(acts[idx_train], targets[idx_train])
+                # Filter test set by eval_mask
+                test_eval = np.intersect1d(idx_test, np.where(eval_mask)[0])
+                if len(test_eval) == 0:
+                    metric_val, per_digit = float("nan"), None
+                else:
+                    metric_val, _, _, per_digit = eval_probe(
+                        ridge, acts[test_eval], targets[test_eval], labels[test_eval], args.mode,
+                    )
+            else:
+                metric_val, _, _, per_digit = probe_cell(acts, probe_grids, cell, mode=args.mode)
+
+            accuracies.append(metric_val)
             if per_digit is not None:
                 per_digit_layer.append(per_digit)
+
         metric = "F1" if args.mode == "candidates" else "Accuracy"
         avg = np.nanmean(accuracies)
         print(f"  Layer {layer} | Mean {metric.lower()} ({args.mode}): {avg:.3f}")
         all_accuracies[layer] = accuracies
         if per_digit_layer:
-            all_per_digit[layer] = np.array(per_digit_layer)  # (81, 9)
+            all_per_digit[layer] = np.array(per_digit_layer)
+
+    # --- Output ---
+    output = args.output
+    if output == "probe_accuracies.png" and step > 0:
+        output = f"probe_step{step}.png"
 
     if args.per_digit and all_per_digit:
-        plot_all_layers_per_digit(all_per_digit, args.output.replace(".png", "_per_digit.png"))
+        plot_all_layers_per_digit(all_per_digit, output.replace(".png", "_per_digit.png"))
     else:
-        plot_all_layers(all_accuracies, empty_pcts, args.output, metric_name=metric)
+        plot_all_layers(all_accuracies, empty_pcts, output, metric_name=metric)
 
 
 if __name__ == "__main__":
