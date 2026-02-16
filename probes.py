@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN
 from model import GPT2Model
@@ -162,7 +162,7 @@ def _cell_candidates(puzzle: str, cell_idx: int) -> list[int]:
     return [1 if d not in used else 0 for d in range(1, 10)]
 
 
-def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False, mode: str = "state_filled"):
+def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False, mode: str = "candidates"):
     """Train a ridge probe to predict a per-cell target from activations.
 
     Modes:
@@ -218,28 +218,36 @@ def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbo
         preds = raw_preds.argmax(axis=1)  # 0=empty, 1=filled
         y_true = (labels_test > 0).astype(int)
         acc = accuracy_score(y_true, preds)
-        return acc, y_true, preds
+        return acc, y_true, preds, None
     elif mode == "state_filled":
         # Evaluate only on filled cells
         filled_test = labels_test > 0
         if not filled_test.any():
-            return float("nan"), np.array([]), np.array([])
+            return float("nan"), np.array([]), np.array([]), None
         preds = raw_preds[filled_test].argmax(axis=1) + 1  # back to 1-9
         y_true = labels_test[filled_test]
         acc = accuracy_score(y_true, preds)
-        return acc, y_true, preds
+        return acc, y_true, preds, None
     elif mode == "candidates":
         # Evaluate only on empty cells; threshold at 0.5 for binary predictions
         empty_test = labels_test == 0
         if not empty_test.any():
-            return float("nan"), np.array([]), np.array([])
+            return float("nan"), np.array([]), np.array([]), np.full(9, float("nan"))
         binary_preds = (raw_preds[empty_test] > 0.5).astype(int)
         y_true = y_test[empty_test]
-        acc = accuracy_score(y_true.ravel(), binary_preds.ravel())  # per-digit accuracy
-        return acc, y_true, binary_preds
+        # Per-digit F1
+        per_digit = np.array([
+            f1_score(y_true[:, d], binary_preds[:, d], zero_division=0.0)
+            for d in range(9)
+        ])
+        f1 = per_digit.mean()
+        return f1, y_true, binary_preds, per_digit
 
 
-def plot_all_layers(all_accuracies: dict[int, list[float]], empty_pcts: list[float], output_path: str = "probe_accuracies.png"):
+def plot_all_layers(
+    all_accuracies: dict[int, list[float]], empty_pcts: list[float],
+    output_path: str = "probe_accuracies.png", metric_name: str = "Accuracy",
+):
     """Plot 9x9 heatmap per layer with shared colorbar."""
     import matplotlib.pyplot as plt
 
@@ -274,9 +282,84 @@ def plot_all_layers(all_accuracies: dict[int, list[float]], empty_pcts: list[flo
     for idx in range(n_layers, len(axes)):
         axes[idx].set_visible(False)
 
-    fig.suptitle("Per-cell probe accuracy by layer", fontsize=14, y=1.02)
+    fig.suptitle(f"Per-cell probe {metric_name.lower()} by layer", fontsize=14, y=1.02)
     fig.tight_layout()
-    fig.colorbar(ims[0], ax=axes[:n_layers].tolist(), shrink=0.6, label="Accuracy", pad=0.02)
+    fig.colorbar(ims[0], ax=axes[:n_layers].tolist(), shrink=0.6, label=metric_name, pad=0.02)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved {output_path}")
+    plt.show()
+
+
+def plot_all_layers_per_digit(
+    all_per_digit: dict[int, np.ndarray],
+    output_path: str = "probe_per_digit.png",
+):
+    """Plot 9×9 grid per layer where each cell contains a 3×3 mini-heatmap of per-digit F1."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    n_layers = len(all_per_digit)
+    ncols = min(n_layers, 3)
+    nrows = (n_layers + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows),
+                             gridspec_kw={"wspace": 0.1, "hspace": 0.1})
+    if n_layers == 1:
+        axes = np.array([axes])
+    axes = np.atleast_1d(axes).flatten()
+
+    norm = Normalize(vmin=0, vmax=1)
+    cmap = plt.get_cmap("RdYlGn")
+
+    for idx, (layer, per_digit_arr) in enumerate(sorted(all_per_digit.items())):
+        ax = axes[idx]
+        ax.set_xlim(-0.5, 8.5)
+        ax.set_ylim(8.5, -0.5)
+        ax.set_aspect("equal")
+        ax.set_xticks(range(9))
+        ax.set_yticks(range(9))
+        ax.tick_params(length=0)
+
+        avg = np.nanmean(per_digit_arr)
+        ax.set_title(f"Layer {layer} (mean F1={avg:.3f})")
+
+        # Draw sudoku box lines
+        for i in range(0, 10, 3):
+            ax.axhline(i - 0.5, color="black", linewidth=2)
+            ax.axvline(i - 0.5, color="black", linewidth=2)
+        # Thin cell lines
+        for i in range(10):
+            ax.axhline(i - 0.5, color="gray", linewidth=0.5)
+            ax.axvline(i - 0.5, color="gray", linewidth=0.5)
+
+        for cell in range(81):
+            r, c = divmod(cell, 9)
+            digits = per_digit_arr[cell]  # shape (9,)
+            mini = digits.reshape(3, 3)
+            # Inset axes: map cell (c, r) to figure coords
+            inset = ax.inset_axes(
+                [c - 0.5, r - 0.5, 1, 1],
+                transform=ax.transData,
+            )
+            inset.imshow(mini, cmap=cmap, norm=norm, aspect="equal")
+            inset.set_xticks([])
+            inset.set_yticks([])
+            inset.patch.set_alpha(0)
+            # Cell boundary
+            for spine in inset.spines.values():
+                spine.set_edgecolor("gray")
+                spine.set_linewidth(0.5)
+            # Intra-cell grid lines between the 3×3 digits
+            for pos in [0.5, 1.5]:
+                inset.axhline(pos, color="gray", linewidth=0.3, alpha=0.6)
+                inset.axvline(pos, color="gray", linewidth=0.3, alpha=0.6)
+
+    for idx in range(n_layers, len(axes)):
+        axes[idx].set_visible(False)
+
+    # Colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    fig.colorbar(sm, ax=axes[:n_layers].tolist(), shrink=0.6, label="F1", pad=0.02)
+    fig.suptitle("Per-digit candidate F1 by layer", fontsize=14, y=1.02)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     print(f"Saved {output_path}")
     plt.show()
@@ -291,6 +374,8 @@ def main():
     parser.add_argument("--output", default="probe_accuracies.png")
     parser.add_argument("--n_puzzles", type=int, default=6400)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--mode", default="state_filled", choices=["filled", "state_filled", "candidates"])
+    parser.add_argument("--per-digit", action="store_true", help="Per-digit F1 heatmap (candidates mode only)")
     args = parser.parse_args()
 
     if os.path.exists(args.cache_path):
@@ -323,19 +408,29 @@ def main():
         empty_pcts.append(n_empty / len(puzzles) * 100)
 
     all_accuracies = {}
+    all_per_digit = {}
     for layer in range(n_layers):
         sep_acts = get_activations_at_token(activations, sequences, layer, args.token_type)
         print(f"\nLayer {layer}, activations shape: {sep_acts.shape}")
         accuracies = []
+        per_digit_layer = []
         for cell in range(81):
             print(f"  Layer {layer} | Cell {cell:2d}/81", end="\r")
-            acc, _, _ = probe_cell(sep_acts, puzzles, cell)
+            acc, _, _, per_digit = probe_cell(sep_acts, puzzles, cell, mode=args.mode)
             accuracies.append(acc)
-        avg = sum(accuracies) / len(accuracies)
-        print(f"  Layer {layer} | Mean accuracy (filled): {avg:.3f}")
+            if per_digit is not None:
+                per_digit_layer.append(per_digit)
+        metric = "F1" if args.mode == "candidates" else "Accuracy"
+        avg = np.nanmean(accuracies)
+        print(f"  Layer {layer} | Mean {metric.lower()} ({args.mode}): {avg:.3f}")
         all_accuracies[layer] = accuracies
+        if per_digit_layer:
+            all_per_digit[layer] = np.array(per_digit_layer)  # (81, 9)
 
-    plot_all_layers(all_accuracies, empty_pcts, args.output)
+    if args.per_digit and all_per_digit:
+        plot_all_layers_per_digit(all_per_digit, args.output.replace(".png", "_per_digit.png"))
+    else:
+        plot_all_layers(all_accuracies, empty_pcts, args.output, metric_name=metric)
 
 
 if __name__ == "__main__":

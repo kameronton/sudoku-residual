@@ -1,6 +1,30 @@
+# Sudoku-residual
+
 This is a repo that tests whether a transformer trained to solve sudokus has:
 1) a representation of the current state of the board in the residual stream
 2) a representation of possible values for each cell in the residual stream
+
+## Results
+
+For a ~12M parameters transformer trained on 8B tokens generated from 3M traces, we can see that it indeed does represent the state of the board and possible cell candidates linearly(!) in the residual stream. 
+Even though the performance is not excellent (for now, on 1k grids it gets 74.6% cell accuracy, 42.2% puzzle accuracy) there is a strong signal on the separation token:
+
+1. (Sanity check) whether a cell is filled is represented in the residual stream:
+![](/imgs/probes_filled.png)
+
+2. The digit a cell is filled with is represented in the residual stream:
+![](/imgs/probes_sep.png)
+
+3. The candidates for each cell are represented in the residual stream (average F1-score over 9 digits):
+![](/imgs/probes_candidates.png)
+
+### Observations
+
+1. There is a drop in accuracy in the last rows in the grid, consistently across tasks and layers. I cannot explain why that happens for now, but here are a couple of hypotheses:
+- This is a data artefact: the clues are always given in the cell order, so for some reason the model doesn't learn to compress the last cells into the `[SEP]` token. If we probe the token right before `[SEP]`, it represents the last cells very well.
+- This is because of causal attention, and for this use-case it would be more reasonable to use bi-directional attention on the clues. Anyway, it needs more investigating.
+
+2. The accuracy of representation drops significantly from the middle layers to the last layer. It means that the "world model" is stored in layers 3 to 5, and the last layer is specialized in using this information for the next token generation. This is consistent with the literature, and it's worth looking at what exactly the last layer is doing.
 
 ## Setup
 
@@ -12,12 +36,12 @@ uv sync
 
 ```bash
 !pip install uv
-!git clone https://github.com/<your-username>/sudoku-residual.git
+!git clone https://github.com/kameronton/sudoku-residual.git
 %cd sudoku-residual
 !uv sync --extra tpu
 ```
 
-Then prefix all commands with `uv run`, same as below. Verify TPU is visible:
+Check TPU is visible:
 
 ```python
 !uv run python -c "import jax; print(jax.devices())"
@@ -28,15 +52,15 @@ Then prefix all commands with `uv run`, same as below. Verify TPU is visible:
 ### 1. Prepare traces (one-time)
 
 ```bash
-uv run python data.py --prepare --data_path sudoku-3m.csv --trace_mode random --output traces_random.npz
+uv run python data.py --prepare --data_path sudoku-3m.csv --trace_mode constraint --output traces.npz
 ```
 
-Trace modes: `random`, `constraint`, `human`.
+Trace modes: `random`, `constraint`.
 
 ### 2. Train
 
 ```bash
-uv run python training.py --traces_path traces_random.npz --batch_size 64 --num_tokens 100000000
+uv run python training.py --traces_path traces.npz --batch_size 512 --num_tokens 8_000_000_000
 ```
 
 Training uses a token-based budget (`--num_tokens`) with a tqdm progress bar showing throughput and loss. Use `--resume` to continue from the latest checkpoint in `checkpoints/`.
@@ -57,24 +81,24 @@ You can also evaluate from a cached probe dataset (no checkpoint needed):
 uv run python evaluate.py --cache_path probe_acts.npz --data_path sudoku-3m.csv --quiet
 ```
 
-To plot a heatmap of where the model's first mistakes occur:
+### 4. Probe residual stream
+
+Train linear probes on residual stream activations to test what the model represents internally at each layer.
 
 ```bash
-uv run python evaluate.py --mistake-map --cache_path probe_acts.npz
+# Run probes (generates traces, collects activations, caches to probe_acts.npz)
+uv run python probes.py --ckpt_dir checkpoints --data_path sudoku-3m.csv --n_puzzles 1000
+
+# Reuse cached activations (no checkpoint needed)
+uv run python probes.py --cache_path probe_acts.npz
 ```
 
-### 4. Visualize traces
+Probe modes (`--mode`):
+- `filled` — binary: is each cell filled or empty?
+- `state_filled` — what digit is in each filled cell? (default)
+- `candidates` — which digits are legal for each empty cell? (reports F1)
 
-Step through a solving trace to see how cells are filled:
-
-```bash
-uv run python visualize.py --data_path sudoku-3m.csv --index 0 --mode random --step
-```
-
-Modes: `random`, `constraint`, `human`. Use `--puzzle` to pass an 81-char puzzle string directly.
-
-### 5. Sanity check
-
-```bash
-uv run python -c "from data import sanity_check; sanity_check()"
-```
+Other useful flags:
+- `--token_type sep` (default) — probe the `<sep>` token activations; alternatives depend on your experiment
+- `--per-digit` — produce a per-digit F1 heatmap (only with `--mode candidates`)
+- `--output probe_accuracies.png` — path for the output plot
