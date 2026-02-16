@@ -154,90 +154,6 @@ def random_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
     random.shuffle(empties)
     return empties
 
-
-def human_like_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
-    """Naked single -> hidden single -> fallback to constraint-guided order."""
-    grid = [int(ch) if ch in "123456789" else 0 for ch in puzzle]
-
-    def candidates(g: list[int], pos: int) -> set[int]:
-        r, c = divmod(pos, 9)
-        used = set()
-        for j in range(9):
-            used.add(g[r * 9 + j])
-            used.add(g[j * 9 + c])
-        br, bc = (r // 3) * 3, (c // 3) * 3
-        for dr in range(3):
-            for dc in range(3):
-                used.add(g[(br + dr) * 9 + (bc + dc)])
-        return set(range(1, 10)) - used
-
-    filled = set()
-    trace = []
-    empties = [i for i in range(81) if grid[i] == 0]
-
-    while empties:
-        progress = False
-        # Naked singles
-        for pos in list(empties):
-            if pos in filled:
-                continue
-            cands = candidates(grid, pos)
-            if len(cands) == 1:
-                d = cands.pop()
-                r, c = divmod(pos, 9)
-                trace.append((r, c, d))
-                grid[pos] = d
-                filled.add(pos)
-                empties.remove(pos)
-                progress = True
-
-        if progress:
-            continue
-
-        # Hidden singles
-        found = False
-        for unit_type in range(3):  # row, col, box
-            for ui in range(9):
-                if unit_type == 0:
-                    cells = [ui * 9 + j for j in range(9)]
-                elif unit_type == 1:
-                    cells = [j * 9 + ui for j in range(9)]
-                else:
-                    br, bc = (ui // 3) * 3, (ui % 3) * 3
-                    cells = [(br + dr) * 9 + (bc + dc) for dr in range(3) for dc in range(3)]
-                empty_cells = [p for p in cells if grid[p] == 0 and p not in filled]
-                for d in range(1, 10):
-                    places = [p for p in empty_cells if d in candidates(grid, p)]
-                    if len(places) == 1:
-                        pos = places[0]
-                        r, c = divmod(pos, 9)
-                        trace.append((r, c, d))
-                        grid[pos] = d
-                        filled.add(pos)
-                        if pos in empties:
-                            empties.remove(pos)
-                        found = True
-                        progress = True
-            if found:
-                break
-
-        if progress:
-            continue
-
-        # Fallback: fill remaining from solution in constraint-guided order (fewest candidates first)
-        remaining = [(len(candidates(grid, p)), p) for p in empties if p not in filled]
-        remaining.sort()
-        for _, pos in remaining:
-            r, c = divmod(pos, 9)
-            d = int(solution[pos])
-            trace.append((r, c, d))
-            grid[pos] = d
-            filled.add(pos)
-        break
-
-    return trace
-
-
 # ---------------------------------------------------------------------------
 # Tokenize a trace into a sequence
 # ---------------------------------------------------------------------------
@@ -293,7 +209,6 @@ def collate_batch(dataset: SudokuDataset, indices: Sequence[int]) -> np.ndarray:
 TRACE_GENERATORS = {
     "random": lambda puzzle, solution, _trace: random_trace(puzzle, solution),
     "constraint": lambda _puzzle, _solution, trace: trace,
-    "human": lambda puzzle, solution, _trace: human_like_trace(puzzle, solution),
 }
 
 
