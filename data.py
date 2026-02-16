@@ -159,7 +159,7 @@ def random_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
 # ---------------------------------------------------------------------------
 
 def tokenize_trace(
-    puzzle: str, solution: str, trace: list[tuple[int, int, int]]
+    puzzle: str, solution: str, trace: list[tuple[int, int, int]], sep_token: bool = True,
 ) -> np.ndarray:
     """Convert clues + trace into a token sequence, padded to MAX_SEQ_LEN."""
     tokens = []
@@ -168,7 +168,8 @@ def tokenize_trace(
         if puzzle[i] in "123456789":
             r, c = divmod(i, 9)
             tokens.append(encode_fill(r, c, int(puzzle[i])))
-    tokens.append(SEP_TOKEN)
+    if sep_token:
+        tokens.append(SEP_TOKEN)
     # Trace tokens
     for r, c, d in trace:
         tokens.append(encode_fill(r, c, d))
