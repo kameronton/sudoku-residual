@@ -5,7 +5,7 @@ import csv
 import random
 import sys
 
-from data import solve, random_trace, human_like_trace
+from data import solve, random_trace
 
 
 def print_grid(grid: list[str], highlight: tuple[int, int] | None = None):
@@ -37,8 +37,6 @@ def visualize(puzzle: str, trace_mode: str = "random", step_through: bool = Fals
         trace = random_trace(puzzle, solution)
     elif trace_mode == "constraint":
         trace = cg_trace
-    elif trace_mode == "human":
-        trace = human_like_trace(puzzle, solution)
     else:
         raise ValueError(f"Unknown trace mode: {trace_mode}")
 
