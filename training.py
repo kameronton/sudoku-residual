@@ -176,10 +176,13 @@ def train_step(state, batch, vocab_size):
 
     def loss_fn(params):
         logits = state.apply_fn({"params": params}, inputs)
-        log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
-        one_hot = jax.nn.one_hot(targets, vocab_size)
-        per_token_loss = -jnp.sum(one_hot * log_probs, axis=-1)  # (B, T-1)
-        loss = jnp.sum(per_token_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+        per_token_loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits=logits, 
+            labels=targets
+        )
+        masked_loss = per_token_loss * mask
+        loss = jnp.sum(masked_loss) / (jnp.sum(mask) + 1e-9)
+
         return loss
 
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
