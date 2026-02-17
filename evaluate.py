@@ -198,52 +198,59 @@ def generate_traces_batched(
         # Encode clues for each puzzle in the batch
         token_lists = [encode_clues(p) for p in batch_puzzles]
         lengths = [len(t) for t in token_lists]
-        max_empties = [sum(1 for ch in p if ch not in "123456789") for p in batch_puzzles]
-        done = [False] * bs
-        steps_taken = [0] * bs
+        max_empties = jnp.array([sum(1 for ch in p if ch not in "123456789") for p in batch_puzzles], dtype=jnp.int32)
 
         # Pad to MAX_SEQ_LEN
         sequences = jnp.full((bs, MAX_SEQ_LEN), PAD_TOKEN, dtype=jnp.int32)
         for i, toks in enumerate(token_lists):
             sequences = sequences.at[i, :len(toks)].set(jnp.array(toks, dtype=jnp.int32))
-        cur_lengths = list(lengths)
+
+        cur_positions = jnp.array(lengths, dtype=jnp.int32)
+        steps_taken = jnp.zeros(bs, dtype=jnp.int32)
+        done_mask = jnp.zeros(bs, dtype=jnp.bool_)
+        batch_idx = jnp.arange(bs)
 
         max_steps = MAX_SEQ_LEN - min(lengths)
-        for _ in range(max_steps):
-            if all(done):
+        for step_i in range(max_steps):
+            if jnp.all(done_mask):
                 break
 
             logits = forward_fn(params, sequences)
 
-            for i in range(bs):
-                if done[i]:
-                    continue
-                pos = cur_lengths[i]
-                if pos >= MAX_SEQ_LEN:
-                    done[i] = True
-                    continue
+            # Gather logits at each puzzle's current position
+            gather_pos = cur_positions - 1
+            next_logits = logits[batch_idx, gather_pos, :]  # (bs, vocab)
 
-                next_logits = logits[i, pos - 1, :]
-                if temperature <= 0:
-                    token = int(jnp.argmax(next_logits))
-                else:
-                    next_logits = next_logits / temperature
-                    token = int(jax.random.categorical(
-                        jax.random.PRNGKey(pos), next_logits
-                    ))
+            # Sample tokens
+            if temperature <= 0:
+                tokens = jnp.argmax(next_logits, axis=-1).astype(jnp.int32)
+            else:
+                tokens = jax.random.categorical(
+                    jax.random.PRNGKey(step_i), next_logits / temperature
+                ).astype(jnp.int32)
 
-                if token in (PAD_TOKEN, SEP_TOKEN) or token < 0 or token > 728:
-                    done[i] = True
-                    continue
+            # Validity check: token must be a fill action (0-728)
+            valid = (tokens >= 0) & (tokens <= 728)
+            active = ~done_mask & (cur_positions < MAX_SEQ_LEN)
+            update_mask = active & valid
 
+            # Update sequences where active and valid
+            old_tokens = sequences[batch_idx, cur_positions]
+            sequences = sequences.at[batch_idx, cur_positions].set(
+                jnp.where(update_mask, tokens, old_tokens)
+            )
+            cur_positions = cur_positions + update_mask.astype(jnp.int32)
+            steps_taken = steps_taken + update_mask.astype(jnp.int32)
+
+            # Mark done: invalid token, hit max empties, or hit MAX_SEQ_LEN
+            done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties) | (cur_positions >= MAX_SEQ_LEN)
+
+        # Extract traces from final sequences
+        for i in range(bs):
+            for pos in range(lengths[i], int(cur_positions[i])):
+                token = int(sequences[i, pos])
                 r, c, d = decode_fill(token)
                 all_traces[batch_start + i].append((r, c, d))
-                sequences = sequences.at[i, pos].set(token)
-                cur_lengths[i] += 1
-                steps_taken[i] += 1
-
-                if steps_taken[i] >= max_empties[i]:
-                    done[i] = True
 
         print(f"  Generated {min(batch_start + bs, n)}/{n}", end="\r")
 
