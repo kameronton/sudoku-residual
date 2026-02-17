@@ -198,10 +198,9 @@ def eval_step(state, batch, vocab_size):
     positions = jnp.arange(targets.shape[1])[None, :]
     mask = ((positions >= sep_pos) & (targets != PAD_TOKEN)).astype(jnp.float32)
     logits = state.apply_fn({"params": state.params}, inputs)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    one_hot = jax.nn.one_hot(targets, vocab_size)
-    per_token_loss = -jnp.sum(one_hot * log_probs, axis=-1)
-    loss = jnp.sum(per_token_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+    per_token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+    masked_loss = per_token_loss * mask
+    loss = jnp.sum(masked_loss) / (jnp.sum(mask) + 1e-9)
     return loss
 
 
