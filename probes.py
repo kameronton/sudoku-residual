@@ -3,6 +3,7 @@
 import argparse
 import csv
 import os
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -347,7 +348,24 @@ def get_activations_at_positions(activations: np.ndarray, positions: list[int], 
     Returns: (n_puzzles, d_model)
     """
     layer_acts = activations[:, layer, :, :]
-    return np.array([layer_acts[i, pos] for i, pos in enumerate(positions)])
+    idx = np.arange(len(positions))
+    return layer_acts[idx, positions]
+
+
+def get_activations_multi_token(activations: np.ndarray, positions: list[list[int]], layer: int) -> np.ndarray:
+    """Extract and concatenate activations at multiple positions per puzzle.
+
+    activations: (n_puzzles, n_layers, seq_len, d_model)
+    positions: list of length n_puzzles, each a list of position indices
+    Returns: (n_puzzles, n_positions * d_model)
+    """
+    layer_acts = activations[:, layer, :, :]
+    parts = []
+    for tok_idx in range(len(positions[0])):
+        pos = [p[tok_idx] for p in positions]
+        idx = np.arange(len(pos))
+        parts.append(layer_acts[idx, pos])
+    return np.concatenate(parts, axis=1)
 
 
 def _compute_solve_mask(puzzles, traces):
@@ -376,6 +394,7 @@ def _subset_by_indices(keep, activations, puzzles, sequences, traces=None):
 def main():
     parser = argparse.ArgumentParser(description="Linear probes on residual stream")
     parser.add_argument("--ckpt_dir", default="checkpoints")
+    parser.add_argument("--ckpt_step", type=int)
     parser.add_argument("--data_path", default="sudoku-3m.csv")
     parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cache activations + puzzles")
     parser.add_argument("--output", default="probe_accuracies.png")
@@ -388,13 +407,26 @@ def main():
                         help="Filter puzzles for both train and eval")
     parser.add_argument("--eval-filter", choices=["all", "solved", "unsolved"], default="all",
                         help="Train on all, evaluate only on this subset of held-out data")
-    args = parser.parse_args()
+    parser.add_argument("--positions", type=str, default="0",
+                        help="Comma-separated offsets relative to SEP+step (e.g. '-2,-1,0'). "
+                             "Ground truth = board state after max offset fills.")
+    # Preprocess sys.argv: find --positions and merge its value if split by argparse
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg == "--positions" and i + 1 < len(argv):
+            # Force argparse to see it as one token: --positions=VALUE
+            argv[i] = f"--positions={argv[i + 1]}"
+            del argv[i + 1]
+            break
+    args = parser.parse_args(argv)
+
+    offsets = [int(x) for x in args.positions.split(",")]
 
     # --- Load data ---
     if os.path.exists(args.cache_path):
         activations, puzzles, sequences = load_probe_dataset(args.cache_path)
     else:
-        params, model = load_checkpoint(args.ckpt_dir)
+        params, model = load_checkpoint(args.ckpt_dir, ckpt_step=args.ckpt_step)
         print("Model loaded")
 
         puzzles = load_puzzles(args.data_path, args.n_puzzles)
@@ -425,24 +457,40 @@ def main():
         activations, puzzles, sequences, traces = _subset_by_indices(keep, activations, puzzles, sequences, traces)
         print(f"  Kept {len(puzzles)} {args.filter} puzzles")
 
-    # --- Build probe grids and positions at the given step ---
+    # --- Build probe grids and positions ---
     step = args.step
-    if step > 0:
-        keep = [i for i, t in enumerate(traces) if len(t) >= step]
-        if len(keep) < len(traces):
-            print(f"Filtered to {len(keep)}/{len(traces)} puzzles with >= {step} trace steps")
-            activations, puzzles, sequences, traces = _subset_by_indices(keep, activations, puzzles, sequences, traces)
+    # The ground truth board state is determined by step (the max offset anchor).
+    # Each offset in `offsets` is relative to SEP+step.
+    min_offset = min(offsets)
 
-        if not puzzles:
-            print("No puzzles remaining after filtering.")
-            return
+    # Filter puzzles that have enough trace steps and enough prefix tokens
+    required_trace_steps = step  # need at least `step` fills after SEP
+    keep = []
+    for i, (seq, t) in enumerate(zip(sequences, traces)):
+        sep_pos = seq.index(SEP_TOKEN)
+        abs_min = sep_pos + step + min_offset
+        if len(t) >= required_trace_steps and abs_min >= 0:
+            keep.append(i)
+    if len(keep) < len(puzzles):
+        print(f"Filtered to {len(keep)}/{len(puzzles)} puzzles (need >= {required_trace_steps} trace steps, min position >= 0)")
+        activations, puzzles, sequences, traces = _subset_by_indices(keep, activations, puzzles, sequences, traces)
 
-    # step=0: original puzzle at SEP; step=N: board after N fills at sep+N
+    if not puzzles:
+        print("No puzzles remaining after filtering.")
+        return
+
+    # Ground truth = board after `step` fills (step=0 means initial board)
     if step == 0:
         probe_grids = puzzles
     else:
         probe_grids = [build_grid_at_step(p, t, step - 1) for p, t in zip(puzzles, traces)]
-    probe_positions = [seq.index(SEP_TOKEN) + step for seq in sequences]
+
+    # Build per-puzzle position lists for activation extraction
+    use_multi = len(offsets) > 1
+    sep_positions = [seq.index(SEP_TOKEN) for seq in sequences]
+    if use_multi:
+        probe_positions_multi = [[sp + step + off for off in offsets] for sp in sep_positions]
+    probe_positions = [sp + step for sp in sep_positions]
 
     # --- Compute eval mask (train on all, eval on subset) ---
     eval_mask = None
@@ -469,7 +517,10 @@ def main():
     all_accuracies = {}
     all_per_digit = {}
     for layer in range(n_layers):
-        acts = get_activations_at_positions(activations, probe_positions, layer)
+        if use_multi:
+            acts = get_activations_multi_token(activations, probe_positions_multi, layer)
+        else:
+            acts = get_activations_at_positions(activations, probe_positions, layer)
         print(f"\nLayer {layer}, activations shape: {acts.shape}")
 
         accuracies = []
@@ -509,6 +560,9 @@ def main():
     output = args.output
     if output == "probe_accuracies.png" and step > 0:
         output = f"probe_step{step}.png"
+    if output == "probe_accuracies.png" and use_multi:
+        pos_tag = "_".join(str(o) for o in offsets)
+        output = f"probe_positions_{pos_tag}.png"
 
     if args.per_digit and all_per_digit:
         plot_all_layers_per_digit(all_per_digit, output.replace(".png", "_per_digit.png"))

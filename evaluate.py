@@ -16,13 +16,17 @@ from model import GPT2Model, TransformerConfig
 from visualize import print_grid
 
 
-def load_checkpoint(ckpt_dir: str, model_cfg: TransformerConfig = None):
+def load_checkpoint(ckpt_dir: str, model_cfg: TransformerConfig = None, ckpt_step: int | None = None):
     """Restore params from the latest checkpoint. Returns (params, model).
 
     If model_cfg is None, loads config from the checkpoint.
     """
     ckpt_mgr = ocp.CheckpointManager(os.path.abspath(ckpt_dir))
-    step = ckpt_mgr.latest_step()
+    if ckpt_step is None:
+        step = ckpt_mgr.latest_step()
+    else:
+        step = ckpt_step
+        
     if step is None:
         raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
     if model_cfg is None:
