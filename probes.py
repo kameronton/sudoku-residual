@@ -14,7 +14,7 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, solve
 from model import GPT2Model
-from evaluate import load_checkpoint, generate_traces_batched, traces_to_sequences, sequences_to_traces, make_forward_fn as make_gen_forward_fn, encode_clues, evaluate_puzzle
+from evaluate import load_checkpoint, generate_traces_batched, generate_traces_batched_cached, traces_to_sequences, sequences_to_traces, make_forward_fn as make_gen_forward_fn, encode_clues, evaluate_puzzle
 
 
 def make_intermediates_fn(model: GPT2Model):
@@ -432,9 +432,8 @@ def main():
         puzzles = load_puzzles(args.data_path, args.n_puzzles)
         print(f"Loaded {len(puzzles)} puzzles")
 
-        gen_fn = make_gen_forward_fn(model)
         print("Generating traces...")
-        traces = generate_traces_batched(gen_fn, params, puzzles, args.batch_size)
+        traces = generate_traces_batched_cached(model, params, puzzles, args.batch_size)
         sequences = traces_to_sequences(puzzles, traces)
         avg_len = np.mean([len(s) for s in sequences])
         print(f"Average sequence length: {avg_len:.1f}")

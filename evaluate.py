@@ -12,7 +12,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
-from model import GPT2Model, TransformerConfig
+from model import GPT2Model, TransformerConfig, init_kv_cache
 from visualize import print_grid
 
 
@@ -262,6 +262,126 @@ def generate_traces_batched(
     return all_traces
 
 
+def generate_traces_batched_cached(
+    model, params, puzzles: list[str], batch_size: int = 64, temperature: float = 0.0,
+) -> list[list[tuple[int, int, int]]]:
+    """Batched autoregressive trace generation with KV cache.
+
+    Groups puzzles by clue count (prefill length) so each group can share
+    a single prefill shape, then uses cached single-token decode steps.
+    """
+    cfg = model.config
+    n = len(puzzles)
+    all_traces: list[list[tuple[int, int, int]] | None] = [None] * n
+
+    # Group puzzles by prefill length (n_clues + 1 for SEP)
+    groups: dict[int, list[tuple[int, str]]] = {}
+    for idx, p in enumerate(puzzles):
+        clue_tokens = encode_clues(p)
+        prefill_len = len(clue_tokens)
+        groups.setdefault(prefill_len, []).append((idx, p))
+
+    @jax.jit
+    def decode_step(params, token, cache, cache_index):
+        logits, new_cache = model.apply(
+            {"params": params}, token, cache=cache, cache_index=cache_index,
+        )
+        return logits, new_cache
+
+    processed = 0
+    for prefill_len, group in groups.items():
+        n_decode = MAX_SEQ_LEN - prefill_len
+
+        @jax.jit
+        def prefill(params, tokens, cache):
+            logits, new_cache = model.apply(
+                {"params": params}, tokens, cache=cache, cache_index=0,
+            )
+            return logits, new_cache
+
+        for batch_start in range(0, len(group), batch_size):
+            batch = group[batch_start : batch_start + batch_size]
+            bs = len(batch)
+
+            # Encode clues — all same prefill_len in this group
+            token_lists = [encode_clues(p) for _, p in batch]
+            prefill_tokens = jnp.array(
+                [toks for toks in token_lists], dtype=jnp.int32
+            )  # (bs, prefill_len)
+
+            max_empties = jnp.array(
+                [sum(1 for ch in p if ch not in "123456789") for _, p in batch],
+                dtype=jnp.int32,
+            )
+
+            # Build full sequence buffer and fill prefill portion
+            sequences = jnp.full((bs, MAX_SEQ_LEN), PAD_TOKEN, dtype=jnp.int32)
+            sequences = sequences.at[:, :prefill_len].set(prefill_tokens)
+
+            cache = init_kv_cache(cfg, bs)
+
+            # Prefill
+            logits, cache = prefill(params, prefill_tokens, cache)
+
+            # First decode token from last prefill logit
+            if temperature <= 0:
+                next_token = jnp.argmax(logits[:, -1, :], axis=-1).astype(jnp.int32)
+            else:
+                next_token = jax.random.categorical(
+                    jax.random.PRNGKey(0), logits[:, -1, :] / temperature
+                ).astype(jnp.int32)
+
+            valid = (next_token >= 0) & (next_token <= 728)
+            sequences = sequences.at[:, prefill_len].set(
+                jnp.where(valid, next_token, PAD_TOKEN)
+            )
+            done_mask = ~valid
+            steps_taken = valid.astype(jnp.int32)
+
+            # Decode remaining steps
+            for step_i in range(1, n_decode):
+                if jnp.all(done_mask):
+                    break
+
+                pos = prefill_len + step_i
+                input_token = sequences[:, pos - 1:pos]  # (bs, 1)
+                logits, cache = decode_step(params, input_token, cache, pos - 1)
+
+                if temperature <= 0:
+                    next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
+                else:
+                    next_token = jax.random.categorical(
+                        jax.random.PRNGKey(step_i), logits[:, 0, :] / temperature
+                    ).astype(jnp.int32)
+
+                valid = (next_token >= 0) & (next_token <= 728)
+                active = ~done_mask & (pos < MAX_SEQ_LEN)
+                update_mask = active & valid
+
+                sequences = sequences.at[:, pos].set(
+                    jnp.where(update_mask, next_token, sequences[:, pos])
+                )
+                steps_taken = steps_taken + update_mask.astype(jnp.int32)
+                done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
+
+            # Extract traces
+            for i in range(bs):
+                orig_idx = batch[i][0]
+                trace = []
+                for pos in range(prefill_len, prefill_len + int(steps_taken[i])):
+                    token = int(sequences[i, pos])
+                    if 0 <= token <= 728:
+                        r, c, d = decode_fill(token)
+                        trace.append((r, c, d))
+                all_traces[orig_idx] = trace
+
+            processed += bs
+            print(f"  Generated {min(processed, n)}/{n}", end="\r")
+
+    print()
+    return all_traces
+
+
 def traces_to_sequences(puzzles: list[str], traces: list[list[tuple[int, int, int]]]) -> list[list[int]]:
     """Convert puzzles + traces into full token sequences."""
     sequences = []
@@ -456,9 +576,9 @@ def main():
             puzzles = random.sample(puzzles, min(args.n, len(puzzles)))
         puzzles = puzzles[:args.n]
 
-        print(f"Generating traces (batch_size={args.batch_size})...", flush=True)
+        print(f"Generating traces (batch_size={args.batch_size}, kv_cache=True)...", flush=True)
         puzzle_strs = [p for p, _ in puzzles]
-        traces = generate_traces_batched(forward_fn, params, puzzle_strs, args.batch_size, args.temperature)
+        traces = generate_traces_batched_cached(model, params, puzzle_strs, args.batch_size, args.temperature)
 
         all_stats = []
         for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
