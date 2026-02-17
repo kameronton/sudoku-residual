@@ -13,8 +13,7 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, solve
 from model import GPT2Model
-from training import encode_clues, evaluate_puzzle
-from evaluate import load_checkpoint, generate_traces_batched, traces_to_sequences, sequences_to_traces, make_forward_fn as make_gen_forward_fn
+from evaluate import load_checkpoint, generate_traces_batched, traces_to_sequences, sequences_to_traces, make_forward_fn as make_gen_forward_fn, encode_clues, evaluate_puzzle
 
 
 def make_intermediates_fn(model: GPT2Model):
