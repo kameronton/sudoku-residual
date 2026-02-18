@@ -294,7 +294,7 @@ def _prepare_constraint_c(
     # Pipe puzzles to C solver
     input_bytes = "\n".join(puzzles).encode()
     proc = subprocess.run(
-        [_SOLVER_BIN], input=input_bytes, capture_output=True, check=True,
+        [_SOLVER_BIN], input=input_bytes, stdout=subprocess.PIPE, check=True,
     )
     buf = proc.stdout
 
@@ -404,4 +404,4 @@ if __name__ == "__main__":
             print("The clues order is randomized")
         else:
             print("The clues order is NOT randomized")
-        prepare_data(args.data_path, args.trace_mode, args.output, args.max_puzzles, args.randomize_clues)
+        prepare_data(args.data_path, args.trace_mode, args.output, args.max_puzzles, sep_token=True, randomize_clues=args.randomize_clues)

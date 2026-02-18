@@ -254,6 +254,8 @@ int main(int argc, char **argv) {
     char solution[81];
     uint8_t trace[81][3];
     int trace_len;
+    long count = 0;
+    int progress_interval = 100000;
 
     while (fgets(line, sizeof(line), stdin)) {
         /* Skip lines that don't look like puzzles */
@@ -272,7 +274,13 @@ int main(int argc, char **argv) {
         fwrite(&tl, 1, 1, stdout);
         if (trace_len > 0)
             fwrite(trace, 3, (size_t)trace_len, stdout);
+
+        count++;
+        if (count % progress_interval == 0)
+            fprintf(stderr, "\r  solved %ld puzzles...", count);
     }
+    if (count >= progress_interval)
+        fprintf(stderr, "\r  solved %ld puzzles (done)\n", count);
 
     return 0;
 }
