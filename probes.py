@@ -211,21 +211,24 @@ def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbo
 
 
 def plot_all_layers(
-    all_accuracies: dict[int, list[float]], empty_pcts: list[float],
+    all_accuracies: dict[int, list[float]],
     output_path: str = "probe_accuracies.png", metric_name: str = "Accuracy",
 ):
     """Plot 9x9 heatmap per layer with shared colorbar."""
     import matplotlib.pyplot as plt
 
     n_layers = len(all_accuracies)
-    ncols = min(n_layers, 3)
-    nrows = (n_layers + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols + 2, 6 * nrows))
+    if n_layers == 8:
+        ncols = 4
+        nrows = 2
+    else:
+        ncols = min(n_layers, 3)
+        nrows = (n_layers + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols + 0.5, 3 * nrows))
     if n_layers == 1:
         axes = np.array([axes])
     axes = axes.flatten()
 
-    empty_grid = np.array(empty_pcts).reshape(9, 9)
     ims = []
     for idx, (layer, accs) in enumerate(sorted(all_accuracies.items())):
         ax = axes[idx]
@@ -238,8 +241,7 @@ def plot_all_layers(
         ax.set_yticks(range(9))
         for r in range(9):
             for c in range(9):
-                ax.text(c, r - 0.12, f"{grid[r, c]:.2f}", ha="center", va="center", fontsize=7)
-                ax.text(c, r + 0.18, f"{empty_grid[r, c]:.0f}%", ha="center", va="center", fontsize=5, color="gray")
+                ax.text(c, r, f"{grid[r, c]:.2f}", ha="center", va="center", fontsize=6)
         for i in range(0, 10, 3):
             ax.axhline(i - 0.5, color="black", linewidth=2)
             ax.axvline(i - 0.5, color="black", linewidth=2)
@@ -508,11 +510,6 @@ def main():
 
     # --- Probing loop ---
     n_layers = activations.shape[1]
-    empty_pcts = []
-    for cell in range(81):
-        n_empty = sum(1 for g in probe_grids if g[cell] not in "123456789")
-        empty_pcts.append(n_empty / len(probe_grids) * 100)
-
     all_accuracies = {}
     all_per_digit = {}
     for layer in range(n_layers):
@@ -566,7 +563,7 @@ def main():
     if args.per_digit and all_per_digit:
         plot_all_layers_per_digit(all_per_digit, output.replace(".png", "_per_digit.png"))
     else:
-        plot_all_layers(all_accuracies, empty_pcts, output, metric_name=metric)
+        plot_all_layers(all_accuracies, output, metric_name=metric)
 
 
 if __name__ == "__main__":

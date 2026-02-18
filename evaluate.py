@@ -54,13 +54,15 @@ def make_forward_fn(model):
 # Evaluation helpers
 # ---------------------------------------------------------------------------
 
-def encode_clues(puzzle: str) -> list[int]:
+def encode_clues(puzzle: str, randomize_order: bool = False) -> list[int]:
     """Encode puzzle clues + <sep> as token list."""
     tokens = []
     for i in range(81):
         if puzzle[i] in "123456789":
             r, c = divmod(i, 9)
             tokens.append(encode_fill(r, c, int(puzzle[i])))
+    if randomize_order:
+        random.shuffle(tokens)
     tokens.append(SEP_TOKEN)
     return tokens
 
@@ -304,7 +306,7 @@ def generate_traces_batched_cached(
             bs = len(batch)
 
             # Encode clues — all same prefill_len in this group
-            token_lists = [encode_clues(p) for _, p in batch]
+            token_lists = [encode_clues(p, randomize_order=True) for _, p in batch]
             prefill_tokens = jnp.array(
                 [toks for toks in token_lists], dtype=jnp.int32
             )  # (bs, prefill_len)
