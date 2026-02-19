@@ -266,15 +266,19 @@ def generate_traces_batched(
 
 def generate_traces_batched_cached(
     model, params, puzzles: list[str], batch_size: int = 64, temperature: float = 0.0,
-) -> list[list[tuple[int, int, int]]]:
+) -> tuple[list[list[tuple[int, int, int]]], list[list[int]]]:
     """Batched autoregressive trace generation with KV cache.
 
     Groups puzzles by clue count (prefill length) so each group can share
     a single prefill shape, then uses cached single-token decode steps.
+
+    Returns (traces, sequences) where sequences are the actual token lists
+    (clues + SEP + trace tokens) the model produced, preserving clue order.
     """
     cfg = model.config
     n = len(puzzles)
     all_traces: list[list[tuple[int, int, int]] | None] = [None] * n
+    all_sequences: list[list[int] | None] = [None] * n
 
     # Group puzzles by prefill length (n_clues + 1 for SEP)
     groups: dict[int, list[tuple[int, str]]] = {}
@@ -366,26 +370,29 @@ def generate_traces_batched_cached(
                 steps_taken = steps_taken + update_mask.astype(jnp.int32)
                 done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
 
-            # Extract traces
+            # Extract traces and sequences
             for i in range(bs):
                 orig_idx = batch[i][0]
                 trace = []
-                for pos in range(prefill_len, prefill_len + int(steps_taken[i])):
+                end_pos = prefill_len + int(steps_taken[i])
+                for pos in range(prefill_len, end_pos):
                     token = int(sequences[i, pos])
                     if 0 <= token <= 728:
                         r, c, d = decode_fill(token)
                         trace.append((r, c, d))
                 all_traces[orig_idx] = trace
+                # Save actual sequence (clues + SEP + trace), stripping padding
+                all_sequences[orig_idx] = [int(sequences[i, p]) for p in range(end_pos)]
 
             processed += bs
             print(f"  Generated {min(processed, n)}/{n}", end="\r")
 
     print()
-    return all_traces
+    return all_traces, all_sequences
 
 
 def traces_to_sequences(puzzles: list[str], traces: list[list[tuple[int, int, int]]]) -> list[list[int]]:
-    """Convert puzzles + traces into full token sequences."""
+    """Convert puzzles + traces into full token sequences (row-major clue order)."""
     sequences = []
     for puzzle, trace in zip(puzzles, traces):
         tokens = encode_clues(puzzle)
@@ -580,7 +587,7 @@ def main():
 
         print(f"Generating traces (batch_size={args.batch_size}, kv_cache=True)...", flush=True)
         puzzle_strs = [p for p, _ in puzzles]
-        traces = generate_traces_batched_cached(model, params, puzzle_strs, args.batch_size, args.temperature)
+        traces, _sequences = generate_traces_batched_cached(model, params, puzzle_strs, args.batch_size, args.temperature)
 
         all_stats = []
         for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):

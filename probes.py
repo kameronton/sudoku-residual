@@ -14,7 +14,7 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score
 
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, solve
 from model import GPT2Model
-from evaluate import load_checkpoint, generate_traces_batched, generate_traces_batched_cached, traces_to_sequences, sequences_to_traces, make_forward_fn as make_gen_forward_fn, encode_clues, evaluate_puzzle
+from evaluate import load_checkpoint, generate_traces_batched, generate_traces_batched_cached, sequences_to_traces, make_forward_fn as make_gen_forward_fn, encode_clues, evaluate_puzzle
 
 
 def make_intermediates_fn(model: GPT2Model):
@@ -60,7 +60,7 @@ def collect_activations(intermediates_fn, params, sequences: list[list[int]], ba
     return np.concatenate(all_acts, axis=0).astype(np.float32)
 
 
-def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], sequences: list[list[int]]):
+def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], sequences: list[list[int]], compress: bool = True):
     """Save activations, puzzles, and token sequences together."""
     puzzle_arr = np.array(puzzles, dtype=f"U{len(puzzles[0])}")
     # Pad sequences to same length for storage
@@ -68,7 +68,8 @@ def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], s
     seq_arr = np.full((len(sequences), max_len), PAD_TOKEN, dtype=np.int16)
     for i, s in enumerate(sequences):
         seq_arr[i, :len(s)] = s
-    np.savez_compressed(path, activations=activations, puzzles=puzzle_arr, sequences=seq_arr)
+    save_fn = np.savez_compressed if compress else np.savez
+    save_fn(path, activations=activations, puzzles=puzzle_arr, sequences=seq_arr)
     size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
     print(f"Saved probe dataset to {path} ({activations.shape}, {size_mb:.0f} MB)")
 
@@ -402,6 +403,7 @@ def main():
     parser.add_argument("--output", default="probe_accuracies.png")
     parser.add_argument("--n_puzzles", type=int, default=6400)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--no-compress", action="store_true", help="Skip compression when saving probe cache")
     parser.add_argument("--mode", default="state_filled", choices=["filled", "state_filled", "candidates"])
     parser.add_argument("--per-digit", action="store_true", help="Per-digit F1 heatmap (candidates mode only)")
     parser.add_argument("--step", type=int, default=0, help="Trace step to probe at (0 = SEP/initial board, 1 = after first fill, ...)")
@@ -435,15 +437,14 @@ def main():
         print(f"Loaded {len(puzzles)} puzzles")
 
         print("Generating traces...")
-        traces = generate_traces_batched_cached(model, params, puzzles, args.batch_size)
-        sequences = traces_to_sequences(puzzles, traces)
+        traces, sequences = generate_traces_batched_cached(model, params, puzzles, args.batch_size)
         avg_len = np.mean([len(s) for s in sequences])
         print(f"Average sequence length: {avg_len:.1f}")
 
         print("Collecting activations...")
         intermediates_fn = make_intermediates_fn(model)
         activations = collect_activations(intermediates_fn, params, sequences, args.batch_size)
-        save_probe_dataset(args.cache_path, activations, puzzles, sequences)
+        save_probe_dataset(args.cache_path, activations, puzzles, sequences, compress=not args.no_compress)
 
     traces = sequences_to_traces(sequences)
 
