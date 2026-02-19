@@ -24,7 +24,14 @@ def make_intermediates_fn(model: GPT2Model):
     return forward
 
 
-def load_puzzles(data_path: str, n: int) -> list[str]:
+def load_puzzles(data_path: str, n: int, traces_path: str | None = None) -> list[str]:
+    """Load puzzle strings. Prefers NPZ test split if traces_path given."""
+    if traces_path and os.path.exists(traces_path):
+        npz = np.load(traces_path, allow_pickle=False)
+        if "puzzles_test" in npz:
+            puzzles = list(npz["puzzles_test"][:n])
+            print(f"Loaded {len(puzzles)} test puzzles from {traces_path}")
+            return puzzles
     puzzles = []
     with open(data_path) as f:
         reader = csv.DictReader(f)
@@ -398,7 +405,8 @@ def main():
     parser = argparse.ArgumentParser(description="Linear probes on residual stream")
     parser.add_argument("--ckpt_dir", default="checkpoints")
     parser.add_argument("--ckpt_step", type=int)
-    parser.add_argument("--data_path", default="sudoku-3m.csv")
+    parser.add_argument("--data_path", default="sudoku-3m.csv", help="CSV fallback (deprecated)")
+    parser.add_argument("--traces_path", default=None, help="NPZ file with test split puzzles")
     parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cache activations + puzzles")
     parser.add_argument("--output", default="probe_accuracies.png")
     parser.add_argument("--n_puzzles", type=int, default=6400)
@@ -433,7 +441,7 @@ def main():
         params, model = load_checkpoint(args.ckpt_dir, ckpt_step=args.ckpt_step)
         print("Model loaded")
 
-        puzzles = load_puzzles(args.data_path, args.n_puzzles)
+        puzzles = load_puzzles(args.data_path, args.n_puzzles, args.traces_path)
         print(f"Loaded {len(puzzles)} puzzles")
 
         print("Generating traces...")

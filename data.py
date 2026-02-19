@@ -246,9 +246,14 @@ def tokenize_trace(
 # ---------------------------------------------------------------------------
 
 class SudokuDataset:
-    def __init__(self, path: str):
+    def __init__(self, path: str, split: str = "train"):
         data = np.load(path)
-        self.sequences = data["sequences"]  # (N, MAX_SEQ_LEN)
+        key = f"sequences_{split}"
+        if key in data:
+            self.sequences = data[key]
+        else:
+            # Backward compat: old NPZ files without splits
+            self.sequences = data["sequences"]
 
     def __len__(self) -> int:
         return self.sequences.shape[0]
@@ -278,6 +283,8 @@ _SOLVER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solver")
 def _prepare_constraint_c(
     data_path: str, output: str, max_puzzles: int | None = None,
     randomize_clues: bool = False,
+    train_frac: float = 0.90, val_frac: float = 0.05, test_frac: float = 0.05,
+    seed: int = 42,
 ):
     """Use the C solver binary for fast constraint-trace generation."""
     # Extract puzzles from CSV
@@ -300,6 +307,7 @@ def _prepare_constraint_c(
 
     # Parse binary output
     sequences = []
+    puzzle_strs = []
     failed = 0
     pos = 0
     for i, (puzzle, expected) in enumerate(zip(puzzles, solutions)):
@@ -317,23 +325,58 @@ def _prepare_constraint_c(
         assert sol == expected, f"C solver mismatch at row {i}: got {sol}"
         seq = tokenize_trace(puzzle, sol, trace, True, randomize_clues)
         sequences.append(seq)
+        puzzle_strs.append(puzzle)
         if (i + 1) % 100_000 == 0:
             print(f"  processed {i + 1} puzzles...")
 
     arr = np.stack(sequences)
-    np.savez_compressed(output, sequences=arr)
+    puzzle_arr = np.array(puzzle_strs, dtype="U81")
+    _save_splits(arr, puzzle_arr, output, train_frac, val_frac, test_frac, seed)
     print(f"Saved {len(sequences)} sequences to {output} (failed: {failed})")
 
 
-def prepare_data(data_path: str, trace_mode: str, output: str, max_puzzles: int | None = None, sep_token: bool = True, randomize_clues: bool = False):
+def _save_splits(
+    sequences: np.ndarray, puzzles: np.ndarray, output: str,
+    train_frac: float, val_frac: float, test_frac: float, seed: int,
+):
+    """Shuffle and split sequences/puzzles into train/val/test, then save to NPZ."""
+    n = len(sequences)
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(n)
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+    # test gets the remainder
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:n_train + n_val]
+    test_idx = indices[n_train + n_val:]
+    np.savez_compressed(
+        output,
+        sequences=sequences,  # backward compat
+        sequences_train=sequences[train_idx],
+        sequences_val=sequences[val_idx],
+        sequences_test=sequences[test_idx],
+        puzzles_train=puzzles[train_idx],
+        puzzles_val=puzzles[val_idx],
+        puzzles_test=puzzles[test_idx],
+    )
+    print(f"Splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+
+
+def prepare_data(
+    data_path: str, trace_mode: str, output: str, max_puzzles: int | None = None,
+    sep_token: bool = True, randomize_clues: bool = False,
+    train_frac: float = 0.90, val_frac: float = 0.05, test_frac: float = 0.05,
+    seed: int = 42,
+):
     # Fast path: use C solver for constraint traces
     if trace_mode == "constraint" and os.path.isfile(_SOLVER_BIN):
         print(f"Using C solver: {_SOLVER_BIN}")
-        _prepare_constraint_c(data_path, output, max_puzzles, randomize_clues)
+        _prepare_constraint_c(data_path, output, max_puzzles, randomize_clues, train_frac, val_frac, test_frac, seed)
         return
 
     gen_fn = TRACE_GENERATORS[trace_mode]
     sequences = []
+    puzzle_strs = []
     failed = 0
 
     with open(data_path) as f:
@@ -353,11 +396,13 @@ def prepare_data(data_path: str, trace_mode: str, output: str, max_puzzles: int 
             seq = tokenize_trace(puzzle, solution, trace, sep_token, randomize_clues)
             assert seq.shape == (MAX_SEQ_LEN,), f"Tokenization error at row {i}"
             sequences.append(seq)
+            puzzle_strs.append(puzzle)
             if (i + 1) % 10_000 == 0:
                 print(f"  processed {i + 1} puzzles...")
 
     arr = np.stack(sequences)
-    np.savez_compressed(output, sequences=arr)
+    puzzle_arr = np.array(puzzle_strs, dtype="U81")
+    _save_splits(arr, puzzle_arr, output, train_frac, val_frac, test_frac, seed)
     print(f"Saved {len(sequences)} sequences to {output} (failed: {failed})")
 
 
@@ -398,10 +443,19 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="traces_random.npz")
     parser.add_argument("--max_puzzles", type=int, default=None)
     parser.add_argument("--randomize_clues", action="store_true")
+    parser.add_argument("--train_frac", type=float, default=0.90)
+    parser.add_argument("--val_frac", type=float, default=0.05)
+    parser.add_argument("--test_frac", type=float, default=0.05)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if args.prepare:
         if args.randomize_clues:
             print("The clues order is randomized")
         else:
             print("The clues order is NOT randomized")
-        prepare_data(args.data_path, args.trace_mode, args.output, args.max_puzzles, sep_token=True, randomize_clues=args.randomize_clues)
+        prepare_data(
+            args.data_path, args.trace_mode, args.output, args.max_puzzles,
+            sep_token=True, randomize_clues=args.randomize_clues,
+            train_frac=args.train_frac, val_frac=args.val_frac,
+            test_frac=args.test_frac, seed=args.seed,
+        )

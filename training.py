@@ -35,9 +35,9 @@ class TrainConfig:
     lr: float = 3e-4
     warmup_tokens: int = 1_000_000
     weight_decay: float = 0.1
-    val_fraction: float = 0.05
     log_every: int = 50
     val_every: int = 500
+    full_val: bool = False
     num_checkpoints: int = 10
     ckpt_dir: str = "checkpoints"
     log_path: str = "train_log.json"
@@ -212,20 +212,30 @@ def train(cfg: TrainConfig):
 
     # Load dataset — preload entire array onto device for zero-copy batch indexing
     print("Loading dataset...", flush=True)
-    raw = np.load(cfg.traces_path)["sequences"]  # (N, MAX_SEQ_LEN) int16
-    n = raw.shape[0]
-    max_seq_len = raw.shape[1]
-    n_val = max(1, int(n * cfg.val_fraction))
-    n_train = n - n_val
-    all_indices = np.arange(n)
-    np.random.shuffle(all_indices)
-    train_indices = all_indices[:n_train]
-    val_indices = all_indices[n_train:]
+    npz = np.load(cfg.traces_path)
+    if "sequences_train" in npz:
+        raw_train = npz["sequences_train"]
+        raw_val = npz["sequences_val"]
+    else:
+        # Backward compat: old NPZ without splits
+        raw = npz["sequences"]
+        n = raw.shape[0]
+        n_val = max(1, int(n * 0.05))
+        indices = np.arange(n)
+        np.random.shuffle(indices)
+        raw_train = raw[indices[:-n_val]]
+        raw_val = raw[indices[-n_val:]]
+    n_train = raw_train.shape[0]
+    n_val = raw_val.shape[0]
+    max_seq_len = raw_train.shape[1]
+    train_indices = np.arange(n_train)
+    val_indices = np.arange(n_val)
 
-    # Upload full dataset to device — avoids CPU→device transfer every step
-    device_sequences = jax.device_put(jnp.array(raw, dtype=jnp.int32))
-    del raw
-    print(f"Dataset: {n} total, {n_train} train, {n_val} val (preloaded to {jax.devices()[0].platform})", flush=True)
+    # Upload to device — avoids CPU→device transfer every step
+    device_train = jax.device_put(jnp.array(raw_train, dtype=jnp.int32))
+    device_val = jax.device_put(jnp.array(raw_val, dtype=jnp.int32))
+    del raw_train, raw_val
+    print(f"Dataset: {n_train} train, {n_val} val (preloaded to {jax.devices()[0].platform})", flush=True)
     print(f"Max sequence length: {max_seq_len}", flush=True)
 
     # Compute token budget and steps
@@ -304,7 +314,7 @@ def train(cfg: TrainConfig):
     for step in range(start_step, total_steps):
         # Sample batch — device-side gather, no CPU→device transfer
         batch_idx = np.random.choice(train_indices, size=cfg.batch_size, replace=False)
-        batch = device_sequences[batch_idx]
+        batch = device_train[batch_idx]
 
         state, loss = train_step(state, batch, model_cfg.vocab_size)
 
@@ -325,11 +335,17 @@ def train(cfg: TrainConfig):
 
         if (step + 1) % cfg.val_every == 0:
             val_losses = []
-            for _ in range(min(10, max(1, n_val // cfg.batch_size))):
-                vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
-                vb = device_sequences[vi]
-                vl = eval_step(state, vb, model_cfg.vocab_size)
-                val_losses.append(float(vl))
+            if cfg.full_val:
+                for vstart in range(0, n_val, cfg.batch_size):
+                    vb = device_val[vstart:min(vstart + cfg.batch_size, n_val)]
+                    vl = eval_step(state, vb, model_cfg.vocab_size)
+                    val_losses.append(float(vl))
+            else:
+                for _ in range(min(10, max(1, n_val // cfg.batch_size))):
+                    vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
+                    vb = device_val[vi]
+                    vl = eval_step(state, vb, model_cfg.vocab_size)
+                    val_losses.append(float(vl))
             avg_val = np.mean(val_losses)
             logger.log_val(step + 1, float(avg_val))
             logger.save()

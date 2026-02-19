@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 
-from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
+from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill, solve
 from model import GPT2Model, TransformerConfig, init_kv_cache
 from visualize import print_grid
 
@@ -491,7 +491,8 @@ def plot_first_mistake_heatmap(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate model on Sudoku puzzles")
     parser.add_argument("--ckpt_dir", default="checkpoints")
-    parser.add_argument("--data_path", default="sudoku-3m.csv")
+    parser.add_argument("--traces_path", default=None, help="NPZ file with test split puzzles")
+    parser.add_argument("--data_path", default="sudoku-3m.csv", help="CSV fallback (deprecated)")
     parser.add_argument("--n", type=int, default=10, help="Number of puzzles to evaluate")
     parser.add_argument("--offset", type=int, default=0, help="Start index in CSV")
     parser.add_argument("--random_sample", action="store_true", help="Sample random puzzles")
@@ -569,21 +570,37 @@ def main():
         params, model = load_checkpoint(args.ckpt_dir, model_cfg)
         forward_fn = make_forward_fn(model)
 
-        # Load puzzles
+        # Load puzzles — prefer NPZ test split, fall back to CSV
         puzzles = []
-        with open(args.data_path) as f:
-            reader = csv.DictReader(f)
-            for i, row in enumerate(reader):
+        if args.traces_path and os.path.exists(args.traces_path):
+            npz = np.load(args.traces_path, allow_pickle=False)
+            if "puzzles_test" in npz:
+                puzzle_strs = list(npz["puzzles_test"])
                 if args.random_sample:
-                    puzzles.append((row["puzzle"], row["solution"]))
-                elif args.offset <= i < args.offset + args.n:
-                    puzzles.append((row["puzzle"], row["solution"]))
-                if not args.random_sample and i >= args.offset + args.n:
-                    break
-
-        if args.random_sample:
-            puzzles = random.sample(puzzles, min(args.n, len(puzzles)))
-        puzzles = puzzles[:args.n]
+                    puzzle_strs = random.sample(puzzle_strs, min(args.n, len(puzzle_strs)))
+                else:
+                    puzzle_strs = puzzle_strs[args.offset:args.offset + args.n]
+                for p in puzzle_strs:
+                    result = solve(p, random_mrv=False)
+                    if result is None:
+                        raise ValueError(f"Solver failed: {p[:20]}...")
+                    puzzles.append((p, result[0]))
+                print(f"Loaded {len(puzzles)} test puzzles from {args.traces_path}")
+            else:
+                raise ValueError(f"No puzzles_test in {args.traces_path}")
+        else:
+            with open(args.data_path) as f:
+                reader = csv.DictReader(f)
+                for i, row in enumerate(reader):
+                    if args.random_sample:
+                        puzzles.append((row["puzzle"], row["solution"]))
+                    elif args.offset <= i < args.offset + args.n:
+                        puzzles.append((row["puzzle"], row["solution"]))
+                    if not args.random_sample and i >= args.offset + args.n:
+                        break
+            if args.random_sample:
+                puzzles = random.sample(puzzles, min(args.n, len(puzzles)))
+            puzzles = puzzles[:args.n]
 
         print(f"Generating traces (batch_size={args.batch_size}, kv_cache=True)...", flush=True)
         puzzle_strs = [p for p, _ in puzzles]
