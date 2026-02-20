@@ -92,27 +92,68 @@ static inline int single_digit(uint16_t v) {
     return 0;
 }
 
+/* ---- Fisher-Yates shuffle ---- */
+
+static void shuffle_int(int *arr, int n) {
+    for (int i = n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+}
+
 /* ---- Solver state ---- */
+
+/* Per-puzzle shuffled tables (shared across search tree, not copied) */
+typedef struct {
+    int peers[81][20];
+    int units[81][3][9];
+    int unit_order[81][3];   /* shuffled order to check the 3 units */
+    int elim_order[9];       /* shuffled digit elimination order (bit positions) */
+} ShuffledTables;
 
 typedef struct {
     uint16_t values[81];
     uint8_t  clues[81];    /* 1 if cell is a clue */
     uint8_t  trace[81][3]; /* (row, col, digit) */
     int      trace_len;
+    ShuffledTables *tables;
 } State;
+
+static void init_shuffled_tables(ShuffledTables *t) {
+    memcpy(t->peers, peers, sizeof(peers));
+    memcpy(t->units, units, sizeof(units));
+    for (int i = 0; i < 81; i++) {
+        shuffle_int(t->peers[i], 20);
+        for (int u = 0; u < 3; u++)
+            shuffle_int(t->units[i][u], 9);
+        /* Shuffle the order in which the 3 units are checked */
+        t->unit_order[i][0] = 0; t->unit_order[i][1] = 1; t->unit_order[i][2] = 2;
+        shuffle_int(t->unit_order[i], 3);
+    }
+    /* Shuffle digit elimination order (bit positions 0-8) */
+    for (int i = 0; i < 9; i++) t->elim_order[i] = i;
+    shuffle_int(t->elim_order, 9);
+}
+
+static void init_deterministic_tables(ShuffledTables *t) {
+    memcpy(t->peers, peers, sizeof(peers));
+    memcpy(t->units, units, sizeof(units));
+    for (int i = 0; i < 81; i++) {
+        t->unit_order[i][0] = 0; t->unit_order[i][1] = 1; t->unit_order[i][2] = 2;
+    }
+    for (int i = 0; i < 9; i++) t->elim_order[i] = i;
+}
 
 static int eliminate(State *s, int cell, uint16_t d_bit);
 
 static int assign(State *s, int cell, uint16_t d_bit) {
     uint16_t other = s->values[cell] & ~d_bit;
-    uint16_t bit = 1;
-    while (other) {
-        if (other & 1) {
+    for (int i = 0; i < 9; i++) {
+        uint16_t bit = 1 << s->tables->elim_order[i];
+        if (other & bit) {
             if (!eliminate(s, cell, bit))
                 return 0;
         }
-        other >>= 1;
-        bit <<= 1;
     }
     return 1;
 }
@@ -136,16 +177,17 @@ static int eliminate(State *s, int cell, uint16_t d_bit) {
             s->trace_len++;
         }
         for (int p = 0; p < 20; p++) {
-            if (!eliminate(s, peers[cell][p], new_val))
+            if (!eliminate(s, s->tables->peers[cell][p], new_val))
                 return 0;
         }
     }
 
     /* Hidden single */
-    for (int u = 0; u < 3; u++) {
+    for (int ui = 0; ui < 3; ui++) {
+        int u = s->tables->unit_order[cell][ui];
         int count = 0, place = -1;
         for (int k = 0; k < 9; k++) {
-            int sq = units[cell][u][k];
+            int sq = s->tables->units[cell][u][k];
             if (s->values[sq] & d_bit) {
                 count++;
                 if (count > 1) break;
@@ -189,7 +231,8 @@ static int search(State *s) {
     int cell = deterministic_mode ? best : tied[rand() % n_tied];
     uint16_t bits = s->values[cell];
 
-    for (uint16_t bit = 1; bit <= bits; bit <<= 1) {
+    for (int i = 0; i < 9; i++) {
+        uint16_t bit = 1 << s->tables->elim_order[i];
         if (!(bits & bit)) continue;
         State copy = *s;
         if (assign(&copy, cell, bit)) {
@@ -209,14 +252,30 @@ static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int
     memset(s.clues, 0, sizeof(s.clues));
     s.trace_len = 0;
 
-    /* Parse clues */
+    /* Shuffle peer/unit tables for this puzzle */
+    ShuffledTables tables;
+    s.tables = &tables;
+    if (!deterministic_mode)
+        init_shuffled_tables(&tables);
+    else
+        init_deterministic_tables(&tables);
+
+    /* Collect clue indices and shuffle */
+    int clue_idx[81];
+    int n_clues = 0;
     for (int i = 0; i < 81; i++) {
-        char ch = puzzle[i];
-        if (ch >= '1' && ch <= '9') {
-            s.clues[i] = 1;
-            if (!assign(&s, i, 1 << (ch - '1')))
-                return 0;
-        }
+        if (puzzle[i] >= '1' && puzzle[i] <= '9')
+            clue_idx[n_clues++] = i;
+    }
+    if (!deterministic_mode)
+        shuffle_int(clue_idx, n_clues);
+
+    /* Parse clues in (shuffled) order */
+    for (int k = 0; k < n_clues; k++) {
+        int i = clue_idx[k];
+        s.clues[i] = 1;
+        if (!assign(&s, i, 1 << (puzzle[i] - '1')))
+            return 0;
     }
 
     /* Check if solved */

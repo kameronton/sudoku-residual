@@ -74,9 +74,23 @@ def _bit(d: int) -> int:
     return 1 << (d - 1)
 
 
+def _shuffled_tables():
+    """Return per-solve shuffled copies of peer and unit tables."""
+    peers = tuple(tuple(random.sample(p, len(p))) for p in _PEERS_INT)
+    units = tuple(
+        tuple(tuple(random.sample(u, len(u))) for u in random.sample(cell_units, len(cell_units)))
+        for cell_units in _UNITS_INT
+    )
+    elim_order = list(range(9))
+    random.shuffle(elim_order)
+    return peers, units, elim_order
+
+
 def _eliminate(
     values: list[int], cell: int, d_bit: int,
     trace: list | None, clue_set: set[int] | None,
+    peers: tuple | None = None, units: tuple | None = None,
+    elim_order: list | None = None,
 ) -> bool:
     old = values[cell]
     if not (old & d_bit):
@@ -91,11 +105,11 @@ def _eliminate(
         if trace is not None and clue_set is not None and cell not in clue_set:
             r, c = divmod(cell, 9)
             trace.append((r, c, new.bit_length()))
-        for peer in _PEERS_INT[cell]:
-            if not _eliminate(values, peer, new, trace, clue_set):
+        for peer in (peers[cell] if peers is not None else _PEERS_INT[cell]):
+            if not _eliminate(values, peer, new, trace, clue_set, peers, units, elim_order):
                 return False
     # Hidden single: for each unit of cell, check if d_bit has only one place
-    for unit in _UNITS_INT[cell]:
+    for unit in (units[cell] if units is not None else _UNITS_INT[cell]):
         count = 0
         place = -1
         for sq in unit:
@@ -107,7 +121,7 @@ def _eliminate(
         if count == 0:
             return False
         if count == 1:
-            if not _assign(values, place, d_bit, trace, clue_set):
+            if not _assign(values, place, d_bit, trace, clue_set, peers, units, elim_order):
                 return False
     return True
 
@@ -115,21 +129,24 @@ def _eliminate(
 def _assign(
     values: list[int], cell: int, d_bit: int,
     trace: list | None, clue_set: set[int] | None,
+    peers: tuple | None = None, units: tuple | None = None,
+    elim_order: list | None = None,
 ) -> bool:
     other = values[cell] & ~d_bit
-    # Eliminate all other digits
-    bit = 1
-    while other:
-        if other & 1:
-            if not _eliminate(values, cell, bit, trace, clue_set):
+    # Eliminate all other digits in shuffled order
+    order = elim_order if elim_order is not None else range(9)
+    for i in order:
+        bit = 1 << i
+        if other & bit:
+            if not _eliminate(values, cell, bit, trace, clue_set, peers, units, elim_order):
                 return False
-        other >>= 1
-        bit <<= 1
     return True
 
 
 def _search(
     values: list[int], trace: list, clue_set: set[int], random_mrv: bool,
+    peers: tuple | None = None, units: tuple | None = None,
+    elim_order: list | None = None,
 ) -> bool:
     # Check if solved — MRV heuristic
     min_count = 10
@@ -153,17 +170,18 @@ def _search(
 
     cell = random.choice(best_cells) if random_mrv else best_cell
     bits = values[cell]
-    bit = 1
-    while bit <= bits:
+    # Try digits in shuffled order
+    order = elim_order if elim_order is not None else range(9)
+    for i in order:
+        bit = 1 << i
         if bits & bit:
             trace_snap = len(trace)
             copy = values[:]
-            if _assign(copy, cell, bit, trace, clue_set):
-                if _search(copy, trace, clue_set, random_mrv):
+            if _assign(copy, cell, bit, trace, clue_set, peers, units, elim_order):
+                if _search(copy, trace, clue_set, random_mrv, peers, units, elim_order):
                     values[:] = copy
                     return True
             del trace[trace_snap:]
-        bit <<= 1
     return False
 
 
@@ -177,12 +195,14 @@ def solve(puzzle: str, *, random_mrv: bool = True) -> tuple[str, list[tuple[int,
     trace: list[tuple[int, int, int]] = []
     clue_set: set[int] = set()
     values = [_ALL_BITS] * 81
-    # Parse grid: assign clues
-    for i, ch in enumerate(puzzle):
-        if '1' <= ch <= '9':
-            clue_set.add(i)
-            if not _assign(values, i, _bit(int(ch)), trace, clue_set):
-                return None
+    peers, units, elim_order = _shuffled_tables()
+    # Parse grid: assign clues in random order
+    clue_indices = [(i, ch) for i, ch in enumerate(puzzle) if '1' <= ch <= '9']
+    random.shuffle(clue_indices)
+    for i, ch in clue_indices:
+        clue_set.add(i)
+        if not _assign(values, i, _bit(int(ch)), trace, clue_set, peers, units, elim_order):
+            return None
 
     # Check if solved
     if all(v.bit_count() == 1 for v in values):
@@ -190,7 +210,7 @@ def solve(puzzle: str, *, random_mrv: bool = True) -> tuple[str, list[tuple[int,
         return solution, trace
 
     # Need search
-    if _search(values, trace, clue_set, random_mrv):
+    if _search(values, trace, clue_set, random_mrv, peers, units, elim_order):
         solution = "".join(str(v.bit_length()) for v in values)
         return solution, trace
     return None
