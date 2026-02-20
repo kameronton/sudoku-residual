@@ -42,7 +42,7 @@ uv run python probes.py --step 5 --filter solved --cache_path probe_acts.npz  # 
 
 # Utilities
 uv run python visualize.py --data_path sudoku-3m.csv --index 0 --mode random --step
-uv run python plot.py train_log.json --tokens_per_step 5184
+uv run python plot.py train_log.json
 uv run python -c "from data import sanity_check; sanity_check()"
 ```
 
@@ -87,13 +87,14 @@ GPT-2 architecture with pre-norm (LayerNorm before attention/FFN). Causal maskin
 
 ### Training (`training.py`)
 
-- Token-based budget (not epochs) via `--num_tokens`
+- Token-based budget via `--num_tokens`, epoch-based sequential iteration with reshuffling
 - Loads `sequences_train` and `sequences_val` directly from NPZ (no runtime splitting)
 - LR schedules: `linear` (1cycle) or `cosine` (warmup + cosine decay), selected via `--schedule_type`
 - Loss masking: only tokens after `<sep>` contribute to loss (trace portion, not clues)
 - Dataset preloaded to device at startup for zero-copy batch indexing on TPU
-- Loss readback deferred to `log_every` intervals to avoid TPU pipeline stalls
+- Fused eval: `--eval_every` logs both train and val loss together; loss readback only at eval points
 - `--full_val` evaluates on the entire val set; default samples 10 random batches
+- Log format: `{"entries": [{"step", "epoch", "train_loss", "val_loss"}, ...], "tokens_per_step", ...}`
 - Checkpointing via Orbax with schedule metadata for correct LR resume
 - `TrainConfig` dataclass holds all hyperparameters (model, optimizer, schedule, paths)
 

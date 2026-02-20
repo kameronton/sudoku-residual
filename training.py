@@ -35,8 +35,7 @@ class TrainConfig:
     lr: float = 3e-4
     warmup_tokens: int = 1_000_000
     weight_decay: float = 0.1
-    log_every: int = 50
-    val_every: int = 500
+    eval_every: int = 500
     full_val: bool = False
     num_checkpoints: int = 10
     ckpt_dir: str = "checkpoints"
@@ -55,33 +54,24 @@ class TrainConfig:
 class TrainLogger:
     """Accumulates training statistics and periodically saves to disk."""
 
-    def __init__(self, log_path: str = "train_log.json"):
+    def __init__(self, log_path: str = "train_log.json", tokens_per_step: int = 0):
         self.log_path = log_path
-        self.step_losses: list[float] = []
-        self.step_tokens: list[int] = []
-        self.step_times: list[float] = []
-        self.val_losses: list[tuple[int, float]] = []  # (step, loss)
+        self.tokens_per_step = tokens_per_step
+        self.entries: list[dict] = []
         self.checkpoints: list[int] = []
         self.total_tokens: int = 0
         self._t0: float = time.time()
 
-    def log_step(self, step: int, loss: float, n_tokens: int):
-        self.step_losses.append(loss)
-        self.step_tokens.append(n_tokens)
-        self.step_times.append(time.time())
-        self.total_tokens += n_tokens
-
-    def log_val(self, step: int, val_loss: float):
-        self.val_losses.append((step, val_loss))
+    def log_eval(self, step: int, epoch: float, train_loss: float, val_loss: float):
+        self.entries.append({
+            "step": step,
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+        })
 
     def log_checkpoint(self, step: int):
         self.checkpoints.append(step)
-
-    def recent_loss(self, n: int = 50) -> float:
-        if not self.step_losses:
-            return float("nan")
-        window = self.step_losses[-n:]
-        return sum(window) / len(window)
 
     @property
     def tokens_per_sec(self) -> float:
@@ -92,21 +82,20 @@ class TrainLogger:
 
     def summary(self) -> dict:
         elapsed = time.time() - self._t0
+        last = self.entries[-1] if self.entries else {}
         return {
-            "total_steps": len(self.step_losses),
+            "total_steps": last.get("step", 0),
             "total_tokens": self.total_tokens,
             "wall_time_s": elapsed,
             "tokens_per_sec": self.tokens_per_sec,
-            "final_loss": self.step_losses[-1] if self.step_losses else None,
-            "final_val_loss": self.val_losses[-1][1] if self.val_losses else None,
+            "final_train_loss": last.get("train_loss"),
+            "final_val_loss": last.get("val_loss"),
         }
 
     def save(self):
         data = {
-            "step_losses": self.step_losses,
-            "step_tokens": self.step_tokens,
-            "step_times": self.step_times,
-            "val_losses": self.val_losses,
+            "tokens_per_step": self.tokens_per_step,
+            "entries": self.entries,
             "checkpoints": self.checkpoints,
             "total_tokens": self.total_tokens,
             "summary": self.summary(),
@@ -228,7 +217,6 @@ def train(cfg: TrainConfig):
     n_train = raw_train.shape[0]
     n_val = raw_val.shape[0]
     max_seq_len = raw_train.shape[1]
-    train_indices = np.arange(n_train)
     val_indices = np.arange(n_val)
 
     # Upload to device — avoids CPU→device transfer every step
@@ -296,8 +284,13 @@ def train(cfg: TrainConfig):
         start_step = int(restored.step)
         print(f"Resumed from checkpoint at step {start_step}")
 
+    # Epoch-based iteration
+    steps_per_epoch = n_train // cfg.batch_size
+    total_epochs = total_steps / steps_per_epoch
+    print(f"Epochs: {total_epochs:.2f} ({steps_per_epoch} steps/epoch)", flush=True)
+
     # Logger
-    logger = TrainLogger(log_path=cfg.log_path)
+    logger = TrainLogger(log_path=cfg.log_path, tokens_per_step=tokens_per_step)
     logger.total_tokens = start_step * tokens_per_step
 
     # Training loop with tqdm
@@ -311,57 +304,62 @@ def train(cfg: TrainConfig):
         smoothing=0.1,
     )
 
-    for step in range(start_step, total_steps):
-        # Sample batch — device-side gather, no CPU→device transfer
-        batch_idx = np.random.choice(train_indices, size=cfg.batch_size, replace=False)
-        batch = device_train[batch_idx]
+    def compute_val_loss():
+        val_losses = []
+        if cfg.full_val:
+            for vstart in range(0, n_val, cfg.batch_size):
+                vb = device_val[vstart:min(vstart + cfg.batch_size, n_val)]
+                vl = eval_step(state, vb, model_cfg.vocab_size)
+                val_losses.append(float(vl))
+        else:
+            for _ in range(min(10, max(1, n_val // cfg.batch_size))):
+                vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
+                vb = device_val[vi]
+                vl = eval_step(state, vb, model_cfg.vocab_size)
+                val_losses.append(float(vl))
+        return float(np.mean(val_losses))
 
-        state, loss = train_step(state, batch, model_cfg.vocab_size)
+    step = start_step
+    epoch = 0
+    while step < total_steps:
+        perm = np.random.permutation(n_train)
+        for batch_start in range(0, steps_per_epoch * cfg.batch_size, cfg.batch_size):
+            if step >= total_steps:
+                break
+            batch_idx = perm[batch_start:batch_start + cfg.batch_size]
+            batch = device_train[batch_idx]
 
-        # Only read loss from device when we need to display it — float()
-        # forces a blocking device→host sync that stalls the TPU pipeline.
-        logger.total_tokens += tokens_per_step
-        pbar.update(tokens_per_step)
-        should_log = (step + 1) % cfg.log_every == 0
-        if should_log:
-            loss_val = float(loss)
-            logger.step_losses.append(loss_val)
+            state, loss = train_step(state, batch, model_cfg.vocab_size)
+            step += 1
+            logger.total_tokens += tokens_per_step
+            pbar.update(tokens_per_step)
 
-        if should_log:
-            tok_s = logger.tokens_per_sec
-            pbar.set_postfix_str(
-                f"loss={loss_val:.4f} | tok/s={tok_s / 1000:.1f}K | step={step + 1}"
-            )
+            if step % cfg.eval_every == 0:
+                train_loss = float(loss)
+                val_loss = compute_val_loss()
+                epoch_float = epoch + (batch_start // cfg.batch_size + 1) / steps_per_epoch
+                logger.log_eval(step, epoch_float, train_loss, val_loss)
+                logger.save()
+                tok_s = logger.tokens_per_sec
+                pbar.set_postfix_str(
+                    f"train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f} | tok/s={tok_s / 1000:.1f}K"
+                )
+                tqdm.write(f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f}")
 
-        if (step + 1) % cfg.val_every == 0:
-            val_losses = []
-            if cfg.full_val:
-                for vstart in range(0, n_val, cfg.batch_size):
-                    vb = device_val[vstart:min(vstart + cfg.batch_size, n_val)]
-                    vl = eval_step(state, vb, model_cfg.vocab_size)
-                    val_losses.append(float(vl))
-            else:
-                for _ in range(min(10, max(1, n_val // cfg.batch_size))):
-                    vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
-                    vb = device_val[vi]
-                    vl = eval_step(state, vb, model_cfg.vocab_size)
-                    val_losses.append(float(vl))
-            avg_val = np.mean(val_losses)
-            logger.log_val(step + 1, float(avg_val))
-            logger.save()
-            tqdm.write(f"  step {step + 1:>6d} | val_loss {avg_val:.4f}")
+            if ckpt_every > 0 and step % ckpt_every == 0:
+                ckpt_mgr.save(step, args=ocp.args.Composite(
+                    params=ocp.args.StandardSave(state.params),
+                    opt_state=ocp.args.StandardSave(state.opt_state),
+                    step=ocp.args.JsonSave(int(state.step)),
+                    model_config=ocp.args.JsonSave(dataclasses.asdict(model_cfg)),
+                    train_config=ocp.args.JsonSave(dataclasses.asdict(cfg)),
+                ))
+                ckpt_mgr.wait_until_finished()
+                logger.log_checkpoint(step)
+                tqdm.write(f"  checkpoint saved at step {step}")
 
-        if ckpt_every > 0 and (step + 1) % ckpt_every == 0:
-            ckpt_mgr.save(step + 1, args=ocp.args.Composite(
-                params=ocp.args.StandardSave(state.params),
-                opt_state=ocp.args.StandardSave(state.opt_state),
-                step=ocp.args.JsonSave(int(state.step)),
-                model_config=ocp.args.JsonSave(dataclasses.asdict(model_cfg)),
-                train_config=ocp.args.JsonSave(dataclasses.asdict(cfg)),
-            ))
-            ckpt_mgr.wait_until_finished()
-            logger.log_checkpoint(step + 1)
-            tqdm.write(f"  checkpoint saved at step {step + 1}")
+        epoch += 1
+        tqdm.write(f"  epoch {epoch} complete at step {step}")
 
     pbar.close()
 
@@ -384,8 +382,8 @@ def train(cfg: TrainConfig):
     print(f"  Tokens: {summary['total_tokens']:,}")
     print(f"  Wall time: {summary['wall_time_s']:.1f}s")
     print(f"  Throughput: {summary['tokens_per_sec'] / 1000:.1f}K tok/s")
-    if summary['final_loss'] is not None:
-        print(f"  Final train loss: {summary['final_loss']:.4f}")
+    if summary['final_train_loss'] is not None:
+        print(f"  Final train loss: {summary['final_train_loss']:.4f}")
     if summary['final_val_loss'] is not None:
         print(f"  Final val loss: {summary['final_val_loss']:.4f}")
 
