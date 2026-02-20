@@ -15,6 +15,7 @@ class TransformerConfig:
     d_ff: int = 512
     vocab_size: int = 731
     max_seq_len: int = 82 # Since there are only 81 cells, we can use a shorter sequence length, even if we'll allow to backtrack eventually
+    use_pos_emb: bool = True
     dtype: str = "float32"  # "float32", "bfloat16", or "float16"
 
     @property
@@ -113,12 +114,15 @@ class GPT2Model(nn.Module):
         dtype = cfg.jax_dtype
         tok_emb = nn.Embed(cfg.vocab_size, cfg.d_model, dtype=dtype, name="token_emb")(tokens)
 
-        if cache_index is not None:
-            positions = jax.lax.dynamic_slice(jnp.arange(cfg.max_seq_len), (cache_index,), (T,))[None, :]
+        if cfg.use_pos_emb:
+            if cache_index is not None:
+                positions = jax.lax.dynamic_slice(jnp.arange(cfg.max_seq_len), (cache_index,), (T,))[None, :]
+            else:
+                positions = jnp.arange(T)[None, :]
+            pos_emb = nn.Embed(cfg.max_seq_len, cfg.d_model, dtype=dtype, name="pos_emb")(positions)
+            x = tok_emb + pos_emb  # (B, T, d_model)
         else:
-            positions = jnp.arange(T)[None, :]
-        pos_emb = nn.Embed(cfg.max_seq_len, cfg.d_model, dtype=dtype, name="pos_emb")(positions)
-        x = tok_emb + pos_emb  # (B, T, d_model)
+            x = tok_emb
 
         updated_caches = []
         intermediates = []

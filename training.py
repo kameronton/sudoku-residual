@@ -46,6 +46,7 @@ class TrainConfig:
     n_heads: int = 4
     d_model: int = 128
     d_ff: int = 512
+    no_pos_emb: bool = False
     dtype: str = "float32"
     schedule_type: str = "linear"  # or "cosine"
     backend: str = "jax"
@@ -241,6 +242,7 @@ def train(cfg: TrainConfig):
         n_heads=cfg.n_heads,
         d_model=cfg.d_model,
         d_ff=cfg.d_ff,
+        use_pos_emb=not cfg.no_pos_emb,
         max_seq_len=max_seq_len,
         dtype=cfg.dtype,
     )
