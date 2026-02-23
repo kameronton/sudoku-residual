@@ -19,3 +19,6 @@ logs/
 # Ignore the dataset
 sudoku-3m.csv
 *.npz
+
+# Ignore compiled solver
+solver

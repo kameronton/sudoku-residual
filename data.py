@@ -44,34 +44,34 @@ _PEERS_INT: tuple[tuple[int, ...], ...]
 
 def _init_tables():
     global _UNITS_INT, _PEERS_INT
-    unitlist: list[tuple[int, ...]] = []
-    for c in range(9):
-        unitlist.append(tuple(r * 9 + c for r in range(9)))
-    for r in range(9):
-        unitlist.append(tuple(r * 9 + c for c in range(9)))
-    for br in range(3):
-        for bc in range(3):
-            unitlist.append(tuple(
-                (br * 3 + dr) * 9 + (bc * 3 + dc)
-                for dr in range(3) for dc in range(3)
-            ))
-    units_list = []
-    peers_list = []
-    for i in range(81):
-        my_units = tuple(tuple(u) for u in unitlist if i in u)
-        units_list.append(my_units)
-        peer_set: set[int] = set()
-        for u in my_units:
-            peer_set.update(u)
-        peer_set.discard(i)
-        peers_list.append(tuple(peer_set))
-    _UNITS_INT = tuple(units_list)
-    _PEERS_INT = tuple(peers_list)
+    unitlist = (
+        [tuple(r * 9 + c for r in range(9)) for c in range(9)]
+        + [tuple(r * 9 + c for c in range(9)) for r in range(9)]
+        + [tuple((br*3+dr)*9 + bc*3+dc for dr in range(3) for dc in range(3))
+           for br in range(3) for bc in range(3)]
+    )
+    _UNITS_INT = tuple(
+        tuple(u for u in unitlist if i in u) for i in range(81)
+    )
+    _PEERS_INT = tuple(
+        tuple(set().union(*_UNITS_INT[i]) - {i}) for i in range(81)
+    )
 
 _init_tables()
 
 def _bit(d: int) -> int:
     return 1 << (d - 1)
+
+
+class _SolverState:
+    __slots__ = ("values", "trace", "clue_set", "peers", "units", "elim_order")
+    def __init__(self, values, trace, clue_set, peers, units, elim_order):
+        self.values = values
+        self.trace = trace
+        self.clue_set = clue_set
+        self.peers = peers
+        self.units = units
+        self.elim_order = elim_order
 
 
 def _shuffled_tables():
@@ -86,34 +86,28 @@ def _shuffled_tables():
     return peers, units, elim_order
 
 
-def _eliminate(
-    values: list[int], cell: int, d_bit: int,
-    trace: list | None, clue_set: set[int] | None,
-    peers: tuple | None = None, units: tuple | None = None,
-    elim_order: list | None = None,
-) -> bool:
-    old = values[cell]
+def _eliminate(s: _SolverState, cell: int, d_bit: int) -> bool:
+    old = s.values[cell]
     if not (old & d_bit):
         return True  # already eliminated
     new = old & ~d_bit
     if new == 0:
         return False
-    values[cell] = new
+    s.values[cell] = new
     # Naked single: propagate to peers
     if new & (new - 1) == 0:  # popcount == 1
-        # Record trace
-        if trace is not None and clue_set is not None and cell not in clue_set:
+        if cell not in s.clue_set:
             r, c = divmod(cell, 9)
-            trace.append((r, c, new.bit_length()))
-        for peer in (peers[cell] if peers is not None else _PEERS_INT[cell]):
-            if not _eliminate(values, peer, new, trace, clue_set, peers, units, elim_order):
+            s.trace.append((r, c, new.bit_length()))
+        for peer in s.peers[cell]:
+            if not _eliminate(s, peer, new):
                 return False
     # Hidden single: for each unit of cell, check if d_bit has only one place
-    for unit in (units[cell] if units is not None else _UNITS_INT[cell]):
+    for unit in s.units[cell]:
         count = 0
         place = -1
         for sq in unit:
-            if values[sq] & d_bit:
+            if s.values[sq] & d_bit:
                 count += 1
                 if count > 1:
                     break
@@ -121,39 +115,29 @@ def _eliminate(
         if count == 0:
             return False
         if count == 1:
-            if not _assign(values, place, d_bit, trace, clue_set, peers, units, elim_order):
+            if not _assign(s, place, d_bit):
                 return False
     return True
 
 
-def _assign(
-    values: list[int], cell: int, d_bit: int,
-    trace: list | None, clue_set: set[int] | None,
-    peers: tuple | None = None, units: tuple | None = None,
-    elim_order: list | None = None,
-) -> bool:
-    other = values[cell] & ~d_bit
+def _assign(s: _SolverState, cell: int, d_bit: int) -> bool:
+    other = s.values[cell] & ~d_bit
     # Eliminate all other digits in shuffled order
-    order = elim_order if elim_order is not None else range(9)
-    for i in order:
+    for i in s.elim_order:
         bit = 1 << i
         if other & bit:
-            if not _eliminate(values, cell, bit, trace, clue_set, peers, units, elim_order):
+            if not _eliminate(s, cell, bit):
                 return False
     return True
 
 
-def _search(
-    values: list[int], trace: list, clue_set: set[int], random_mrv: bool,
-    peers: tuple | None = None, units: tuple | None = None,
-    elim_order: list | None = None,
-) -> bool:
+def _search(s: _SolverState, random_mrv: bool) -> bool:
     # Check if solved — MRV heuristic
     min_count = 10
     best_cell = -1
     best_cells: list[int] | None = [] if random_mrv else None
     for i in range(81):
-        v = values[i]
+        v = s.values[i]
         if v == 0:
             return False
         cnt = v.bit_count()
@@ -169,19 +153,18 @@ def _search(
         return True  # all cells solved
 
     cell = random.choice(best_cells) if random_mrv else best_cell
-    bits = values[cell]
+    bits = s.values[cell]
     # Try digits in shuffled order
-    order = elim_order if elim_order is not None else range(9)
-    for i in order:
+    for i in s.elim_order:
         bit = 1 << i
         if bits & bit:
-            trace_snap = len(trace)
-            copy = values[:]
-            if _assign(copy, cell, bit, trace, clue_set, peers, units, elim_order):
-                if _search(copy, trace, clue_set, random_mrv, peers, units, elim_order):
-                    values[:] = copy
+            trace_snap = len(s.trace)
+            saved_values = s.values[:]
+            if _assign(s, cell, bit):
+                if _search(s, random_mrv):
                     return True
-            del trace[trace_snap:]
+            s.values[:] = saved_values
+            del s.trace[trace_snap:]
     return False
 
 
@@ -192,27 +175,32 @@ def solve(puzzle: str, *, random_mrv: bool = True) -> tuple[str, list[tuple[int,
         random_mrv: When True (default), break MRV ties randomly during search.
             Set to False for faster solving when trace variety is not needed.
     """
-    trace: list[tuple[int, int, int]] = []
-    clue_set: set[int] = set()
-    values = [_ALL_BITS] * 81
     peers, units, elim_order = _shuffled_tables()
+    s = _SolverState(
+        values=[_ALL_BITS] * 81,
+        trace=[],
+        clue_set=set(),
+        peers=peers,
+        units=units,
+        elim_order=elim_order,
+    )
     # Parse grid: assign clues in random order
     clue_indices = [(i, ch) for i, ch in enumerate(puzzle) if '1' <= ch <= '9']
     random.shuffle(clue_indices)
     for i, ch in clue_indices:
-        clue_set.add(i)
-        if not _assign(values, i, _bit(int(ch)), trace, clue_set, peers, units, elim_order):
+        s.clue_set.add(i)
+        if not _assign(s, i, _bit(int(ch))):
             return None
 
     # Check if solved
-    if all(v.bit_count() == 1 for v in values):
-        solution = "".join(str(v.bit_length()) for v in values)
-        return solution, trace
+    if all(v.bit_count() == 1 for v in s.values):
+        solution = "".join(str(v.bit_length()) for v in s.values)
+        return solution, s.trace
 
     # Need search
-    if _search(values, trace, clue_set, random_mrv, peers, units, elim_order):
-        solution = "".join(str(v.bit_length()) for v in values)
-        return solution, trace
+    if _search(s, random_mrv):
+        solution = "".join(str(v.bit_length()) for v in s.values)
+        return solution, s.trace
     return None
 
 
@@ -221,11 +209,7 @@ def solve(puzzle: str, *, random_mrv: bool = True) -> tuple[str, list[tuple[int,
 # ---------------------------------------------------------------------------
 
 def random_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
-    empties = []
-    for i in range(81):
-        if puzzle[i] not in "123456789":
-            r, c = divmod(i, 9)
-            empties.append((r, c, int(solution[i])))
+    empties = [(i // 9, i % 9, int(solution[i])) for i in range(81) if puzzle[i] not in "123456789"]
     random.shuffle(empties)
     return empties
 
@@ -290,12 +274,6 @@ def collate_batch(dataset: SudokuDataset, indices: Sequence[int]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Preprocessing / prepare
 # ---------------------------------------------------------------------------
-
-TRACE_GENERATORS = {
-    "random": lambda puzzle, solution, _trace: random_trace(puzzle, solution),
-    "constraint": lambda _puzzle, _solution, trace: trace,
-}
-
 
 _SOLVER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solver")
 
@@ -394,7 +372,6 @@ def prepare_data(
         _prepare_constraint_c(data_path, output, max_puzzles, randomize_clues, train_frac, val_frac, test_frac, seed)
         return
 
-    gen_fn = TRACE_GENERATORS[trace_mode]
     sequences = []
     puzzle_strs = []
     failed = 0
@@ -412,7 +389,10 @@ def prepare_data(
                 continue
             solution, cg_trace = result
             assert solution == solution_csv, f"Solver mismatch at row {i}"
-            trace = gen_fn(puzzle, solution, cg_trace)
+            if trace_mode == "random":
+                trace = random_trace(puzzle, solution)
+            elif trace_mode == "constraint":
+                trace = cg_trace
             seq = tokenize_trace(puzzle, solution, trace, sep_token, randomize_clues)
             assert seq.shape == (MAX_SEQ_LEN,), f"Tokenization error at row {i}"
             sequences.append(seq)
@@ -459,7 +439,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--data_path", default="sudoku-3m.csv")
-    parser.add_argument("--trace_mode", default="random", choices=["random", "constraint", "human"])
+    parser.add_argument("--trace_mode", default="random", choices=["random", "constraint"])
     parser.add_argument("--output", default="traces_random.npz")
     parser.add_argument("--max_puzzles", type=int, default=None)
     parser.add_argument("--randomize_clues", action="store_true")
