@@ -49,6 +49,7 @@ class TrainConfig:
     no_pos_emb: bool = False
     dtype: str = "float32"
     schedule_type: str = "linear"  # or "cosine"
+    loss_mask: str = "after_clues"  # "all" or "after_clues"
     backend: str = "jax"
 
 
@@ -153,21 +154,27 @@ def create_train_state(rng, cfg: TrainConfig, model_cfg: TransformerConfig, tota
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-@partial(jax.jit, static_argnames=("vocab_size",), donate_argnums=(0,))
-def train_step(state, batch, vocab_size):
+def _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep):
+    """Build per-token loss mask based on masking mode."""
+    positions = jnp.arange(targets.shape[1])[None, :]  # (1, T-1)
+    if loss_mask == "all":
+        return (targets != PAD_TOKEN).astype(jnp.float32)
+    else:  # "after_clues"
+        boundary = n_clues_batch[:, None] if has_sep else (n_clues_batch[:, None] - 1)
+        return ((positions >= boundary) & (targets != PAD_TOKEN)).astype(jnp.float32)
+
+
+@partial(jax.jit, static_argnames=("vocab_size", "loss_mask", "has_sep"), donate_argnums=(0,))
+def train_step(state, batch, n_clues_batch, vocab_size, loss_mask, has_sep):
     """Single training step. batch is (B, T) int32 tokens."""
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
-
-    # Mask: only compute loss for tokens after <sep>, excluding pad
-    sep_pos = jnp.argmax(inputs == SEP_TOKEN, axis=1, keepdims=True)  # (B, 1)
-    positions = jnp.arange(targets.shape[1])[None, :]  # (1, T-1)
-    mask = ((positions >= sep_pos) & (targets != PAD_TOKEN)).astype(jnp.float32)
+    mask = _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep)
 
     def loss_fn(params):
         logits = state.apply_fn({"params": params}, inputs)
         per_token_loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits=logits, 
+            logits=logits,
             labels=targets
         )
         masked_loss = per_token_loss * mask
@@ -180,13 +187,11 @@ def train_step(state, batch, vocab_size):
     return state, loss
 
 
-@partial(jax.jit, static_argnames=("vocab_size",))
-def eval_step(state, batch, vocab_size):
+@partial(jax.jit, static_argnames=("vocab_size", "loss_mask", "has_sep"))
+def eval_step(state, batch, n_clues_batch, vocab_size, loss_mask, has_sep):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
-    sep_pos = jnp.argmax(inputs == SEP_TOKEN, axis=1, keepdims=True)
-    positions = jnp.arange(targets.shape[1])[None, :]
-    mask = ((positions >= sep_pos) & (targets != PAD_TOKEN)).astype(jnp.float32)
+    mask = _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep)
     logits = state.apply_fn({"params": state.params}, inputs)
     per_token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
     masked_loss = per_token_loss * mask
@@ -215,6 +220,17 @@ def train(cfg: TrainConfig):
         np.random.shuffle(indices)
         raw_train = raw[indices[:-n_val]]
         raw_val = raw[indices[-n_val:]]
+    # Load n_clues metadata (fallback: derive from SEP position)
+    if "n_clues_train" in npz:
+        nc_train = npz["n_clues_train"]
+        nc_val = npz["n_clues_val"]
+    else:
+        nc_train = np.argmax(raw_train == SEP_TOKEN, axis=1).astype(np.int32)
+        nc_val = np.argmax(raw_val == SEP_TOKEN, axis=1).astype(np.int32)
+
+    # Detect whether dataset uses SEP tokens (dataset-level property)
+    has_sep = bool(SEP_TOKEN in raw_train[0])
+
     n_train = raw_train.shape[0]
     n_val = raw_val.shape[0]
     max_seq_len = raw_train.shape[1]
@@ -223,8 +239,11 @@ def train(cfg: TrainConfig):
     # Upload to device — avoids CPU→device transfer every step
     device_train = jax.device_put(jnp.array(raw_train, dtype=jnp.int32))
     device_val = jax.device_put(jnp.array(raw_val, dtype=jnp.int32))
-    del raw_train, raw_val
+    device_nc_train = jax.device_put(jnp.array(nc_train, dtype=jnp.int32))
+    device_nc_val = jax.device_put(jnp.array(nc_val, dtype=jnp.int32))
+    del raw_train, raw_val, nc_train, nc_val
     print(f"Dataset: {n_train} train, {n_val} val (preloaded to {jax.devices()[0].platform})", flush=True)
+    print(f"Loss mask: {cfg.loss_mask} (has_sep={has_sep})", flush=True)
     print(f"Max sequence length: {max_seq_len}", flush=True)
 
     # Compute token budget and steps
@@ -310,14 +329,17 @@ def train(cfg: TrainConfig):
         val_losses = []
         if cfg.full_val:
             for vstart in range(0, n_val, cfg.batch_size):
-                vb = device_val[vstart:min(vstart + cfg.batch_size, n_val)]
-                vl = eval_step(state, vb, model_cfg.vocab_size)
+                vend = min(vstart + cfg.batch_size, n_val)
+                vb = device_val[vstart:vend]
+                vnc = device_nc_val[vstart:vend]
+                vl = eval_step(state, vb, vnc, model_cfg.vocab_size, cfg.loss_mask, has_sep)
                 val_losses.append(float(vl))
         else:
             for _ in range(min(10, max(1, n_val // cfg.batch_size))):
                 vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
                 vb = device_val[vi]
-                vl = eval_step(state, vb, model_cfg.vocab_size)
+                vnc = device_nc_val[vi]
+                vl = eval_step(state, vb, vnc, model_cfg.vocab_size, cfg.loss_mask, has_sep)
                 val_losses.append(float(vl))
         return float(np.mean(val_losses))
 
@@ -330,8 +352,9 @@ def train(cfg: TrainConfig):
                 break
             batch_idx = perm[batch_start:batch_start + cfg.batch_size]
             batch = device_train[batch_idx]
+            nc_batch = device_nc_train[batch_idx]
 
-            state, loss = train_step(state, batch, model_cfg.vocab_size)
+            state, loss = train_step(state, batch, nc_batch, model_cfg.vocab_size, cfg.loss_mask, has_sep)
             step += 1
             logger.total_tokens += tokens_per_step
             pbar.update(tokens_per_step)

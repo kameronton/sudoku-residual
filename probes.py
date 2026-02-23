@@ -67,7 +67,7 @@ def collect_activations(intermediates_fn, params, sequences: list[list[int]], ba
     return np.concatenate(all_acts, axis=0).astype(np.float32)
 
 
-def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], sequences: list[list[int]], compress: bool = True):
+def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], sequences: list[list[int]], compress: bool = True, n_clues: np.ndarray | None = None):
     """Save activations, puzzles, and token sequences together."""
     puzzle_arr = np.array(puzzles, dtype=f"U{len(puzzles[0])}")
     # Pad sequences to same length for storage
@@ -76,13 +76,16 @@ def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], s
     for i, s in enumerate(sequences):
         seq_arr[i, :len(s)] = s
     save_fn = np.savez_compressed if compress else np.savez
-    save_fn(path, activations=activations, puzzles=puzzle_arr, sequences=seq_arr)
+    arrays = dict(activations=activations, puzzles=puzzle_arr, sequences=seq_arr)
+    if n_clues is not None:
+        arrays["n_clues"] = n_clues
+    save_fn(path, **arrays)
     size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
     print(f"Saved probe dataset to {path} ({activations.shape}, {size_mb:.0f} MB)")
 
 
 def load_probe_dataset(path: str):
-    """Load cached activations, puzzles, and sequences."""
+    """Load cached activations, puzzles, sequences, and optionally n_clues."""
     data = np.load(path)
     activations = data["activations"]
     puzzles = list(data["puzzles"])
@@ -92,9 +95,31 @@ def load_probe_dataset(path: str):
     for row in seq_arr:
         seq = row[row != PAD_TOKEN].tolist()
         sequences.append(seq)
+    n_clues = data["n_clues"] if "n_clues" in data else None
     print(f"Loaded probe dataset from {path} ({activations.shape})")
-    return activations, puzzles, sequences
+    return activations, puzzles, sequences, n_clues
 
+
+
+def derive_n_clues(puzzles: list[str]) -> np.ndarray:
+    """Derive n_clues from puzzle strings (count of non-zero characters)."""
+    return np.array([
+        sum(1 for ch in p if ch in "123456789") for p in puzzles
+    ], dtype=np.int16)
+
+
+def anchor_positions(n_clues: np.ndarray, anchor: str) -> list[int]:
+    """Compute per-puzzle anchor position from n_clues and anchor mode.
+
+    anchor="sep": position of SEP token = n_clues[i] (same as seq.index(SEP_TOKEN))
+    anchor="last_clue": position of last clue token = n_clues[i] - 1
+    """
+    if anchor == "sep":
+        return [int(nc) for nc in n_clues]
+    elif anchor == "last_clue":
+        return [int(nc) - 1 for nc in n_clues]
+    else:
+        raise ValueError(f"Unknown anchor mode: {anchor}")
 
 
 def _cell_candidates(puzzle: str, cell_idx: int) -> list[int]:
@@ -415,6 +440,8 @@ def main():
     parser.add_argument("--mode", default="state_filled", choices=["filled", "state_filled", "candidates"])
     parser.add_argument("--per-digit", action="store_true", help="Per-digit F1 heatmap (candidates mode only)")
     parser.add_argument("--step", type=int, default=0, help="Trace step to probe at (0 = SEP/initial board, 1 = after first fill, ...)")
+    parser.add_argument("--anchor", default="sep", choices=["sep", "last_clue"],
+                        help="Anchor mode: 'sep' probes at SEP token (default), 'last_clue' probes at the last clue token")
     parser.add_argument("--filter", choices=["all", "solved", "unsolved"], default="all",
                         help="Filter puzzles for both train and eval")
     parser.add_argument("--eval-filter", choices=["all", "solved", "unsolved"], default="all",
@@ -436,7 +463,7 @@ def main():
 
     # --- Load data ---
     if os.path.exists(args.cache_path):
-        activations, puzzles, sequences = load_probe_dataset(args.cache_path)
+        activations, puzzles, sequences, n_clues = load_probe_dataset(args.cache_path)
     else:
         params, model = load_checkpoint(args.ckpt_dir, ckpt_step=args.ckpt_step)
         print("Model loaded")
@@ -452,9 +479,14 @@ def main():
         print("Collecting activations...")
         intermediates_fn = make_intermediates_fn(model)
         activations = collect_activations(intermediates_fn, params, sequences, args.batch_size)
-        save_probe_dataset(args.cache_path, activations, puzzles, sequences, compress=not args.no_compress)
+        n_clues = derive_n_clues(puzzles)
+        save_probe_dataset(args.cache_path, activations, puzzles, sequences, compress=not args.no_compress, n_clues=n_clues)
 
-    traces = sequences_to_traces(sequences)
+    # Derive n_clues if not loaded from cache (old cache format)
+    if n_clues is None:
+        n_clues = derive_n_clues(puzzles)
+
+    traces = sequences_to_traces(sequences, n_clues)
 
     # --- Filter puzzles (affects both train and eval) ---
     if args.filter != "all":
@@ -473,17 +505,21 @@ def main():
     # Each offset in `offsets` is relative to SEP+step.
     min_offset = min(offsets)
 
+    # Compute anchor positions from n_clues
+    anchor_pos = anchor_positions(n_clues, args.anchor)
+
     # Filter puzzles that have enough trace steps and enough prefix tokens
     required_trace_steps = step  # need at least `step` fills after SEP
     keep = []
-    for i, (seq, t) in enumerate(zip(sequences, traces)):
-        sep_pos = seq.index(SEP_TOKEN)
-        abs_min = sep_pos + step + min_offset
+    for i, (t, ap) in enumerate(zip(traces, anchor_pos)):
+        abs_min = ap + step + min_offset
         if len(t) >= required_trace_steps and abs_min >= 0:
             keep.append(i)
     if len(keep) < len(puzzles):
         print(f"Filtered to {len(keep)}/{len(puzzles)} puzzles (need >= {required_trace_steps} trace steps, min position >= 0)")
         activations, puzzles, sequences, traces = _subset_by_indices(keep, activations, puzzles, sequences, traces)
+        n_clues = n_clues[keep] if isinstance(n_clues, np.ndarray) else np.array([n_clues[i] for i in keep], dtype=np.int16)
+        anchor_pos = [anchor_pos[i] for i in keep]
 
     if not puzzles:
         print("No puzzles remaining after filtering.")
@@ -497,10 +533,9 @@ def main():
 
     # Build per-puzzle position lists for activation extraction
     use_multi = len(offsets) > 1
-    sep_positions = [seq.index(SEP_TOKEN) for seq in sequences]
     if use_multi:
-        probe_positions_multi = [[sp + step + off for off in offsets] for sp in sep_positions]
-    probe_positions = [sp + step for sp in sep_positions]
+        probe_positions_multi = [[ap + step + off for off in offsets] for ap in anchor_pos]
+    probe_positions = [ap + step for ap in anchor_pos]
 
     # --- Compute eval mask (train on all, eval on subset) ---
     eval_mask = None

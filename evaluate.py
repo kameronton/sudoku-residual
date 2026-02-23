@@ -402,18 +402,30 @@ def traces_to_sequences(puzzles: list[str], traces: list[list[tuple[int, int, in
     return sequences
 
 
-def sequences_to_traces(sequences: list[list[int]]) -> list[list[tuple[int, int, int]]]:
-    """Extract trace tokens from sequences (everything after SEP_TOKEN)."""
+def sequences_to_traces(sequences: list[list[int]], n_clues: np.ndarray | None = None) -> list[list[tuple[int, int, int]]]:
+    """Extract trace tokens from sequences (everything after the clue/SEP boundary).
+
+    If n_clues is provided, uses it to split: trace starts at n_clues[i]+1 (skipping SEP
+    if present) or n_clues[i] (if no SEP). Falls back to scanning for SEP_TOKEN.
+    """
     traces = []
-    for seq in sequences:
+    for i, seq in enumerate(sequences):
         trace = []
-        after_sep = False
-        for tok in seq:
-            if tok == SEP_TOKEN:
-                after_sep = True
-                continue
-            if after_sep and 0 <= tok <= 728:
-                trace.append(decode_fill(tok))
+        if n_clues is not None:
+            nc = int(n_clues[i])
+            # Skip SEP if present at the boundary
+            start = nc + 1 if nc < len(seq) and seq[nc] == SEP_TOKEN else nc
+            for tok in seq[start:]:
+                if 0 <= tok <= 728:
+                    trace.append(decode_fill(tok))
+        else:
+            after_sep = False
+            for tok in seq:
+                if tok == SEP_TOKEN:
+                    after_sep = True
+                    continue
+                if after_sep and 0 <= tok <= 728:
+                    trace.append(decode_fill(tok))
         traces.append(trace)
     return traces
 
@@ -515,8 +527,8 @@ def main():
 
     if args.mistake_map or args.mistake_position:
         from probes import load_probe_dataset
-        activations, puzzles, sequences = load_probe_dataset(args.cache_path)
-        traces = sequences_to_traces(sequences)
+        activations, puzzles, sequences, n_clues = load_probe_dataset(args.cache_path)
+        traces = sequences_to_traces(sequences, n_clues)
         positions = []
         steps_from_end = []
         for puzzle, trace in zip(puzzles, traces):
@@ -539,8 +551,8 @@ def main():
 
     if use_cache:
         from probes import load_probe_dataset
-        activations, puzzles_cached, sequences = load_probe_dataset(args.cache_path)
-        traces = sequences_to_traces(sequences)
+        activations, puzzles_cached, sequences, n_clues = load_probe_dataset(args.cache_path)
+        traces = sequences_to_traces(sequences, n_clues)
 
         # Solve puzzles to get solutions
         from data import solve

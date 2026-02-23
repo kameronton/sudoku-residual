@@ -218,7 +218,7 @@ def random_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
 # ---------------------------------------------------------------------------
 
 def tokenize_trace(
-    puzzle: str, solution: str, trace: list[tuple[int, int, int]], sep_token: bool = True, randomize_clues: bool = False,
+    puzzle: str, solution: str, trace: list[tuple[int, int, int]], no_sep_token: bool = False, randomize_clues: bool = False,
 ) -> np.ndarray:
     """Convert clues + trace into a token sequence, padded to MAX_SEQ_LEN."""
     tokens = []
@@ -231,7 +231,7 @@ def tokenize_trace(
     if randomize_clues:
         random.shuffle(clues)
     tokens.extend(clues)
-    if sep_token:
+    if not no_sep_token:
         tokens.append(SEP_TOKEN)
     # Trace tokens
     for r, c, d in trace:
@@ -258,6 +258,19 @@ class SudokuDataset:
         else:
             # Backward compat: old NPZ files without splits
             self.sequences = data["sequences"]
+
+        # Load n_clues (number of clue tokens per puzzle)
+        clue_key = f"n_clues_{split}"
+        if clue_key in data:
+            self.n_clues = data[clue_key]
+        elif "n_clues" in data:
+            self.n_clues = data["n_clues"]
+        else:
+            # Fallback: derive from sequences by finding SEP position
+            self.n_clues = np.array([
+                list(seq).index(SEP_TOKEN) if SEP_TOKEN in seq else len(seq)
+                for seq in self.sequences
+            ], dtype=np.int16)
 
     def __len__(self) -> int:
         return self.sequences.shape[0]
@@ -333,6 +346,11 @@ def _prepare_constraint_c(
     print(f"Saved {len(sequences)} sequences to {output} (failed: {failed})")
 
 
+def _count_clues(puzzle: str) -> int:
+    """Count non-zero clue characters in an 81-char puzzle string."""
+    return sum(1 for ch in puzzle if ch in "123456789")
+
+
 def _save_splits(
     sequences: np.ndarray, puzzles: np.ndarray, output: str,
     train_frac: float, val_frac: float, test_frac: float, seed: int,
@@ -347,6 +365,10 @@ def _save_splits(
     train_idx = indices[:n_train]
     val_idx = indices[n_train:n_train + n_val]
     test_idx = indices[n_train + n_val:]
+
+    # Compute n_clues per puzzle (index where clues end / trace begins)
+    n_clues = np.array([_count_clues(str(p)) for p in puzzles], dtype=np.int16)
+
     np.savez_compressed(
         output,
         sequences=sequences,  # backward compat
@@ -356,13 +378,17 @@ def _save_splits(
         puzzles_train=puzzles[train_idx],
         puzzles_val=puzzles[val_idx],
         puzzles_test=puzzles[test_idx],
+        n_clues=n_clues,  # backward compat
+        n_clues_train=n_clues[train_idx],
+        n_clues_val=n_clues[val_idx],
+        n_clues_test=n_clues[test_idx],
     )
     print(f"Splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
 
 
 def prepare_data(
     data_path: str, trace_mode: str, output: str, max_puzzles: int | None = None,
-    sep_token: bool = True, randomize_clues: bool = False,
+    no_sep_token: bool = False, randomize_clues: bool = False,
     train_frac: float = 0.90, val_frac: float = 0.05, test_frac: float = 0.05,
     seed: int = 42,
 ):
@@ -393,7 +419,7 @@ def prepare_data(
                 trace = random_trace(puzzle, solution)
             elif trace_mode == "constraint":
                 trace = cg_trace
-            seq = tokenize_trace(puzzle, solution, trace, sep_token, randomize_clues)
+            seq = tokenize_trace(puzzle, solution, trace, no_sep_token, randomize_clues)
             assert seq.shape == (MAX_SEQ_LEN,), f"Tokenization error at row {i}"
             sequences.append(seq)
             puzzle_strs.append(puzzle)
@@ -443,19 +469,16 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="traces_random.npz")
     parser.add_argument("--max_puzzles", type=int, default=None)
     parser.add_argument("--randomize_clues", action="store_true")
+    parser.add_argument("--no_sep_token", action="store_true")
     parser.add_argument("--train_frac", type=float, default=0.90)
     parser.add_argument("--val_frac", type=float, default=0.05)
     parser.add_argument("--test_frac", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if args.prepare:
-        if args.randomize_clues:
-            print("The clues order is randomized")
-        else:
-            print("The clues order is NOT randomized")
         prepare_data(
             args.data_path, args.trace_mode, args.output, args.max_puzzles,
-            sep_token=True, randomize_clues=args.randomize_clues,
+            no_sep_token=args.no_sep_token, randomize_clues=args.randomize_clues,
             train_frac=args.train_frac, val_frac=args.val_frac,
             test_frac=args.test_frac, seed=args.seed,
         )
