@@ -8,7 +8,7 @@
  *   uint8_t  trace_len
  *   uint8_t  trace[trace_len][3]  (row, col, digit)
  *
- * Usage: ./solver [--seed N] [--deterministic] < puzzles.txt > traces.bin
+ * Usage: ./solver [--seed N] < puzzles.txt > traces.bin
  */
 
 #include <stdint.h>
@@ -66,30 +66,7 @@ static void init_tables(void) {
                 int c = units[i][u][k];
                 if (!seen[c]) { seen[c] = 1; peers[i][pi++] = c; }
             }
-        /* Sort peers ascending for deterministic order */
-        for (int a = 1; a < pi; a++) {
-            int key = peers[i][a];
-            int b = a - 1;
-            while (b >= 0 && peers[i][b] > key) {
-                peers[i][b+1] = peers[i][b];
-                b--;
-            }
-            peers[i][b+1] = key;
-        }
     }
-}
-
-/* ---- Popcount / bit helpers ---- */
-
-static inline int popcount(uint16_t v) {
-    return __builtin_popcount(v);
-}
-
-/* Return digit (1-9) for a singleton bitmask, 0 if not singleton */
-static inline int single_digit(uint16_t v) {
-    if (v && !(v & (v - 1)))
-        return __builtin_ctz(v) + 1;
-    return 0;
 }
 
 /* ---- Fisher-Yates shuffle ---- */
@@ -101,13 +78,23 @@ static void shuffle_int(int *arr, int n) {
     }
 }
 
+/* Shuffle a row of 9 ints as a unit (swap entire rows) */
+static void shuffle_unit_rows(int units_cell[3][9]) {
+    for (int i = 2; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp[9];
+        memcpy(tmp, units_cell[i], 9 * sizeof(int));
+        memcpy(units_cell[i], units_cell[j], 9 * sizeof(int));
+        memcpy(units_cell[j], tmp, 9 * sizeof(int));
+    }
+}
+
 /* ---- Solver state ---- */
 
 /* Per-puzzle shuffled tables (shared across search tree, not copied) */
 typedef struct {
     int peers[81][20];
     int units[81][3][9];
-    int unit_order[81][3];   /* shuffled order to check the 3 units */
     int elim_order[9];       /* shuffled digit elimination order (bit positions) */
 } ShuffledTables;
 
@@ -126,22 +113,11 @@ static void init_shuffled_tables(ShuffledTables *t) {
         shuffle_int(t->peers[i], 20);
         for (int u = 0; u < 3; u++)
             shuffle_int(t->units[i][u], 9);
-        /* Shuffle the order in which the 3 units are checked */
-        t->unit_order[i][0] = 0; t->unit_order[i][1] = 1; t->unit_order[i][2] = 2;
-        shuffle_int(t->unit_order[i], 3);
+        shuffle_unit_rows(t->units[i]);
     }
     /* Shuffle digit elimination order (bit positions 0-8) */
     for (int i = 0; i < 9; i++) t->elim_order[i] = i;
     shuffle_int(t->elim_order, 9);
-}
-
-static void init_deterministic_tables(ShuffledTables *t) {
-    memcpy(t->peers, peers, sizeof(peers));
-    memcpy(t->units, units, sizeof(units));
-    for (int i = 0; i < 81; i++) {
-        t->unit_order[i][0] = 0; t->unit_order[i][1] = 1; t->unit_order[i][2] = 2;
-    }
-    for (int i = 0; i < 9; i++) t->elim_order[i] = i;
 }
 
 static int eliminate(State *s, int cell, uint16_t d_bit);
@@ -183,8 +159,7 @@ static int eliminate(State *s, int cell, uint16_t d_bit) {
     }
 
     /* Hidden single */
-    for (int ui = 0; ui < 3; ui++) {
-        int u = s->tables->unit_order[cell][ui];
+    for (int u = 0; u < 3; u++) {
         int count = 0, place = -1;
         for (int k = 0; k < 9; k++) {
             int sq = s->tables->units[cell][u][k];
@@ -203,32 +178,27 @@ static int eliminate(State *s, int cell, uint16_t d_bit) {
     return 1;
 }
 
-static int deterministic_mode = 0;
-
 static int search(State *s) {
-    /* MRV */
-    int min_count = 10, best = -1;
+    /* MRV with random tie-breaking */
+    int min_count = 10;
     int tied[81], n_tied = 0;
 
     for (int i = 0; i < 81; i++) {
         if (s->values[i] == 0) return 0;
-        int cnt = popcount(s->values[i]);
+        int cnt = __builtin_popcount(s->values[i]);
         if (cnt > 1) {
             if (cnt < min_count) {
                 min_count = cnt;
-                best = i;
-                if (!deterministic_mode) {
-                    tied[0] = i;
-                    n_tied = 1;
-                }
-            } else if (!deterministic_mode && cnt == min_count) {
+                tied[0] = i;
+                n_tied = 1;
+            } else if (cnt == min_count) {
                 tied[n_tied++] = i;
             }
         }
     }
-    if (best == -1) return 1; /* solved */
+    if (n_tied == 0) return 1; /* solved */
 
-    int cell = deterministic_mode ? best : tied[rand() % n_tied];
+    int cell = tied[rand() % n_tied];
     uint16_t bits = s->values[cell];
 
     for (int i = 0; i < 9; i++) {
@@ -255,10 +225,7 @@ static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int
     /* Shuffle peer/unit tables for this puzzle */
     ShuffledTables tables;
     s.tables = &tables;
-    if (!deterministic_mode)
-        init_shuffled_tables(&tables);
-    else
-        init_deterministic_tables(&tables);
+    init_shuffled_tables(&tables);
 
     /* Collect clue indices and shuffle */
     int clue_idx[81];
@@ -267,10 +234,9 @@ static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int
         if (puzzle[i] >= '1' && puzzle[i] <= '9')
             clue_idx[n_clues++] = i;
     }
-    if (!deterministic_mode)
-        shuffle_int(clue_idx, n_clues);
+    shuffle_int(clue_idx, n_clues);
 
-    /* Parse clues in (shuffled) order */
+    /* Parse clues in shuffled order */
     for (int k = 0; k < n_clues; k++) {
         int i = clue_idx[k];
         s.clues[i] = 1;
@@ -281,7 +247,7 @@ static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int
     /* Check if solved */
     int solved = 1;
     for (int i = 0; i < 81; i++) {
-        if (popcount(s.values[i]) != 1) { solved = 0; break; }
+        if (__builtin_popcount(s.values[i]) != 1) { solved = 0; break; }
     }
 
     if (!solved) {
@@ -291,7 +257,7 @@ static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int
 
     /* Extract solution */
     for (int i = 0; i < 81; i++)
-        solution[i] = (char)('0' + single_digit(s.values[i]));
+        solution[i] = '1' + __builtin_ctz(s.values[i]);
 
     memcpy(trace_out, s.trace, s.trace_len * 3);
     *trace_len = s.trace_len;
@@ -303,8 +269,6 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
             seed = (unsigned)atoi(argv[++i]);
-        else if (strcmp(argv[i], "--deterministic") == 0)
-            deterministic_mode = 1;
     }
     srand(seed);
     init_tables();
