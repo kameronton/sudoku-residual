@@ -12,7 +12,7 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 
-from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, solve
+from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, solve
 from model import GPT2Model
 from evaluate import load_checkpoint, generate_traces_batched, generate_traces_batched_cached, sequences_to_traces, make_forward_fn as make_gen_forward_fn, encode_clues, evaluate_puzzle
 
@@ -366,12 +366,18 @@ def plot_all_layers_per_digit(
     plt.show()
 
 
-def build_grid_at_step(puzzle: str, trace: list[tuple[int, int, int]], step: int) -> str:
-    """Replay the first step+1 fill actions on the puzzle grid. Returns 81-char grid string."""
-    grid = list(puzzle)
-    for i in range(min(step + 1, len(trace))):
-        r, c, d = trace[i]
-        grid[r * 9 + c] = str(d)
+def build_grid_at_step(sequence: list[int], position: int) -> str:
+    """Build grid state by replaying all fill tokens in sequence[0:position+1].
+
+    Starts from an empty board and applies every fill token up to (and including)
+    the given position. Works correctly for both clue tokens and trace tokens,
+    and for negative step offsets (partial clue visibility).
+    """
+    grid = ["0"] * 81
+    for tok in sequence[: position + 1]:
+        if 0 <= tok <= 728:
+            r, c, d = decode_fill(tok)
+            grid[r * 9 + c] = str(d)
     return "".join(grid)
 
 
@@ -509,7 +515,7 @@ def main():
     anchor_pos = anchor_positions(n_clues, args.anchor)
 
     # Filter puzzles that have enough trace steps and enough prefix tokens
-    required_trace_steps = step  # need at least `step` fills after SEP
+    required_trace_steps = max(step, 0)  # need at least `step` fills after anchor (0 if negative)
     keep = []
     for i, (t, ap) in enumerate(zip(traces, anchor_pos)):
         abs_min = ap + step + min_offset
@@ -525,17 +531,17 @@ def main():
         print("No puzzles remaining after filtering.")
         return
 
-    # Ground truth = board after `step` fills (step=0 means initial board)
-    if step == 0:
-        probe_grids = puzzles
-    else:
-        probe_grids = [build_grid_at_step(p, t, step - 1) for p, t in zip(puzzles, traces)]
-
     # Build per-puzzle position lists for activation extraction
     use_multi = len(offsets) > 1
     if use_multi:
         probe_positions_multi = [[ap + step + off for off in offsets] for ap in anchor_pos]
     probe_positions = [ap + step for ap in anchor_pos]
+
+    # Ground truth = board state at the probe position (all fills up to that token)
+    if step == 0 and args.anchor == "sep":
+        probe_grids = puzzles  # at SEP, all clues visible, no trace fills yet
+    else:
+        probe_grids = [build_grid_at_step(seq, pos) for seq, pos in zip(sequences, probe_positions)]
 
     # --- Compute eval mask (train on all, eval on subset) ---
     eval_mask = None
