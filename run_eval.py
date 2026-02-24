@@ -10,12 +10,11 @@ Usage:
 import os
 from datetime import datetime
 
-from experiment_config import parse_batch_args, filter_experiments
+from experiment_config import parse_batch_args, filter_experiments, experiment_dir
 
 
 def main():
     opts = parse_batch_args()
-    output_path = opts["_extra"].get("output", "eval_results.txt")
 
     runs = filter_experiments(opts["filter"])
     if not runs:
@@ -24,25 +23,26 @@ def main():
 
     if opts["dry_run"]:
         for name, _ in runs:
-            cache = f"activations/{name}.npz"
+            exp_dir = experiment_dir(name)
+            cache = f"{exp_dir}/activations.npz"
             exists = "OK" if os.path.exists(cache) else "MISSING"
-            print(f"  {name}: {cache} [{exists}]")
+            print(f"  {name}: {cache} [{exists}] -> {exp_dir}/eval.txt")
         return
 
     from data import solve
     from probes import load_probe_dataset, derive_n_clues
     from evaluate import evaluate_puzzle, summarize_stats, sequences_to_traces
 
-    results = []
     for i, (name, _) in enumerate(runs):
-        cache_path = f"activations/{name}.npz"
+        exp_dir = experiment_dir(name)
+        cache_path = f"{exp_dir}/activations.npz"
+        eval_path = f"{exp_dir}/eval.txt"
 
         header = f"[{i+1}/{len(runs)}] {name}"
         print(f"\n{'='*60}\n{header}\n{'='*60}")
 
         if not os.path.exists(cache_path):
             print(f"  Skipping (missing: {cache_path})")
-            results.append((name, None))
             continue
 
         print(f"  Loading {cache_path}...")
@@ -68,20 +68,14 @@ def main():
 
         summary = summarize_stats(all_stats)
         print(summary)
-        results.append((name, summary))
 
-    # Write combined results
-    with open(output_path, "w") as f:
-        f.write(f"Evaluation results — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        for name, summary in results:
-            f.write(f"\n{'='*60}\n")
+        with open(eval_path, "w") as f:
             f.write(f"Experiment: {name}\n")
-            if summary is None:
-                f.write("  SKIPPED (activation cache missing)\n")
-            else:
-                f.write(summary + "\n")
+            f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+            f.write(summary + "\n")
+        print(f"  Written to {eval_path}")
 
-    print(f"\nResults written to {output_path}")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

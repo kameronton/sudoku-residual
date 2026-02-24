@@ -9,11 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Checkpoints and logs
-checkpoints/
-logs/
-activations/
-data/
+# Experiment results
+results/
 
 # Ignore the plot image files
 *.png

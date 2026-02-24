@@ -9,7 +9,7 @@ Usage:
 
 import os
 
-from experiment_config import COMMON, parse_batch_args, filter_experiments
+from experiment_config import COMMON, parse_batch_args, filter_experiments, experiment_dir
 
 DEFAULT_N_PUZZLES = 6400
 DEFAULT_BATCH_SIZE = 64
@@ -27,21 +27,22 @@ def main():
 
     if opts["dry_run"]:
         for name, overrides in runs:
-            ckpt_dir = "checkpoints/" + overrides.get("ckpt_dir", name)
+            exp_dir = experiment_dir(name)
+            ckpt_dir = overrides.get("ckpt_dir", f"{exp_dir}/checkpoint")
             traces_path = overrides.get("traces_path", COMMON["traces_path"])
-            cache_path = f"activations/{name}.npz"
+            cache_path = f"{exp_dir}/activations.npz"
             print(f"{name}: ckpt_dir={ckpt_dir} traces={traces_path} -> {cache_path}")
         return
-
-    os.makedirs("activations", exist_ok=True)
 
     # Import here so --dry-run works without JAX installed
     from probes import generate_probe_dataset
 
     for i, (name, overrides) in enumerate(runs):
-        ckpt_dir = "checkpoints/" + overrides.get("ckpt_dir", name)
+        exp_dir = experiment_dir(name)
+        ckpt_dir = overrides.get("ckpt_dir", f"{exp_dir}/checkpoint")
         traces_path = overrides.get("traces_path", COMMON["traces_path"])
-        cache_path = f"activations/{name}.npz"
+        cache_path = f"{exp_dir}/activations.npz"
+        os.makedirs(exp_dir, exist_ok=True)
 
         header = f"[{i+1}/{len(runs)}] {name}"
         print(f"\n{'='*60}\n{header}\n{'='*60}")

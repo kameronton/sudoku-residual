@@ -261,8 +261,13 @@ def train(cfg: TrainConfig):
     param_count = sum(x.size for x in jax.tree.leaves(state.params))
     print(f"Model parameters: {param_count:,}", flush=True)
 
-    # Checkpoint manager
+    # Create output directories
     os.makedirs(cfg.ckpt_dir, exist_ok=True)
+    log_dir = os.path.dirname(cfg.log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    # Checkpoint manager
     ckpt_mgr = ocp.CheckpointManager(
         os.path.abspath(cfg.ckpt_dir),
         options=ocp.CheckpointManagerOptions(max_to_keep=None),

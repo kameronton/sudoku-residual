@@ -51,6 +51,17 @@ Check TPU is visible:
 
 The full pipeline goes: **CSV** → **NPZ (with train/val/test splits)** → **Training** → **Evaluation / Activation collection / Probes**.
 
+All experiment artifacts are organized under `results/{experiment_name}/`:
+
+```
+results/{name}/
+  checkpoint/                      # Orbax model checkpoint
+  train_log.json                   # training loss log
+  activations.npz                  # residual stream activations + sequences
+  eval.txt                         # evaluation summary
+  probe_{mode}_step{step}.png      # probe accuracy plots
+```
+
 ### 1. Prepare traces
 
 Takes a CSV of puzzles (columns: `puzzle`, `solution`), generates solving traces, tokenizes them, splits into train/val/test, and saves everything to a single NPZ file.
@@ -62,77 +73,86 @@ uv run python data.py --prepare --data_path sudoku-3m.csv --trace_mode constrain
 The NPZ contains:
 - `sequences_train`, `sequences_val`, `sequences_test` — tokenized sequences for each split
 - `puzzles_train`, `puzzles_val`, `puzzles_test` — 81-char puzzle strings for each split
-- `sequences` — all sequences concatenated (backward compat)
+- `n_clues_train`, `n_clues_val`, `n_clues_test` — number of clues per puzzle
 
 Key flags:
 - `--trace_mode {random,constraint}` — order in which empty cells are filled. `constraint` encodes causal propagation order from a Norvig-style solver.
 - `--train_frac 0.90 --val_frac 0.05 --test_frac 0.05` — split proportions (default 90/5/5)
 - `--seed 42` — seed for the shuffle before splitting
 - `--max_puzzles N` — limit number of puzzles to process
-- `--randomize_clues` — randomize the order of clue tokens within each sequence
 
-### 2. Train
+### 2. Run experiments
 
-Trains a GPT-2 model on the train split. Validates on the val split.
+Experiments are defined in `experiment_config.py` — a `COMMON` dict of defaults and an `EXPERIMENTS` list of `(name, overrides)` tuples. All batch runner scripts share this config.
+
+```bash
+# Preview what each step will do
+uv run python run_training.py --dry-run
+uv run python collect_activations.py --dry-run
+uv run python run_probes.py --dry-run
+uv run python run_eval.py --dry-run
+
+# Run the full pipeline
+uv run python run_training.py              # train all experiments
+uv run python collect_activations.py       # collect activations for all
+uv run python run_probes.py                # fit probes for all
+uv run python run_eval.py                  # evaluate all from cached traces
+
+# Filter to a subset of experiments
+uv run python run_training.py --filter no_sep
+uv run python run_probes.py --filter baseline --mode candidates --step 5
+```
+
+### 3. Standalone commands (single experiment)
+
+#### Train
 
 ```bash
 uv run python training.py --traces_path traces.npz --batch_size 512 --num_tokens 8_000_000_000
 ```
 
-Training uses a token-based budget (`--num_tokens`) with a tqdm progress bar showing throughput and loss. Train and val splits are loaded directly from the NPZ — no runtime splitting. Use `--resume` to continue from the latest checkpoint in `checkpoints/`.
+Training uses a token-based budget (`--num_tokens`). Use `--resume` to continue from the latest checkpoint.
 
 Key flags:
 - `--num_tokens`, `--warmup_tokens`, `--lr`, `--schedule_type {linear,cosine}`
-- `--val_every`, `--log_every`, `--num_checkpoints`
+- `--eval_every`, `--num_checkpoints`
 - `--full_val` — evaluate on the entire val set (default: 10 random batches)
 - `--dtype bfloat16` — mixed precision for ~2x throughput on TPU
+- `--loss_mask {after_clues,all}` — what tokens contribute to loss
+- `--no_pos_emb` — disable positional embeddings
 
-### 3. Evaluate
-
-Autoregressively generates solving traces for test puzzles and reports accuracy.
+#### Evaluate
 
 ```bash
 # From checkpoint + NPZ test split
-uv run python evaluate.py --ckpt_dir checkpoints --traces_path traces.npz --n 100
+uv run python evaluate.py --ckpt_dir results/baseline/checkpoint --traces_path traces.npz --n 100
 
-# From checkpoint + CSV (legacy)
-uv run python evaluate.py --ckpt_dir checkpoints --data_path sudoku-3m.csv --n 100
-
-# From cached probe dataset (no checkpoint needed)
-uv run python evaluate.py --cache_path probe_acts.npz --quiet
+# From cached activations (no checkpoint needed)
+uv run python evaluate.py --cache_path results/baseline/activations.npz --quiet
 ```
 
-When `--traces_path` is provided, puzzles are loaded from the `puzzles_test` array in the NPZ. Falls back to `--data_path` (CSV) if no NPZ is given.
-
-Key flags: `--n` (number of puzzles), `--random_sample`, `--temperature`, `--quiet` (summary only), `--batch_size`.
+Key flags: `--n` (number of puzzles), `--temperature`, `--quiet` (summary only), `--batch_size`.
 
 #### Mistake analysis
 
 ```bash
-# First-mistake heatmap (9x9 grid showing where errors occur)
-uv run python evaluate.py --mistake-map --cache_path probe_acts.npz
-
-# First-mistake position distribution (how many steps from end)
-uv run python evaluate.py --mistake-position --cache_path probe_acts.npz
+uv run python evaluate.py --mistake-map --cache_path results/baseline/activations.npz
+uv run python evaluate.py --mistake-position --cache_path results/baseline/activations.npz
 ```
 
-### 4. Collect activations
-
-Before probing, you need a cache of residual stream activations. This step generates traces for test puzzles, runs them through the model, and saves per-layer activations.
+#### Collect activations
 
 ```bash
-uv run python probes.py --ckpt_dir checkpoints --traces_path traces.npz --n_puzzles 1000
+uv run python probes.py --ckpt_dir results/baseline/checkpoint --traces_path traces.npz --n_puzzles 1000
 ```
 
-This saves `probe_acts.npz` containing activations, puzzle strings, and token sequences. All subsequent probe commands reuse this cache.
+Saves activations NPZ containing per-layer residual stream activations, puzzle strings, and token sequences.
 
-### 5. Probe residual stream
-
-Train linear probes (Ridge regression) on cached activations to test what the model represents internally at each layer.
+#### Probe residual stream
 
 ```bash
-# Reuse cached activations (no checkpoint needed)
-uv run python probes.py --cache_path probe_acts.npz
+uv run python probes.py --cache_path results/baseline/activations.npz --mode state_filled --step 0
+uv run python probes.py --cache_path results/baseline/activations.npz --mode candidates --step 10
 ```
 
 Probe modes (`--mode`):
@@ -144,27 +164,7 @@ The `--step` flag controls which point in the solving trace to probe:
 - `--step 0` (default) — probe at the `<sep>` token; ground truth = initial board (clues only)
 - `--step N` (N >= 1) — probe at sep+N; ground truth = board state after N trace fills
 
-```bash
-# Probe the initial board state (default)
-uv run python probes.py --cache_path probe_acts.npz
-
-# Probe after 10 fills — does the model track the evolving board?
-uv run python probes.py --step 10 --cache_path probe_acts.npz
-```
-
-Filtering flags:
-- `--filter {solved,unsolved}` — restrict both training and evaluation to a subset of puzzles
-- `--eval-filter {solved,unsolved}` — train on all puzzles (80/20 split), evaluate only on the specified subset of held-out data
-
-```bash
-# Train on all, report accuracy separately for solved vs unsolved
-uv run python probes.py --eval-filter solved --cache_path probe_acts.npz
-uv run python probes.py --eval-filter unsolved --cache_path probe_acts.npz
-```
-
-Other useful flags:
-- `--per-digit` — produce a per-digit F1 heatmap (only with `--mode candidates`)
-- `--output probe_accuracies.png` — path for the output plot
+Filtering: `--filter {solved,unsolved}` restricts both training and evaluation to a subset.
 
 ### Utilities
 
@@ -173,7 +173,7 @@ Other useful flags:
 uv run python visualize.py --data_path sudoku-3m.csv --index 0 --mode random --step
 
 # Plot training curves
-uv run python plot.py train_log.json --tokens_per_step 5184
+uv run python plot.py results/baseline/train_log.json
 
 # Sanity check
 uv run python -c "from data import sanity_check; sanity_check()"

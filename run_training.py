@@ -9,13 +9,14 @@ Usage:
 import subprocess
 import sys
 
-from experiment_config import COMMON, parse_batch_args, filter_experiments
+from experiment_config import COMMON, parse_batch_args, filter_experiments, experiment_dir
 
 
 def build_args(name: str, overrides: dict) -> list[str]:
     cfg = {**COMMON, **overrides}
-    cfg["ckpt_dir"] = "checkpoints/" + overrides.get("ckpt_dir", name)
-    cfg["log_path"] = "logs/" + overrides.get("log_path", f"{name}.json")
+    exp_dir = experiment_dir(name)
+    cfg["ckpt_dir"] = overrides.get("ckpt_dir", f"{exp_dir}/checkpoint")
+    cfg["log_path"] = overrides.get("log_path", f"{exp_dir}/train_log.json")
     args = ["uv", "run", "python", "training.py"]
     for k, v in cfg.items():
         if isinstance(v, bool):

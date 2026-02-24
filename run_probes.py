@@ -10,7 +10,7 @@ Usage:
 
 import os
 
-from experiment_config import parse_batch_args, filter_experiments
+from experiment_config import parse_batch_args, filter_experiments, experiment_dir
 
 
 def main():
@@ -25,12 +25,11 @@ def main():
 
     if opts["dry_run"]:
         for name, _ in runs:
-            cache = f"activations/{name}.npz"
+            exp_dir = experiment_dir(name)
+            cache = f"{exp_dir}/activations.npz"
             exists = "OK" if os.path.exists(cache) else "MISSING"
-            print(f"  {name}: {cache} [{exists}] -> probes/{name}_{mode}_step{step}.png")
+            print(f"  {name}: {cache} [{exists}] -> {exp_dir}/probe_{mode}_step{step}.png")
         return
-
-    os.makedirs("probes", exist_ok=True)
 
     # Import heavy deps only when actually running
     from data import SEP_TOKEN
@@ -41,8 +40,9 @@ def main():
     from evaluate import sequences_to_traces
 
     for i, (name, _) in enumerate(runs):
-        cache_path = f"activations/{name}.npz"
-        output_path = f"probes/{name}_{mode}_step{step}.png"
+        exp_dir = experiment_dir(name)
+        cache_path = f"{exp_dir}/activations.npz"
+        output_path = f"{exp_dir}/probe_{mode}_step{step}.png"
 
         header = f"[{i+1}/{len(runs)}] {name}"
         print(f"\n{'='*60}\n{header}\n{'='*60}")

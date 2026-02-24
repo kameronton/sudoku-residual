@@ -41,6 +41,14 @@ EXPERIMENTS = [
 ]
 
 
+RESULTS_DIR = "results"
+
+
+def experiment_dir(name: str) -> str:
+    """Return the output directory for a given experiment."""
+    return f"{RESULTS_DIR}/{name}"
+
+
 def parse_batch_args(argv: list[str] | None = None) -> dict:
     """Parse common batch runner flags: --dry-run, --filter, and extra key=value pairs.
 
