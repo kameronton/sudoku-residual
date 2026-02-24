@@ -12,6 +12,8 @@ wheels/
 # Checkpoints and logs
 checkpoints/
 logs/
+activations/
+data/
 
 # Ignore the plot image files
 *.png

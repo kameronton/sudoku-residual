@@ -1,10 +1,7 @@
 """Load a checkpoint and evaluate the model on N puzzles."""
 
 import argparse
-import csv
 import os
-import random
-import sys
 
 import jax
 import jax.numpy as jnp
@@ -42,17 +39,6 @@ def load_checkpoint(ckpt_dir: str, model_cfg: TransformerConfig = None, ckpt_ste
     print(f"Loaded checkpoint at step {step}", flush=True)
     return restored.params, model
 
-
-def make_forward_fn(model):
-    """Create a JIT-compiled forward function closed over the model."""
-    @jax.jit
-    def forward(params, tokens):
-        return model.apply({"params": params}, tokens)
-    return forward
-
-# ---------------------------------------------------------------------------
-# Evaluation helpers
-# ---------------------------------------------------------------------------
 
 def encode_clues(puzzle: str, randomize_order: bool = False) -> list[int]:
     """Encode puzzle clues + <sep> as token list."""
@@ -149,119 +135,6 @@ def evaluate_puzzle(trace: list[tuple[int, int, int]], puzzle: str, solution: st
         "puzzle_solved": correct == n_empties,
     }
 
-
-
-
-def generate_trace(
-    forward_fn, params, puzzle: str, temperature: float = 0.0,
-) -> list[tuple[int, int, int]]:
-    """Autoregressively generate a solving trace for a puzzle."""
-    tokens = encode_clues(puzzle)
-    n_empties = sum(1 for ch in puzzle if ch not in "123456789")
-    trace = []
-
-    for _ in range(n_empties):
-        seq_len = len(tokens)
-        if seq_len >= MAX_SEQ_LEN:
-            break
-        padded = tokens + [PAD_TOKEN] * (MAX_SEQ_LEN - seq_len)
-        input_arr = jnp.array([padded], dtype=jnp.int32)
-        logits = forward_fn(params, input_arr)
-        next_logits = logits[0, seq_len - 1, :]
-
-        if temperature <= 0:
-            token = int(jnp.argmax(next_logits))
-        else:
-            next_logits = next_logits / temperature
-            token = int(jax.random.categorical(
-                jax.random.PRNGKey(seq_len), next_logits
-            ))
-
-        if token in (PAD_TOKEN, SEP_TOKEN) or token < 0 or token > 728:
-            break
-
-        r, c, d = decode_fill(token)
-        trace.append((r, c, d))
-        tokens.append(token)
-
-    return trace
-
-
-def generate_traces_batched(
-    forward_fn, params, puzzles: list[str], batch_size: int = 64, temperature: float = 0.0,
-) -> list[list[tuple[int, int, int]]]:
-    """Batched autoregressive trace generation for multiple puzzles.
-
-    Returns a list of traces (one per puzzle), where each trace is a list of (row, col, digit).
-    """
-    n = len(puzzles)
-    all_traces: list[list[tuple[int, int, int]]] = [[] for _ in range(n)]
-
-    for batch_start in range(0, n, batch_size):
-        batch_puzzles = puzzles[batch_start : batch_start + batch_size]
-        bs = len(batch_puzzles)
-
-        # Encode clues for each puzzle in the batch
-        token_lists = [encode_clues(p) for p in batch_puzzles]
-        lengths = [len(t) for t in token_lists]
-        max_empties = jnp.array([sum(1 for ch in p if ch not in "123456789") for p in batch_puzzles], dtype=jnp.int32)
-
-        # Pad to MAX_SEQ_LEN
-        sequences = jnp.full((bs, MAX_SEQ_LEN), PAD_TOKEN, dtype=jnp.int32)
-        for i, toks in enumerate(token_lists):
-            sequences = sequences.at[i, :len(toks)].set(jnp.array(toks, dtype=jnp.int32))
-
-        cur_positions = jnp.array(lengths, dtype=jnp.int32)
-        steps_taken = jnp.zeros(bs, dtype=jnp.int32)
-        done_mask = jnp.zeros(bs, dtype=jnp.bool_)
-        batch_idx = jnp.arange(bs)
-
-        max_steps = MAX_SEQ_LEN - min(lengths)
-        for step_i in range(max_steps):
-            if jnp.all(done_mask):
-                break
-
-            logits = forward_fn(params, sequences)
-
-            # Gather logits at each puzzle's current position
-            gather_pos = cur_positions - 1
-            next_logits = logits[batch_idx, gather_pos, :]  # (bs, vocab)
-
-            # Sample tokens
-            if temperature <= 0:
-                tokens = jnp.argmax(next_logits, axis=-1).astype(jnp.int32)
-            else:
-                tokens = jax.random.categorical(
-                    jax.random.PRNGKey(step_i), next_logits / temperature
-                ).astype(jnp.int32)
-
-            # Validity check: token must be a fill action (0-728)
-            valid = (tokens >= 0) & (tokens <= 728)
-            active = ~done_mask & (cur_positions < MAX_SEQ_LEN)
-            update_mask = active & valid
-
-            # Update sequences where active and valid
-            old_tokens = sequences[batch_idx, cur_positions]
-            sequences = sequences.at[batch_idx, cur_positions].set(
-                jnp.where(update_mask, tokens, old_tokens)
-            )
-            cur_positions = cur_positions + update_mask.astype(jnp.int32)
-            steps_taken = steps_taken + update_mask.astype(jnp.int32)
-
-            # Mark done: invalid token, hit max empties, or hit MAX_SEQ_LEN
-            done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties) | (cur_positions >= MAX_SEQ_LEN)
-
-        # Extract traces from final sequences
-        for i in range(bs):
-            for pos in range(lengths[i], int(cur_positions[i])):
-                token = int(sequences[i, pos])
-                r, c, d = decode_fill(token)
-                all_traces[batch_start + i].append((r, c, d))
-
-        print(f"  Generated {min(batch_start + bs, n)}/{n}", end="\r")
-
-    print()
-    return all_traces
 
 
 def generate_traces_batched_cached(
@@ -500,34 +373,63 @@ def plot_first_mistake_heatmap(
     print(f"Saved heatmap to {output_path}")
 
 
+def run_evaluation(
+    ckpt_dir: str,
+    traces_path: str,
+    n: int = 100,
+    batch_size: int = 64,
+    temperature: float = 0.0,
+    quiet: bool = True,
+) -> list[dict]:
+    """Load checkpoint, generate traces, evaluate puzzles. Returns list of per-puzzle stats."""
+    print(f"Loading checkpoint from {ckpt_dir}...")
+    params, model = load_checkpoint(ckpt_dir)
+
+    # Load puzzles from NPZ test split
+    npz = np.load(traces_path, allow_pickle=False)
+    if "puzzles_test" not in npz:
+        raise ValueError(f"No puzzles_test in {traces_path}")
+    puzzle_strs = list(npz["puzzles_test"][:n])
+    puzzles = []
+    for p in puzzle_strs:
+        result = solve(p)
+        if result is None:
+            raise ValueError(f"Solver failed: {p[:20]}...")
+        puzzles.append((p, result[0]))
+    print(f"Loaded {len(puzzles)} test puzzles from {traces_path}")
+
+    print(f"Generating traces (batch_size={batch_size}, kv_cache=True)...", flush=True)
+    puzzle_strs = [p for p, _ in puzzles]
+    traces, _sequences = generate_traces_batched_cached(model, params, puzzle_strs, batch_size, temperature)
+
+    all_stats = []
+    for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
+        if not quiet:
+            print(f"\nPuzzle {idx + 1}/{len(puzzles)}:")
+            print_grid(list(puzzle))
+        stats = evaluate_puzzle(trace, puzzle, solution, verbose=not quiet)
+        all_stats.append(stats)
+
+    return all_stats
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate model on Sudoku puzzles")
     parser.add_argument("--ckpt_dir", default="checkpoints")
-    parser.add_argument("--traces_path", default=None, help="NPZ file with test split puzzles")
-    parser.add_argument("--data_path", default="sudoku-3m.csv", help="CSV fallback (deprecated)")
+    parser.add_argument("--traces_path", required=True, help="NPZ file with test split puzzles")
     parser.add_argument("--n", type=int, default=10, help="Number of puzzles to evaluate")
-    parser.add_argument("--offset", type=int, default=0, help="Start index in CSV")
-    parser.add_argument("--random_sample", action="store_true", help="Sample random puzzles")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--quiet", action="store_true", help="Only show summary")
-    parser.add_argument("--n_layers", type=int, default=None)
-    parser.add_argument("--n_heads", type=int, default=None)
-    parser.add_argument("--d_model", type=int, default=None)
-    parser.add_argument("--d_ff", type=int, default=None)
-    parser.add_argument("--dtype", type=str, default=None, choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--cache_path", default=None, help="Path to cached probe dataset (evaluate from cached traces)")
     parser.add_argument("--mistake-map", action="store_true", help="Plot first-mistake heatmap from cached traces")
     parser.add_argument("--mistake-position", action="store_true", help="Plot distribution of first-mistake position (steps from end)")
-    parser.add_argument("--cache_path", default="probe_acts.npz", help="Path to cached probe dataset")
     parser.add_argument("--output", default=None, help="Output path for plots")
     args = parser.parse_args()
 
-    # Use cached traces if --cache_path was explicitly provided
-    use_cache = '--cache_path' in sys.argv or '--cache-path' in sys.argv
-
     if args.mistake_map or args.mistake_position:
         from probes import load_probe_dataset
-        activations, puzzles, sequences, n_clues = load_probe_dataset(args.cache_path)
+        _, puzzles, sequences, n_clues = load_probe_dataset(args.cache_path)
         traces = sequences_to_traces(sequences, n_clues)
         positions = []
         steps_from_end = []
@@ -542,27 +444,21 @@ def main():
             print("No mistakes found — nothing to plot.")
             return
         if args.mistake_map:
-            out = args.output or "first_mistake_heatmap.png"
-            plot_first_mistake_heatmap(positions, out)
+            plot_first_mistake_heatmap(positions, args.output or "first_mistake_heatmap.png")
         if args.mistake_position:
-            out = args.output or "first_mistake_position.png"
-            plot_mistake_position_distribution(steps_from_end, out)
+            plot_mistake_position_distribution(steps_from_end, args.output or "first_mistake_position.png")
         return
 
-    if use_cache:
+    if args.cache_path:
         from probes import load_probe_dataset
-        activations, puzzles_cached, sequences, n_clues = load_probe_dataset(args.cache_path)
+        _, puzzles_cached, sequences, n_clues = load_probe_dataset(args.cache_path)
         traces = sequences_to_traces(sequences, n_clues)
-
-        # Solve puzzles to get solutions
-        from data import solve
         puzzles = []
         for p in puzzles_cached:
             result = solve(p)
             if result is None:
                 raise ValueError(f"Solver failed for puzzle: {p[:20]}...")
             puzzles.append((p, result[0]))
-
         all_stats = []
         for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
             if not args.quiet:
@@ -570,63 +466,18 @@ def main():
                 print_grid(list(puzzle))
             stats = evaluate_puzzle(trace, puzzle, solution, verbose=not args.quiet)
             all_stats.append(stats)
-
     else:
-        model_cfg = None
-        if any(v is not None for v in [args.n_layers, args.n_heads, args.d_model, args.d_ff, args.dtype]):
-            model_cfg = TransformerConfig(
-                n_layers=args.n_layers or 6, n_heads=args.n_heads or 4,
-                d_model=args.d_model or 128, d_ff=args.d_ff or 512,
-                dtype=args.dtype or "float32",
-            )
-        params, model = load_checkpoint(args.ckpt_dir, model_cfg)
-        forward_fn = make_forward_fn(model)
+        all_stats = run_evaluation(
+            ckpt_dir=args.ckpt_dir, traces_path=args.traces_path,
+            n=args.n, batch_size=args.batch_size,
+            temperature=args.temperature, quiet=args.quiet,
+        )
 
-        # Load puzzles — prefer NPZ test split, fall back to CSV
-        puzzles = []
-        if args.traces_path and os.path.exists(args.traces_path):
-            npz = np.load(args.traces_path, allow_pickle=False)
-            if "puzzles_test" in npz:
-                puzzle_strs = list(npz["puzzles_test"])
-                if args.random_sample:
-                    puzzle_strs = random.sample(puzzle_strs, min(args.n, len(puzzle_strs)))
-                else:
-                    puzzle_strs = puzzle_strs[args.offset:args.offset + args.n]
-                for p in puzzle_strs:
-                    result = solve(p, random_mrv=False)
-                    if result is None:
-                        raise ValueError(f"Solver failed: {p[:20]}...")
-                    puzzles.append((p, result[0]))
-                print(f"Loaded {len(puzzles)} test puzzles from {args.traces_path}")
-            else:
-                raise ValueError(f"No puzzles_test in {args.traces_path}")
-        else:
-            with open(args.data_path) as f:
-                reader = csv.DictReader(f)
-                for i, row in enumerate(reader):
-                    if args.random_sample:
-                        puzzles.append((row["puzzle"], row["solution"]))
-                    elif args.offset <= i < args.offset + args.n:
-                        puzzles.append((row["puzzle"], row["solution"]))
-                    if not args.random_sample and i >= args.offset + args.n:
-                        break
-            if args.random_sample:
-                puzzles = random.sample(puzzles, min(args.n, len(puzzles)))
-            puzzles = puzzles[:args.n]
+    print(summarize_stats(all_stats))
 
-        print(f"Generating traces (batch_size={args.batch_size}, kv_cache=True)...", flush=True)
-        puzzle_strs = [p for p, _ in puzzles]
-        traces, _sequences = generate_traces_batched_cached(model, params, puzzle_strs, args.batch_size, args.temperature)
 
-        all_stats = []
-        for idx, ((puzzle, solution), trace) in enumerate(zip(puzzles, traces)):
-            if not args.quiet:
-                print(f"\nPuzzle {idx + 1}/{len(puzzles)}:")
-                print_grid(list(puzzle))
-            stats = evaluate_puzzle(trace, puzzle, solution, verbose=not args.quiet)
-            all_stats.append(stats)
-
-    # Summary
+def summarize_stats(all_stats: list[dict]) -> str:
+    """Format aggregate evaluation statistics as a string."""
     n = len(all_stats)
     avg_acc = np.mean([s["cell_accuracy"] for s in all_stats])
     n_solved = sum(s["puzzle_solved"] for s in all_stats)
@@ -637,15 +488,18 @@ def main():
     total_oc = sum(s["overwrites_clue"] for s in all_stats)
     total_of = sum(s["overwrites_fill"] for s in all_stats)
     total_miss = sum(s["missing"] for s in all_stats)
-    print(f"\n{'='*60}")
-    print(f"Results on {n} puzzles:")
-    print(f"  Cell accuracy:     {avg_acc:.1%} ({avg_correct:.1f}/{avg_empties:.1f} avg)")
-    print(f"  Puzzles solved:    {n_solved}/{n} ({n_solved/n:.1%})")
-    print(f"  Wrong consistent:  {total_wc}")
-    print(f"  Inconsistent:      {total_ic}")
-    print(f"  Clue overwrites:   {total_oc}")
-    print(f"  Fill overwrites:   {total_of}")
-    print(f"  Missing fills:     {total_miss}")
+    lines = [
+        f"\n{'='*60}",
+        f"Results on {n} puzzles:",
+        f"  Cell accuracy:     {avg_acc:.1%} ({avg_correct:.1f}/{avg_empties:.1f} avg)",
+        f"  Puzzles solved:    {n_solved}/{n} ({n_solved/n:.1%})",
+        f"  Wrong consistent:  {total_wc}",
+        f"  Inconsistent:      {total_ic}",
+        f"  Clue overwrites:   {total_oc}",
+        f"  Fill overwrites:   {total_of}",
+        f"  Missing fills:     {total_miss}",
+    ]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

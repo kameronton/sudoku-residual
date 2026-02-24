@@ -77,7 +77,7 @@ if __name__ == "__main__":
     parser.add_argument("--puzzle", type=str, default=None, help="81-char puzzle string")
     parser.add_argument("--index", type=int, default=None, help="Row index in CSV")
     parser.add_argument("--data_path", default="sudoku-3m.csv")
-    parser.add_argument("--mode", default="random", choices=["random", "constraint", "human"])
+    parser.add_argument("--mode", default="random", choices=["random", "constraint"])
     parser.add_argument("--step", action="store_true", help="Step through one fill at a time")
     args = parser.parse_args()
 

@@ -50,7 +50,6 @@ class TrainConfig:
     dtype: str = "float32"
     schedule_type: str = "linear"  # or "cosine"
     loss_mask: str = "after_clues"  # "all" or "after_clues"
-    backend: str = "jax"
 
 
 class TrainLogger:
@@ -164,8 +163,8 @@ def _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep):
         return ((positions >= boundary) & (targets != PAD_TOKEN)).astype(jnp.float32)
 
 
-@partial(jax.jit, static_argnames=("vocab_size", "loss_mask", "has_sep"), donate_argnums=(0,))
-def train_step(state, batch, n_clues_batch, vocab_size, loss_mask, has_sep):
+@partial(jax.jit, static_argnames=("loss_mask", "has_sep"), donate_argnums=(0,))
+def train_step(state, batch, n_clues_batch, loss_mask, has_sep):
     """Single training step. batch is (B, T) int32 tokens."""
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
@@ -187,8 +186,8 @@ def train_step(state, batch, n_clues_batch, vocab_size, loss_mask, has_sep):
     return state, loss
 
 
-@partial(jax.jit, static_argnames=("vocab_size", "loss_mask", "has_sep"))
-def eval_step(state, batch, n_clues_batch, vocab_size, loss_mask, has_sep):
+@partial(jax.jit, static_argnames=("loss_mask", "has_sep"))
+def eval_step(state, batch, n_clues_batch, loss_mask, has_sep):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
     mask = _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep)
@@ -208,18 +207,8 @@ def train(cfg: TrainConfig):
     # Load dataset — preload entire array onto device for zero-copy batch indexing
     print("Loading dataset...", flush=True)
     npz = np.load(cfg.traces_path)
-    if "sequences_train" in npz:
-        raw_train = npz["sequences_train"]
-        raw_val = npz["sequences_val"]
-    else:
-        # Backward compat: old NPZ without splits
-        raw = npz["sequences"]
-        n = raw.shape[0]
-        n_val = max(1, int(n * 0.05))
-        indices = np.arange(n)
-        np.random.shuffle(indices)
-        raw_train = raw[indices[:-n_val]]
-        raw_val = raw[indices[-n_val:]]
+    raw_train = npz["sequences_train"]
+    raw_val = npz["sequences_val"]
     # Load n_clues metadata (fallback: derive from SEP position)
     if "n_clues_train" in npz:
         nc_train = npz["n_clues_train"]
@@ -332,14 +321,14 @@ def train(cfg: TrainConfig):
                 vend = min(vstart + cfg.batch_size, n_val)
                 vb = device_val[vstart:vend]
                 vnc = device_nc_val[vstart:vend]
-                vl = eval_step(state, vb, vnc, model_cfg.vocab_size, cfg.loss_mask, has_sep)
+                vl = eval_step(state, vb, vnc, cfg.loss_mask, has_sep)
                 val_losses.append(float(vl))
         else:
             for _ in range(min(10, max(1, n_val // cfg.batch_size))):
                 vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
                 vb = device_val[vi]
                 vnc = device_nc_val[vi]
-                vl = eval_step(state, vb, vnc, model_cfg.vocab_size, cfg.loss_mask, has_sep)
+                vl = eval_step(state, vb, vnc, cfg.loss_mask, has_sep)
                 val_losses.append(float(vl))
         return float(np.mean(val_losses))
 
@@ -354,7 +343,7 @@ def train(cfg: TrainConfig):
             batch = device_train[batch_idx]
             nc_batch = device_nc_train[batch_idx]
 
-            state, loss = train_step(state, batch, nc_batch, model_cfg.vocab_size, cfg.loss_mask, has_sep)
+            state, loss = train_step(state, batch, nc_batch, cfg.loss_mask, has_sep)
             step += 1
             logger.total_tokens += tokens_per_step
             pbar.update(tokens_per_step)

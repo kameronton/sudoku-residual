@@ -131,11 +131,10 @@ def _assign(s: _SolverState, cell: int, d_bit: int) -> bool:
     return True
 
 
-def _search(s: _SolverState, random_mrv: bool) -> bool:
-    # Check if solved — MRV heuristic
+def _search(s: _SolverState) -> bool:
+    # Check if solved — MRV heuristic with random tie-breaking
     min_count = 10
-    best_cell = -1
-    best_cells: list[int] | None = [] if random_mrv else None
+    best_cells: list[int] = []
     for i in range(81):
         v = s.values[i]
         if v == 0:
@@ -144,15 +143,13 @@ def _search(s: _SolverState, random_mrv: bool) -> bool:
         if cnt > 1:
             if cnt < min_count:
                 min_count = cnt
-                best_cell = i
-                if random_mrv:
-                    best_cells = [i]
-            elif random_mrv and cnt == min_count:
+                best_cells = [i]
+            elif cnt == min_count:
                 best_cells.append(i)
-    if best_cell == -1:
+    if not best_cells:
         return True  # all cells solved
 
-    cell = random.choice(best_cells) if random_mrv else best_cell
+    cell = random.choice(best_cells)
     bits = s.values[cell]
     # Try digits in shuffled order
     for i in s.elim_order:
@@ -161,20 +158,15 @@ def _search(s: _SolverState, random_mrv: bool) -> bool:
             trace_snap = len(s.trace)
             saved_values = s.values[:]
             if _assign(s, cell, bit):
-                if _search(s, random_mrv):
+                if _search(s):
                     return True
             s.values[:] = saved_values
             del s.trace[trace_snap:]
     return False
 
 
-def solve(puzzle: str, *, random_mrv: bool = True) -> tuple[str, list[tuple[int, int, int]]] | None:
-    """Solve an 81-char puzzle string. Returns (solution_str, constraint_guided_trace) or None.
-
-    Args:
-        random_mrv: When True (default), break MRV ties randomly during search.
-            Set to False for faster solving when trace variety is not needed.
-    """
+def solve(puzzle: str) -> tuple[str, list[tuple[int, int, int]]] | None:
+    """Solve an 81-char puzzle string. Returns (solution_str, constraint_guided_trace) or None."""
     peers, units, elim_order = _shuffled_tables()
     s = _SolverState(
         values=[_ALL_BITS] * 81,
@@ -198,7 +190,7 @@ def solve(puzzle: str, *, random_mrv: bool = True) -> tuple[str, list[tuple[int,
         return solution, s.trace
 
     # Need search
-    if _search(s, random_mrv):
+    if _search(s):
         solution = "".join(str(v.bit_length()) for v in s.values)
         return solution, s.trace
     return None
@@ -218,7 +210,7 @@ def random_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
 # ---------------------------------------------------------------------------
 
 def tokenize_trace(
-    puzzle: str, solution: str, trace: list[tuple[int, int, int]], no_sep_token: bool = False, randomize_clues: bool = False,
+    puzzle: str, solution: str, trace: list[tuple[int, int, int]], no_sep_token: bool = False, randomize_clues: bool = True,
 ) -> np.ndarray:
     """Convert clues + trace into a token sequence, padded to MAX_SEQ_LEN."""
     tokens = []
