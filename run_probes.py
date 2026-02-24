@@ -4,13 +4,15 @@ Usage:
     uv run python run_probes.py                          # run all
     uv run python run_probes.py --dry-run                # list what would run
     uv run python run_probes.py --filter no_sep          # subset by name
+    uv run python run_probes.py --name baseline          # single experiment
+    uv run python run_probes.py --name baseline --all-steps  # all checkpoints
     uv run python run_probes.py --mode candidates        # probe mode
     uv run python run_probes.py --step 5                 # probe at step 5
 """
 
 import os
 
-from experiment_config import parse_batch_args, filter_experiments, experiment_dir
+from experiment_config import parse_batch_args, resolve_runs
 
 
 def main():
@@ -18,17 +20,17 @@ def main():
     mode = opts["_extra"].get("mode", "state_filled")
     step = int(opts["_extra"].get("step", 0))
 
-    runs = filter_experiments(opts["filter"])
+    runs = resolve_runs(opts)
     if not runs:
         print("No matching experiments.")
         return
 
     if opts["dry_run"]:
-        for name, _ in runs:
-            exp_dir = experiment_dir(name)
-            cache = f"{exp_dir}/activations.npz"
+        for name, _, ckpt_step, output_dir in runs:
+            cache = f"{output_dir}/activations.npz"
             exists = "OK" if os.path.exists(cache) else "MISSING"
-            print(f"  {name}: {cache} [{exists}] -> {exp_dir}/probe_{mode}_step{step}.png")
+            step_info = f" (step {ckpt_step})" if ckpt_step is not None else ""
+            print(f"  {name}{step_info}: {cache} [{exists}] -> {output_dir}/probe_{mode}_step{step}.png")
         return
 
     # Import heavy deps only when actually running
@@ -39,12 +41,12 @@ def main():
     )
     from evaluate import sequences_to_traces
 
-    for i, (name, _) in enumerate(runs):
-        exp_dir = experiment_dir(name)
-        cache_path = f"{exp_dir}/activations.npz"
-        output_path = f"{exp_dir}/probe_{mode}_step{step}.png"
+    for i, (name, _, ckpt_step, output_dir) in enumerate(runs):
+        cache_path = f"{output_dir}/activations.npz"
+        output_path = f"{output_dir}/probe_{mode}_step{step}.png"
 
-        header = f"[{i+1}/{len(runs)}] {name}"
+        step_info = f" step {ckpt_step}" if ckpt_step is not None else ""
+        header = f"[{i+1}/{len(runs)}] {name}{step_info}"
         print(f"\n{'='*60}\n{header}\n{'='*60}")
 
         if not os.path.exists(cache_path):
@@ -103,7 +105,7 @@ def main():
         else:
             plot_all_layers(all_accuracies, output_path, metric_name=metric, show=False)
 
-    print(f"\nDone. Results in probes/")
+    print(f"\nDone.")
 
 
 if __name__ == "__main__":

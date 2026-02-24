@@ -4,41 +4,42 @@ Usage:
     uv run python run_eval.py                        # run all
     uv run python run_eval.py --dry-run              # list what would run
     uv run python run_eval.py --filter no_sep        # subset by name
-    uv run python run_eval.py --output results.txt   # custom output file
+    uv run python run_eval.py --name baseline        # single experiment
+    uv run python run_eval.py --name baseline --all-steps  # all checkpoints
 """
 
 import os
 from datetime import datetime
 
-from experiment_config import parse_batch_args, filter_experiments, experiment_dir
+from experiment_config import parse_batch_args, resolve_runs
 
 
 def main():
     opts = parse_batch_args()
 
-    runs = filter_experiments(opts["filter"])
+    runs = resolve_runs(opts)
     if not runs:
         print("No matching experiments.")
         return
 
     if opts["dry_run"]:
-        for name, _ in runs:
-            exp_dir = experiment_dir(name)
-            cache = f"{exp_dir}/activations.npz"
+        for name, _, ckpt_step, output_dir in runs:
+            cache = f"{output_dir}/activations.npz"
             exists = "OK" if os.path.exists(cache) else "MISSING"
-            print(f"  {name}: {cache} [{exists}] -> {exp_dir}/eval.txt")
+            step_info = f" (step {ckpt_step})" if ckpt_step is not None else ""
+            print(f"  {name}{step_info}: {cache} [{exists}] -> {output_dir}/eval.txt")
         return
 
     from data import solve
     from probes import load_probe_dataset, derive_n_clues
     from evaluate import evaluate_puzzle, summarize_stats, sequences_to_traces
 
-    for i, (name, _) in enumerate(runs):
-        exp_dir = experiment_dir(name)
-        cache_path = f"{exp_dir}/activations.npz"
-        eval_path = f"{exp_dir}/eval.txt"
+    for i, (name, _, ckpt_step, output_dir) in enumerate(runs):
+        cache_path = f"{output_dir}/activations.npz"
+        eval_path = f"{output_dir}/eval.txt"
 
-        header = f"[{i+1}/{len(runs)}] {name}"
+        step_info = f" step {ckpt_step}" if ckpt_step is not None else ""
+        header = f"[{i+1}/{len(runs)}] {name}{step_info}"
         print(f"\n{'='*60}\n{header}\n{'='*60}")
 
         if not os.path.exists(cache_path):
@@ -71,6 +72,8 @@ def main():
 
         with open(eval_path, "w") as f:
             f.write(f"Experiment: {name}\n")
+            if ckpt_step is not None:
+                f.write(f"Checkpoint step: {ckpt_step}\n")
             f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
             f.write(summary + "\n")
         print(f"  Written to {eval_path}")

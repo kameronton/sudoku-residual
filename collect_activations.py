@@ -1,15 +1,17 @@
-"""Collect activations for all experiments defined in experiment_config.py.
+"""Collect activations for experiments discovered from results/*/config.json.
 
 Usage:
     uv run python collect_activations.py                    # run all
-    uv run python collect_activations.py --dry-run          # print commands
+    uv run python collect_activations.py --dry-run          # print what would run
     uv run python collect_activations.py --filter no_sep    # subset by name
+    uv run python collect_activations.py --name baseline    # single experiment
+    uv run python collect_activations.py --name baseline --all-steps  # all checkpoints
     uv run python collect_activations.py --n_puzzles 1000   # override puzzle count
 """
 
 import os
 
-from experiment_config import COMMON, parse_batch_args, filter_experiments, experiment_dir
+from experiment_config import parse_batch_args, resolve_runs
 
 DEFAULT_N_PUZZLES = 6400
 DEFAULT_BATCH_SIZE = 64
@@ -20,31 +22,26 @@ def main():
     n_puzzles = int(opts["_extra"].get("n_puzzles", DEFAULT_N_PUZZLES))
     batch_size = int(opts["_extra"].get("batch_size", DEFAULT_BATCH_SIZE))
 
-    runs = filter_experiments(opts["filter"])
+    runs = resolve_runs(opts)
     if not runs:
         print("No matching experiments.")
         return
 
     if opts["dry_run"]:
-        for name, overrides in runs:
-            exp_dir = experiment_dir(name)
-            ckpt_dir = overrides.get("ckpt_dir", f"{exp_dir}/checkpoint")
-            traces_path = overrides.get("traces_path", COMMON["traces_path"])
-            cache_path = f"{exp_dir}/activations.npz"
-            print(f"{name}: ckpt_dir={ckpt_dir} traces={traces_path} -> {cache_path}")
+        for name, cfg, ckpt_step, output_dir in runs:
+            step_info = f" (step {ckpt_step})" if ckpt_step is not None else ""
+            print(f"{name}{step_info}: ckpt_dir={cfg['ckpt_dir']} traces={cfg['traces_path']} -> {output_dir}/activations.npz")
         return
 
     # Import here so --dry-run works without JAX installed
     from probes import generate_probe_dataset
 
-    for i, (name, overrides) in enumerate(runs):
-        exp_dir = experiment_dir(name)
-        ckpt_dir = overrides.get("ckpt_dir", f"{exp_dir}/checkpoint")
-        traces_path = overrides.get("traces_path", COMMON["traces_path"])
-        cache_path = f"{exp_dir}/activations.npz"
-        os.makedirs(exp_dir, exist_ok=True)
+    for i, (name, cfg, ckpt_step, output_dir) in enumerate(runs):
+        cache_path = f"{output_dir}/activations.npz"
+        os.makedirs(output_dir, exist_ok=True)
 
-        header = f"[{i+1}/{len(runs)}] {name}"
+        step_info = f" step {ckpt_step}" if ckpt_step is not None else ""
+        header = f"[{i+1}/{len(runs)}] {name}{step_info}"
         print(f"\n{'='*60}\n{header}\n{'='*60}")
 
         if os.path.exists(cache_path):
@@ -52,12 +49,13 @@ def main():
             continue
 
         generate_probe_dataset(
-            ckpt_dir=ckpt_dir,
-            traces_path=traces_path,
+            ckpt_dir=cfg["ckpt_dir"],
+            traces_path=cfg["traces_path"],
             n_puzzles=n_puzzles,
             batch_size=batch_size,
             cache_path=cache_path,
             compress=False,
+            ckpt_step=ckpt_step,
         )
 
     print(f"\nAll {len(runs)} activations collected.")
