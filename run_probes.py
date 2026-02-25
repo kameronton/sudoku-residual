@@ -34,10 +34,11 @@ def main():
         return
 
     # Import heavy deps only when actually running
-    from data import SEP_TOKEN
-    from activations import load_probe_dataset, derive_n_clues, anchor_positions
-    from probes import run_probe_loop, plot_all_layers, build_grid_at_step
-    from evaluate import sequences_to_traces
+    from activations import load_probe_dataset, derive_n_clues
+    from probes import (
+        prepare_probe_inputs, run_probe_loop,
+        plot_all_layers, plot_all_layers_per_digit, metric_name_for_mode,
+    )
 
     for i, (name, _, ckpt_step, output_dir) in enumerate(runs):
         cache_path = f"{output_dir}/activations.npz"
@@ -60,45 +61,21 @@ def main():
         if n_clues is None:
             n_clues = derive_n_clues(puzzles)
 
-        # Detect anchor mode: use "sep" if sequences contain SEP token, else "last_clue"
-        has_sep = any(SEP_TOKEN in seq for seq in sequences[:10])
-        anchor = "sep" if has_sep else "last_clue"
-        print(f"  Anchor mode: {anchor}")
+        activations, probe_grids, probe_positions = prepare_probe_inputs(
+            activations, puzzles, sequences, n_clues, step,
+        )
 
-        traces = sequences_to_traces(sequences, n_clues)
-        anchor_pos = anchor_positions(n_clues, anchor)
-
-        # Filter puzzles with enough trace steps
-        keep = [j for j, (t, ap) in enumerate(zip(traces, anchor_pos))
-                if len(t) >= step and ap + step >= 0]
-        if len(keep) < len(puzzles):
-            print(f"  Filtered to {len(keep)}/{len(puzzles)} puzzles")
-            activations = activations[keep]
-            puzzles = [puzzles[j] for j in keep]
-            sequences = [sequences[j] for j in keep]
-            n_clues = n_clues[keep]
-            anchor_pos = [anchor_pos[j] for j in keep]
-
-        if not puzzles:
+        if not probe_grids:
             print("  No puzzles remaining after filtering.")
             continue
 
-        probe_positions = [ap + step for ap in anchor_pos]
-
-        if step == 0 and anchor == "sep":
-            probe_grids = puzzles
-        else:
-            probe_grids = [build_grid_at_step(seq, pos)
-                           for seq, pos in zip(sequences, probe_positions)]
-
-        print(f"  Running probes ({mode}, step={step}, {len(puzzles)} puzzles)...")
+        print(f"  Running probes ({mode}, step={step}, {len(probe_grids)} puzzles)...")
         all_accuracies, all_per_digit = run_probe_loop(
             activations, probe_grids, probe_positions, mode=mode,
         )
 
-        metric = "F1" if mode == "candidates" else "Accuracy"
+        metric = metric_name_for_mode(mode)
         if mode == "candidates" and all_per_digit:
-            from probes import plot_all_layers_per_digit
             plot_all_layers_per_digit(all_per_digit, output_path, show=False)
         else:
             plot_all_layers(all_accuracies, output_path, metric_name=metric, show=False)

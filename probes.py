@@ -107,32 +107,15 @@ def eval_probe(ridge: Ridge, X_test: np.ndarray, y_test: np.ndarray, labels_test
         raise ValueError(f"Unsupported mode: {mode}")
 
 
-def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, verbose: bool = False, mode: str = "candidates"):
-    """Train and evaluate a ridge probe for a single cell. Convenience wrapper.
+def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, mode: str = "candidates"):
+    """Train and evaluate a ridge probe for a single cell.
 
-    Modes:
-    - "filled": binary classification (filled vs empty), evaluated on all cells.
-    - "state_filled": 9-class digit classification, evaluated only on filled cells.
-    - "candidates": 9-dim binary candidate sets, evaluated only on empty cells.
+    Returns (metric, y_true, preds, per_digit).
     """
     targets, labels = build_probe_targets(puzzles, cell_idx, mode)
 
     indices = np.arange(len(puzzles))
     idx_train, idx_test = train_test_split(indices, test_size=0.2, random_state=42)
-
-    if verbose:
-        n_filled = (labels > 0).sum()
-        n = len(puzzles)
-        labels_train, labels_test = labels[idx_train], labels[idx_test]
-        print(f"\n  Dataset: {n_filled} filled, {n - n_filled} empty out of {n}")
-        print(f"  {'Class':>5}  {'Train':>6}  {'Test':>6}  {'Train%':>7}  {'Test%':>7}")
-        for d in range(0, 10):
-            n_tr = (labels_train == d).sum()
-            n_te = (labels_test == d).sum()
-            pct_tr = n_tr / len(labels_train) * 100
-            pct_te = n_te / len(labels_test) * 100
-            label = "empty" if d == 0 else str(d)
-            print(f"  {label:>5}  {n_tr:>6}  {n_te:>6}  {pct_tr:>6.1f}%  {pct_te:>6.1f}%")
 
     ridge = fit_probe(activations[idx_train], targets[idx_train])
     return eval_probe(ridge, activations[idx_test], targets[idx_test], labels[idx_test], mode)
@@ -267,6 +250,47 @@ def plot_all_layers_per_digit(
     plt.close(fig)
 
 
+def metric_name_for_mode(mode: str) -> str:
+    return "F1" if mode == "candidates" else "Accuracy"
+
+
+def prepare_probe_inputs(
+    activations: np.ndarray,
+    puzzles: list[str],
+    sequences: list[list[int]],
+    n_clues: np.ndarray,
+    step: int,
+) -> tuple[np.ndarray, list[str], list[int]]:
+    """Detect anchor, filter by step length, compute probe grids and positions.
+
+    Returns (activations, probe_grids, probe_positions) after filtering.
+    """
+    has_sep = any(SEP_TOKEN in seq for seq in sequences[:10])
+    anchor = "sep" if has_sep else "last_clue"
+
+    traces = sequences_to_traces(sequences, n_clues)
+    anchor_pos = anchor_positions(n_clues, anchor)
+
+    # Filter puzzles with enough trace steps
+    keep = [i for i, (t, ap) in enumerate(zip(traces, anchor_pos))
+            if len(t) >= step and ap + step >= 0]
+    if len(keep) < len(puzzles):
+        print(f"Filtered to {len(keep)}/{len(puzzles)} puzzles (need >= {step} trace steps)")
+        activations = activations[keep]
+        puzzles = [puzzles[i] for i in keep]
+        sequences = [sequences[i] for i in keep]
+        anchor_pos = [anchor_pos[i] for i in keep]
+
+    probe_positions = [ap + step for ap in anchor_pos]
+
+    if step == 0 and anchor == "sep":
+        probe_grids = puzzles
+    else:
+        probe_grids = [build_grid_at_step(seq, pos) for seq, pos in zip(sequences, probe_positions)]
+
+    return activations, probe_grids, probe_positions
+
+
 def build_grid_at_step(sequence: list[int], position: int) -> str:
     """Build grid state by replaying all fill tokens in sequence[0:position+1].
 
@@ -344,9 +368,8 @@ def run_probe_loop(
             if per_digit is not None:
                 per_digit_layer.append(per_digit)
 
-        metric = "F1" if mode == "candidates" else "Accuracy"
         avg = np.nanmean(accuracies)
-        print(f"  Layer {layer} | Mean {metric.lower()} ({mode}): {avg:.3f}")
+        print(f"  Layer {layer} | Mean {metric_name_for_mode(mode).lower()} ({mode}): {avg:.3f}")
         all_accuracies[layer] = accuracies
         if per_digit_layer:
             all_per_digit[layer] = np.array(per_digit_layer)
@@ -387,45 +410,24 @@ def main():
     if n_clues is None:
         n_clues = derive_n_clues(puzzles)
 
-    traces = sequences_to_traces(sequences, n_clues)
-
     # --- Filter puzzles by solve status ---
     if args.filter != "all":
         print(f"Filtering puzzles by solve status: {args.filter}")
+        traces = sequences_to_traces(sequences, n_clues)
         solve_mask = _compute_solve_mask(puzzles, traces)
-        if args.filter == "solved":
-            keep = np.where(solve_mask)[0]
-        else:
-            keep = np.where(~solve_mask)[0]
-        activations, puzzles, sequences, traces = _subset_by_indices(keep, activations, puzzles, sequences, traces)
+        keep = np.where(solve_mask if args.filter == "solved" else ~solve_mask)[0]
+        activations, puzzles, sequences = _subset_by_indices(keep, activations, puzzles, sequences)
+        n_clues = n_clues[keep]
         print(f"  Kept {len(puzzles)} {args.filter} puzzles")
 
-    # --- Auto-detect anchor mode from data ---
-    has_sep = any(SEP_TOKEN in seq for seq in sequences[:10])
-    anchor = "sep" if has_sep else "last_clue"
-    step = args.step
+    # --- Prepare probe inputs ---
+    activations, probe_grids, probe_positions = prepare_probe_inputs(
+        activations, puzzles, sequences, n_clues, args.step,
+    )
 
-    anchor_pos = anchor_positions(n_clues, anchor)
-
-    # Filter puzzles with enough trace steps
-    keep = [i for i, (t, ap) in enumerate(zip(traces, anchor_pos))
-            if len(t) >= step and ap + step >= 0]
-    if len(keep) < len(puzzles):
-        print(f"Filtered to {len(keep)}/{len(puzzles)} puzzles (need >= {step} trace steps)")
-        activations, puzzles, sequences, traces = _subset_by_indices(keep, activations, puzzles, sequences, traces)
-        n_clues = n_clues[keep]
-        anchor_pos = [anchor_pos[i] for i in keep]
-
-    if not puzzles:
+    if not probe_grids:
         print("No puzzles remaining after filtering.")
         return
-
-    probe_positions = [ap + step for ap in anchor_pos]
-
-    if step == 0 and anchor == "sep":
-        probe_grids = puzzles
-    else:
-        probe_grids = [build_grid_at_step(seq, pos) for seq, pos in zip(sequences, probe_positions)]
 
     # --- Probing loop + plot ---
     all_accuracies, all_per_digit = run_probe_loop(
@@ -433,10 +435,10 @@ def main():
     )
 
     output = args.output
-    if output == "probe_accuracies.png" and step > 0:
-        output = f"probe_step{step}.png"
+    if output == "probe_accuracies.png" and args.step > 0:
+        output = f"probe_step{args.step}.png"
 
-    metric = "F1" if args.mode == "candidates" else "Accuracy"
+    metric = metric_name_for_mode(args.mode)
     if args.per_digit and all_per_digit:
         plot_all_layers_per_digit(all_per_digit, output.replace(".png", "_per_digit.png"))
     else:
