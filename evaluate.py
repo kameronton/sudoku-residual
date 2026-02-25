@@ -9,7 +9,8 @@ import numpy as np
 import orbax.checkpoint as ocp
 import random
 
-from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill, solve
+from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
+from solver import solve
 from model import GPT2Model, TransformerConfig, init_kv_cache
 from visualize import print_grid
 

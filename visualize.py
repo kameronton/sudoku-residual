@@ -5,7 +5,8 @@ import csv
 import random
 import sys
 
-from data import solve, random_trace
+from data import random_trace
+from solver import solve
 
 
 def print_grid(grid: list[str], highlight: tuple[int, int] | None = None):

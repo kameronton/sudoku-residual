@@ -30,7 +30,7 @@ def main():
             print(f"  {name}{step_info}: {cache} [{exists}] -> {output_dir}/eval.txt")
         return
 
-    from data import solve
+    from solver import solve
     from probes import load_probe_dataset, derive_n_clues
     from evaluate import evaluate_puzzle, summarize_stats, sequences_to_traces
 

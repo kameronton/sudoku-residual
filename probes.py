@@ -10,7 +10,8 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 
-from data import SEP_TOKEN, PAD_TOKEN, decode_fill, solve
+from data import SEP_TOKEN, PAD_TOKEN, decode_fill
+from solver import solve
 from model import GPT2Model
 from evaluate import load_checkpoint, generate_traces_batched_cached, sequences_to_traces, evaluate_puzzle
 
