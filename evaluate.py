@@ -430,7 +430,7 @@ def main():
     args = parser.parse_args()
 
     if args.mistake_map or args.mistake_position:
-        from probes import load_probe_dataset
+        from activations import load_probe_dataset
         _, puzzles, sequences, n_clues = load_probe_dataset(args.cache_path)
         traces = sequences_to_traces(sequences, n_clues)
         positions = []
@@ -452,7 +452,7 @@ def main():
         return
 
     if args.cache_path:
-        from probes import load_probe_dataset
+        from activations import load_probe_dataset
         _, puzzles_cached, sequences, n_clues = load_probe_dataset(args.cache_path)
         traces = sequences_to_traces(sequences, n_clues)
         puzzles = []

@@ -35,10 +35,8 @@ def main():
 
     # Import heavy deps only when actually running
     from data import SEP_TOKEN
-    from probes import (
-        load_probe_dataset, derive_n_clues, run_probe_loop,
-        plot_all_layers, anchor_positions, build_grid_at_step,
-    )
+    from activations import load_probe_dataset, derive_n_clues, anchor_positions
+    from probes import run_probe_loop, plot_all_layers, build_grid_at_step
     from evaluate import sequences_to_traces
 
     for i, (name, _, ckpt_step, output_dir) in enumerate(runs):

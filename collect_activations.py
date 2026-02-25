@@ -34,7 +34,7 @@ def main():
         return
 
     # Import here so --dry-run works without JAX installed
-    from probes import generate_probe_dataset
+    from activations import generate_probe_dataset
 
     for i, (name, cfg, ckpt_step, output_dir) in enumerate(runs):
         cache_path = f"{output_dir}/activations.npz"

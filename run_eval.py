@@ -31,7 +31,7 @@ def main():
         return
 
     from solver import solve
-    from probes import load_probe_dataset, derive_n_clues
+    from activations import load_probe_dataset, derive_n_clues
     from evaluate import evaluate_puzzle, summarize_stats, sequences_to_traces
 
     for i, (name, _, ckpt_step, output_dir) in enumerate(runs):
