@@ -34,7 +34,7 @@ def decode_fill(token: int) -> tuple[int, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Trace generation modes
+# Trace generation
 # ---------------------------------------------------------------------------
 
 def random_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
@@ -42,27 +42,22 @@ def random_trace(puzzle: str, solution: str) -> list[tuple[int, int, int]]:
     random.shuffle(empties)
     return empties
 
-# ---------------------------------------------------------------------------
-# Tokenize a trace into a sequence
-# ---------------------------------------------------------------------------
 
 def tokenize_trace(
-    puzzle: str, solution: str, trace: list[tuple[int, int, int]], no_sep_token: bool = False, randomize_clues: bool = True,
+    puzzle: str, trace: list[tuple[int, int, int]], no_sep_token: bool = False, randomize_clues: bool = True,
 ) -> np.ndarray:
     """Convert clues + trace into a token sequence, padded to MAX_SEQ_LEN."""
-    tokens = []
     clues = []
-    # Clue tokens
     for i in range(81):
         if puzzle[i] in "123456789":
             r, c = divmod(i, 9)
             clues.append(encode_fill(r, c, int(puzzle[i])))
     if randomize_clues:
         random.shuffle(clues)
-    tokens.extend(clues)
+
+    tokens = clues
     if not no_sep_token:
         tokens.append(SEP_TOKEN)
-    # Trace tokens
     for r, c, d in trace:
         tokens.append(encode_fill(r, c, d))
 
@@ -120,16 +115,9 @@ def collate_batch(dataset: SudokuDataset, indices: Sequence[int]) -> np.ndarray:
 _SOLVER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solver")
 
 
-def _prepare_constraint_c(
-    data_path: str, output: str, max_puzzles: int | None = None,
-    no_sep_token: bool = True, randomize_clues: bool = False,
-    train_frac: float = 0.90, val_frac: float = 0.05, test_frac: float = 0.05,
-    seed: int = 42,
-):
-    """Use the C solver binary for fast constraint-trace generation."""
-    # Extract puzzles from CSV
-    puzzles = []
-    solutions = []
+def _read_csv(data_path: str, max_puzzles: int | None = None):
+    """Read puzzle/solution pairs from CSV."""
+    puzzles, solutions = [], []
     with open(data_path) as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
@@ -137,18 +125,17 @@ def _prepare_constraint_c(
                 break
             puzzles.append(row["puzzle"])
             solutions.append(row["solution"])
+    return puzzles, solutions
 
-    # Pipe puzzles to C solver
+
+def _traces_from_c_solver(puzzles, solutions):
+    """Run the C solver binary, return list of traces (None for failures)."""
     input_bytes = "\n".join(puzzles).encode()
     proc = subprocess.run(
         [_SOLVER_BIN], input=input_bytes, stdout=subprocess.PIPE, check=True,
     )
     buf = proc.stdout
-
-    # Parse binary output
-    sequences = []
-    puzzle_strs = []
-    failed = 0
+    traces = []
     pos = 0
     for i, (puzzle, expected) in enumerate(zip(puzzles, solutions)):
         status = buf[pos]; pos += 1
@@ -160,24 +147,27 @@ def _prepare_constraint_c(
             trace.append((r, c, d))
             pos += 3
         if not status:
-            failed += 1
+            traces.append(None)
             continue
         assert sol == expected, f"C solver mismatch at row {i}: got {sol}"
-        seq = tokenize_trace(puzzle, sol, trace, no_sep_token, randomize_clues)
-        sequences.append(seq)
-        puzzle_strs.append(puzzle)
-        if (i + 1) % 100_000 == 0:
+        traces.append(trace)
+    return traces
+
+
+def _traces_from_python_solver(puzzles, solutions):
+    """Run the Python solver, return list of traces (None for failures)."""
+    traces = []
+    for i, (puzzle, expected) in enumerate(zip(puzzles, solutions)):
+        result = solve(puzzle)
+        if result is None:
+            traces.append(None)
+            continue
+        solution, trace = result
+        assert solution == expected, f"Solver mismatch at row {i}"
+        traces.append(trace)
+        if (i + 1) % 10_000 == 0:
             print(f"  processed {i + 1} puzzles...")
-
-    arr = np.stack(sequences)
-    puzzle_arr = np.array(puzzle_strs, dtype="U81")
-    _save_splits(arr, puzzle_arr, output, train_frac, val_frac, test_frac, seed)
-    print(f"Saved {len(sequences)} sequences to {output} (failed: {failed})")
-
-
-def _count_clues(puzzle: str) -> int:
-    """Count non-zero clue characters in an 81-char puzzle string."""
-    return sum(1 for ch in puzzle if ch in "123456789")
+    return traces
 
 
 def _save_splits(
@@ -190,28 +180,21 @@ def _save_splits(
     indices = rng.permutation(n)
     n_train = int(n * train_frac)
     n_val = int(n * val_frac)
-    # test gets the remainder
     train_idx = indices[:n_train]
     val_idx = indices[n_train:n_train + n_val]
     test_idx = indices[n_train + n_val:]
 
-    # Compute n_clues per puzzle (index where clues end / trace begins)
-    n_clues = np.array([_count_clues(str(p)) for p in puzzles], dtype=np.int16)
+    n_clues = np.array([
+        sum(1 for ch in str(p) if ch in "123456789") for p in puzzles
+    ], dtype=np.int16)
 
-    np.savez_compressed(
-        output,
-        sequences=sequences,  # backward compat
-        sequences_train=sequences[train_idx],
-        sequences_val=sequences[val_idx],
-        sequences_test=sequences[test_idx],
-        puzzles_train=puzzles[train_idx],
-        puzzles_val=puzzles[val_idx],
-        puzzles_test=puzzles[test_idx],
-        n_clues=n_clues,  # backward compat
-        n_clues_train=n_clues[train_idx],
-        n_clues_val=n_clues[val_idx],
-        n_clues_test=n_clues[test_idx],
-    )
+    arrays = {}
+    for name, idx in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
+        arrays[f"sequences_{name}"] = sequences[idx]
+        arrays[f"puzzles_{name}"] = puzzles[idx]
+        arrays[f"n_clues_{name}"] = n_clues[idx]
+
+    np.savez_compressed(output, **arrays)
     print(f"Splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
 
 
@@ -221,39 +204,29 @@ def prepare_data(
     train_frac: float = 0.90, val_frac: float = 0.05, test_frac: float = 0.05,
     seed: int = 42,
 ):
-    # Fast path: use C solver for constraint traces
+    puzzles, solutions = _read_csv(data_path, max_puzzles)
+
+    # Generate traces
     if trace_mode == "constraint" and os.path.isfile(_SOLVER_BIN):
         print(f"Using C solver: {_SOLVER_BIN}")
-        _prepare_constraint_c(data_path, output, max_puzzles, no_sep_token, randomize_clues, train_frac, val_frac, test_frac, seed)
-        return
+        traces = _traces_from_c_solver(puzzles, solutions)
+    elif trace_mode == "constraint":
+        traces = _traces_from_python_solver(puzzles, solutions)
+    else:
+        traces = [random_trace(p, s) for p, s in zip(puzzles, solutions)]
 
+    # Tokenize
     sequences = []
     puzzle_strs = []
     failed = 0
-
-    with open(data_path) as f:
-        reader = csv.DictReader(f)
-        for i, row in enumerate(reader):
-            if max_puzzles and i >= max_puzzles:
-                break
-            puzzle = row["puzzle"]
-            solution_csv = row["solution"]
-            result = solve(puzzle)
-            if result is None:
-                failed += 1
-                continue
-            solution, cg_trace = result
-            assert solution == solution_csv, f"Solver mismatch at row {i}"
-            if trace_mode == "random":
-                trace = random_trace(puzzle, solution)
-            elif trace_mode == "constraint":
-                trace = cg_trace
-            seq = tokenize_trace(puzzle, solution, trace, no_sep_token, randomize_clues)
-            assert seq.shape == (MAX_SEQ_LEN,), f"Tokenization error at row {i}"
-            sequences.append(seq)
-            puzzle_strs.append(puzzle)
-            if (i + 1) % 10_000 == 0:
-                print(f"  processed {i + 1} puzzles...")
+    for i, (puzzle, trace) in enumerate(zip(puzzles, traces)):
+        if trace is None:
+            failed += 1
+            continue
+        sequences.append(tokenize_trace(puzzle, trace, no_sep_token, randomize_clues))
+        puzzle_strs.append(puzzle)
+        if (i + 1) % 100_000 == 0:
+            print(f"  processed {i + 1} puzzles...")
 
     arr = np.stack(sequences)
     puzzle_arr = np.array(puzzle_strs, dtype="U81")
@@ -285,7 +258,7 @@ def sanity_check(n: int = 100):
                 grid[r * 9 + c] = str(d)
             assert "".join(grid) == expected, f"Random trace mismatch at puzzle {i}"
             # Verify tokenization round-trip
-            seq = tokenize_trace(puzzle, solution, rt)
+            seq = tokenize_trace(puzzle, rt)
             assert seq[seq != PAD_TOKEN].shape[0] == 81 + 1, f"Token count off at puzzle {i}"  # 81 cells + sep
     print(f"All {n} puzzles passed sanity check.")
 
