@@ -10,10 +10,10 @@ from sklearn.metrics import accuracy_score, f1_score
 
 from data import SEP_TOKEN, decode_fill
 from solver import solve
-from evaluate import evaluate_puzzle, sequences_to_traces
+from evaluate import evaluate_puzzle
 from activations import (
     load_probe_dataset, derive_n_clues, anchor_positions,
-    generate_probe_dataset,
+    generate_probe_dataset, sequences_to_traces,
 )
 
 

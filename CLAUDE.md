@@ -30,7 +30,6 @@ uv run python run_eval.py                        # evaluate all experiments
 
 # 3. Standalone (single experiment)
 uv run python training.py --traces_path traces.npz --batch_size 64 --num_tokens 100000000
-uv run python evaluate.py --ckpt_dir results/baseline/checkpoint --traces_path traces.npz --n 100
 uv run python evaluate.py --cache_path results/baseline/activations.npz --quiet
 uv run python probes.py --cache_path results/baseline/activations.npz --step 0 --mode state_filled
 uv run python probes.py --cache_path results/baseline/activations.npz --step 10 --mode candidates
@@ -53,8 +52,8 @@ uv run python -c "from data import sanity_check; sanity_check()"
 | `data.py` | Trace generation, tokenization, dataset class, train/val/test splitting |
 | `model.py` | GPT-2 transformer (Flax) |
 | `training.py` | Training loop, config, logger |
-| `evaluate.py` | Checkpoint loading, autoregressive generation, puzzle evaluation |
-| `activations.py` | Activation collection, dataset I/O (save/load NPZ), anchor utilities |
+| `evaluate.py` | Puzzle evaluation, mistake analysis, statistics |
+| `activations.py` | Checkpoint loading, trace generation, activation collection, dataset I/O |
 | `probes.py` | Linear probing experiments on residual stream activations |
 | `experiment_config.py` | Shared experiment definitions (COMMON defaults, EXPERIMENTS list) |
 | `run_training.py` | Batch training runner (subprocess per experiment) |
@@ -131,9 +130,7 @@ GPT-2 architecture with pre-norm (LayerNorm before attention/FFN). Causal maskin
 
 ### Evaluation (`evaluate.py`)
 
-Loads a checkpoint, autoregressively generates solving traces (with KV cache) for test puzzles, and reports per-puzzle and aggregate statistics: cell accuracy, solve rate, consistency errors, clue/fill overwrites.
-
-Supports evaluation from cached activations NPZ (`--cache_path`) without needing a checkpoint. The `--mistake-map` flag plots a 9x9 heatmap of where first inconsistencies occur.
+Evaluates cached traces against ground-truth solutions, reporting per-puzzle and aggregate statistics: cell accuracy, solve rate, consistency errors, clue/fill overwrites. Requires `--cache_path` (activations NPZ). The `--mistake-map` flag plots a 9x9 heatmap of where first inconsistencies occur.
 
 ### Probing (`probes.py`)
 

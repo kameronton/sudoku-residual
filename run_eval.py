@@ -30,9 +30,8 @@ def main():
             print(f"  {name}{step_info}: {cache} [{exists}] -> {output_dir}/eval.txt")
         return
 
-    from solver import solve
-    from activations import load_probe_dataset, derive_n_clues
-    from evaluate import evaluate_puzzle, summarize_stats, sequences_to_traces
+    from activations import load_probe_dataset, derive_n_clues, sequences_to_traces
+    from evaluate import evaluate_traces, summarize_stats
 
     for i, (name, _, ckpt_step, output_dir) in enumerate(runs):
         cache_path = f"{output_dir}/activations.npz"
@@ -52,20 +51,7 @@ def main():
             n_clues = derive_n_clues(puzzles)
 
         traces = sequences_to_traces(sequences, n_clues)
-
-        # Solve puzzles to get ground truth solutions
-        print(f"  Solving {len(puzzles)} puzzles for ground truth...")
-        solutions = []
-        for p in puzzles:
-            result = solve(p)
-            if result is None:
-                raise ValueError(f"Solver failed: {p[:20]}...")
-            solutions.append(result[0])
-
-        all_stats = []
-        for puzzle, solution, trace in zip(puzzles, solutions, traces):
-            stats = evaluate_puzzle(trace, puzzle, solution, verbose=False)
-            all_stats.append(stats)
+        all_stats = evaluate_traces(puzzles, traces)
 
         summary = summarize_stats(all_stats)
         print(summary)
