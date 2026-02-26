@@ -76,6 +76,13 @@ def generate_traces_batched_cached(
         groups.setdefault(prefill_len, []).append((idx, p))
 
     @jax.jit
+    def prefill(params, tokens, cache):
+        logits, new_cache = model.apply(
+            {"params": params}, tokens, cache=cache, cache_index=0,
+        )
+        return logits, new_cache
+
+    @jax.jit
     def decode_step(params, token, cache, cache_index):
         logits, new_cache = model.apply(
             {"params": params}, token, cache=cache, cache_index=cache_index,
@@ -85,13 +92,6 @@ def generate_traces_batched_cached(
     processed = 0
     for prefill_len, group in groups.items():
         n_decode = MAX_SEQ_LEN - prefill_len
-
-        @jax.jit
-        def prefill(params, tokens, cache):
-            logits, new_cache = model.apply(
-                {"params": params}, tokens, cache=cache, cache_index=0,
-            )
-            return logits, new_cache
 
         for batch_start in range(0, len(group), batch_size):
             batch = group[batch_start : batch_start + batch_size]
@@ -134,9 +134,6 @@ def generate_traces_batched_cached(
 
             # Decode remaining steps
             for step_i in range(1, n_decode):
-                if jnp.all(done_mask):
-                    break
-
                 pos = prefill_len + step_i
                 input_token = sequences[:, pos - 1:pos]  # (bs, 1)
                 logits, cache = decode_step(params, input_token, cache, pos - 1)
