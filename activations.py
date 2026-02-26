@@ -89,8 +89,15 @@ def generate_traces_batched_cached(
         )
         return logits, new_cache
 
+    import time
+
     n_groups = len(groups)
     processed = 0
+    total_prefill_ms = 0.0
+    total_decode_ms = 0.0
+    total_extract_ms = 0.0
+    total_batches = 0
+
     for group_idx, (prefill_len, group) in enumerate(groups.items()):
         n_decode = MAX_SEQ_LEN - prefill_len
         print(f"  Group {group_idx+1}/{n_groups}: prefill_len={prefill_len}, {len(group)} puzzles, {n_decode} decode steps", flush=True)
@@ -98,6 +105,7 @@ def generate_traces_batched_cached(
         for batch_start in range(0, len(group), batch_size):
             batch = group[batch_start : batch_start + batch_size]
             bs = len(batch)
+            is_first_in_group = batch_start == 0
 
             # Encode clues — all same prefill_len in this group
             token_lists = [encode_clues(p, randomize_order=True) for _, p in batch]
@@ -116,11 +124,15 @@ def generate_traces_batched_cached(
 
             cache = init_kv_cache(cfg, bs)
 
-            # Prefill (first call per unique prefill_len triggers XLA compilation)
-            print(f"    Prefilling batch {batch_start//batch_size + 1} (bs={bs})...", flush=True)
+            # Prefill — first call per unique prefill_len triggers XLA compilation
+            if is_first_in_group:
+                print(f"    Prefilling (bs={bs}, first in group — may compile)...", flush=True)
+            t0 = time.perf_counter()
             logits, cache = prefill(params, prefill_tokens, cache)
             jax.effects_barrier()
-            print(f"    Prefill done. Decoding {n_decode} steps...", flush=True)
+            prefill_ms = (time.perf_counter() - t0) * 1000
+            if is_first_in_group:
+                print(f"    Prefill: {prefill_ms:.0f} ms{'  [includes compile]' if is_first_in_group else ''}", flush=True)
 
             # First decode token from last prefill logit
             if temperature <= 0:
@@ -138,6 +150,7 @@ def generate_traces_batched_cached(
             steps_taken = valid.astype(jnp.int32)
 
             # Decode remaining steps
+            t1 = time.perf_counter()
             for step_i in range(1, n_decode):
                 pos = prefill_len + step_i
                 input_token = sequences[:, pos - 1:pos]  # (bs, 1)
@@ -160,7 +173,11 @@ def generate_traces_batched_cached(
                 steps_taken = steps_taken + update_mask.astype(jnp.int32)
                 done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
 
+            jax.effects_barrier()
+            decode_ms = (time.perf_counter() - t1) * 1000
+
             # Extract traces and sequences
+            t2 = time.perf_counter()
             for i in range(bs):
                 orig_idx = batch[i][0]
                 trace = []
@@ -173,10 +190,33 @@ def generate_traces_batched_cached(
                 all_traces[orig_idx] = trace
                 # Save actual sequence (clues + SEP + trace), stripping padding
                 all_sequences[orig_idx] = [int(sequences[i, p]) for p in range(end_pos)]
+            extract_ms = (time.perf_counter() - t2) * 1000
+
+            tok_per_s = bs * n_decode / (decode_ms / 1000)
+            seq_per_s = bs / ((prefill_ms + decode_ms) / 1000)
+            print(
+                f"  [{processed+bs}/{n}] bs={bs}"
+                f"  prefill={prefill_ms:.0f}ms"
+                f"  decode={decode_ms:.0f}ms ({decode_ms/n_decode:.1f}ms/step, {tok_per_s:.0f} tok/s)"
+                f"  extract={extract_ms:.0f}ms"
+                f"  throughput={seq_per_s:.1f} seq/s",
+                flush=True,
+            )
+
+            # Accumulate stats (skip first batch of each group to exclude compile time)
+            if not is_first_in_group:
+                total_prefill_ms += prefill_ms
+                total_decode_ms += decode_ms
+                total_extract_ms += extract_ms
+                total_batches += 1
 
             processed += bs
-            print(f"  Generated {processed}/{n}", flush=True)
 
+    if total_batches > 0:
+        print(f"\n  Steady-state averages over {total_batches} batches (excluding first per group):")
+        print(f"    Prefill:  {total_prefill_ms/total_batches:.0f} ms/batch")
+        print(f"    Decode:   {total_decode_ms/total_batches:.0f} ms/batch  ({total_decode_ms/total_batches/n_decode:.1f} ms/step)")
+        print(f"    Extract:  {total_extract_ms/total_batches:.0f} ms/batch")
     print()
     return all_traces, all_sequences
 
