@@ -1,6 +1,5 @@
 """Trace generation, activation collection, and dataset I/O."""
 
-import functools
 import os
 import random
 
@@ -88,18 +87,22 @@ def generate_traces_batched_cached(
         )
         return logits, new_cache
 
-    @functools.partial(jax.jit, static_argnames=("prefill_len", "n_decode"))
+    @jax.jit
     def _decode_scan(params, sequences, cache, done_mask, steps_taken, max_empties,
-                     prefill_len, n_decode):
-        """Decode n_decode-1 steps via lax.scan — one XLA dispatch per batch.
+                     prefill_len):
+        """Decode via lax.scan — always runs MAX_SEQ_LEN-1 steps, ONE compilation total.
 
-        prefill_len and n_decode are static so they are constant-folded.
-        One compilation per unique prefill_len (~18 for clue counts 17-35),
-        cached across all batches in this call.
+        prefill_len is a regular traced scalar (not static), so this function
+        compiles exactly once regardless of how many distinct prefill lengths exist.
+
+        Steps beyond the useful decode range have active=False (from the
+        pos < MAX_SEQ_LEN guard), so they are no-ops on sequences/steps_taken.
+        XLA's dynamic_slice/dynamic_update_slice clamp OOB indices, making
+        those extra steps safe even though they still run the model forward pass.
         """
         def body(carry, step_i):
             sequences, cache, done_mask, steps_taken = carry
-            pos = prefill_len + step_i   # static int + traced int = traced int
+            pos = prefill_len + step_i   # both traced → traced
             bs = sequences.shape[0]
             input_token = jax.lax.dynamic_slice(sequences, (0, pos - 1), (bs, 1))
             logits, cache = model.apply(
@@ -107,7 +110,7 @@ def generate_traces_batched_cached(
             )
             next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
             valid = (next_token >= 0) & (next_token <= 728)
-            active = ~done_mask
+            active = ~done_mask & (pos < MAX_SEQ_LEN)
             update_mask = active & valid
             new_col = jnp.where(
                 update_mask[:, None],
@@ -122,8 +125,8 @@ def generate_traces_batched_cached(
         (sequences, _, done_mask, steps_taken), _ = jax.lax.scan(
             body,
             (sequences, cache, done_mask, steps_taken),
-            jnp.arange(1, n_decode),
-            unroll=1,  # emit a while loop — fast compilation, compact HLO
+            jnp.arange(1, MAX_SEQ_LEN),  # fixed shape (81,) → single compilation
+            unroll=1,
         )
         return sequences, done_mask, steps_taken
 
@@ -178,7 +181,7 @@ def generate_traces_batched_cached(
             # Decode remaining steps — single XLA dispatch via lax.scan
             sequences, done_mask, steps_taken = _decode_scan(
                 params, sequences, cache, done_mask, steps_taken, max_empties,
-                prefill_len, n_decode,
+                jnp.int32(prefill_len),
             )
 
             # Extract traces and sequences — this is the only host-device sync per batch
