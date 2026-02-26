@@ -31,7 +31,7 @@ class TrainConfig:
     traces_path: str = "traces.npz"
     resume: bool = False
     batch_size: int = 64
-    num_tokens: int = 100_000_000
+    num_epochs: int = 10
     lr: float = 3e-4
     warmup_tokens: int = 1_000_000
     weight_decay: float = 0.1
@@ -235,12 +235,20 @@ def train(cfg: TrainConfig):
     print(f"Loss mask: {cfg.loss_mask} (has_sep={has_sep})", flush=True)
     print(f"Max sequence length: {max_seq_len}", flush=True)
 
-    # Compute token budget and steps
+    # Compute epoch budget and steps
     tokens_per_step = cfg.batch_size * (max_seq_len - 1)
-    total_steps = cfg.num_tokens // tokens_per_step
+    steps_per_epoch = n_train // cfg.batch_size
     warmup_steps = cfg.warmup_tokens // tokens_per_step
-    ckpt_every = total_steps // cfg.num_checkpoints if cfg.num_checkpoints > 0 else 0
-    print(f"Token budget: {cfg.num_tokens:,} tokens -> {total_steps:,} steps ({tokens_per_step} tok/step)", flush=True)
+    if cfg.num_checkpoints > 0:
+        ckpt_every = max(1, round(cfg.num_epochs * steps_per_epoch / cfg.num_checkpoints))
+        total_steps = cfg.num_checkpoints * ckpt_every
+    else:
+        ckpt_every = 0
+        total_steps = cfg.num_epochs * steps_per_epoch
+    ne, nc = cfg.num_epochs, cfg.num_checkpoints
+    if nc > 0 and ne > 0 and not (ne % nc == 0 or nc % ne == 0):
+        print(f"Warning: num_epochs={ne} and num_checkpoints={nc} violate divisibility constraint (rounding applied)", flush=True)
+    print(f"Epoch budget: {cfg.num_epochs} epochs -> {total_steps:,} steps ({steps_per_epoch} steps/epoch, {tokens_per_step} tok/step)", flush=True)
     if ckpt_every > 0:
         print(f"Checkpointing every {ckpt_every} steps ({cfg.num_checkpoints} checkpoints)", flush=True)
 
@@ -277,14 +285,13 @@ def train(cfg: TrainConfig):
     start_step = 0
     if ckpt_mgr.latest_step() is not None and cfg.resume:
         step = ckpt_mgr.latest_step()
-        # First restore train_config + step to get original schedule params
+        # Restore schedule params saved at checkpoint time
         meta = ckpt_mgr.restore(step, args=ocp.args.Composite(
             step=ocp.args.JsonRestore(),
-            train_config=ocp.args.JsonRestore(),
+            schedule_config=ocp.args.JsonRestore(),
         ))
-        orig_cfg = meta.train_config
-        orig_total_steps = orig_cfg["num_tokens"] // (cfg.batch_size * (max_seq_len - 1))
-        orig_warmup_steps = orig_cfg["warmup_tokens"] // (cfg.batch_size * (max_seq_len - 1))
+        orig_total_steps = meta.schedule_config["total_steps"]
+        orig_warmup_steps = meta.schedule_config["warmup_steps"]
         print(f"Restoring schedule from original run: {orig_total_steps} total, {orig_warmup_steps} warmup steps")
         # Rebuild state with the original schedule before restoring weights
         rng, reinit_rng = jax.random.split(rng)
@@ -299,11 +306,6 @@ def train(cfg: TrainConfig):
         start_step = int(restored.step)
         print(f"Resumed from checkpoint at step {start_step}")
 
-    # Epoch-based iteration
-    steps_per_epoch = n_train // cfg.batch_size
-    total_epochs = total_steps / steps_per_epoch
-    print(f"Epochs: {total_epochs:.2f} ({steps_per_epoch} steps/epoch)", flush=True)
-
     # Logger
     logger = TrainLogger(log_path=cfg.log_path, tokens_per_step=tokens_per_step)
     logger.total_tokens = start_step * tokens_per_step
@@ -311,7 +313,7 @@ def train(cfg: TrainConfig):
     # Training loop with tqdm
     print("Compiling train_step...", flush=True)
     pbar = tqdm(
-        total=cfg.num_tokens,
+        total=total_steps * tokens_per_step,
         initial=logger.total_tokens,
         unit="tok",
         unit_scale=True,
@@ -372,6 +374,7 @@ def train(cfg: TrainConfig):
                     step=ocp.args.JsonSave(int(state.step)),
                     model_config=ocp.args.JsonSave(dataclasses.asdict(model_cfg)),
                     train_config=ocp.args.JsonSave(dataclasses.asdict(cfg)),
+                    schedule_config=ocp.args.JsonSave({"total_steps": total_steps, "warmup_steps": warmup_steps}),
                 ))
                 ckpt_mgr.wait_until_finished()
                 logger.log_checkpoint(step)
@@ -382,15 +385,18 @@ def train(cfg: TrainConfig):
 
     pbar.close()
 
-    # Final checkpoint
-    ckpt_mgr.save(total_steps, args=ocp.args.Composite(
-                params=ocp.args.StandardSave(state.params),
-                opt_state=ocp.args.StandardSave(state.opt_state),
-                step=ocp.args.JsonSave(int(state.step)),
-                model_config=ocp.args.JsonSave(dataclasses.asdict(model_cfg)),
-                train_config=ocp.args.JsonSave(dataclasses.asdict(cfg)),
-            ))
-    ckpt_mgr.wait_until_finished()
+    # Final checkpoint only needed when no intermediate checkpoints were configured
+    # (when ckpt_every > 0, the last in-loop save already fires at step == total_steps)
+    if ckpt_every == 0:
+        ckpt_mgr.save(step, args=ocp.args.Composite(
+            params=ocp.args.StandardSave(state.params),
+            opt_state=ocp.args.StandardSave(state.opt_state),
+            step=ocp.args.JsonSave(int(state.step)),
+            model_config=ocp.args.JsonSave(dataclasses.asdict(model_cfg)),
+            train_config=ocp.args.JsonSave(dataclasses.asdict(cfg)),
+            schedule_config=ocp.args.JsonSave({"total_steps": total_steps, "warmup_steps": warmup_steps}),
+        ))
+        ckpt_mgr.wait_until_finished()
 
     logger.save()
 
