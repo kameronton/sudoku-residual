@@ -53,58 +53,6 @@ def encode_clues(puzzle: str, randomize_order: bool = False) -> list[int]:
     return tokens
 
 
-@functools.partial(jax.jit, static_argnames=("model",))
-def _prefill(params, sequences, cache, model):
-    """Prefill the KV cache with the full (padded) sequence."""
-    logits, new_cache = model.apply(
-        {"params": params}, sequences, cache=cache, cache_index=0,
-    )
-    return logits, new_cache
-
-
-@functools.partial(jax.jit, static_argnames=("model", "prefill_len", "n_decode"))
-def _decode_scan(params, sequences, cache, done_mask, steps_taken, max_empties,
-                 model, prefill_len, n_decode):
-    """Decode n_decode-1 steps via lax.scan — one XLA dispatch per batch.
-
-    prefill_len and n_decode are static so they are constant-folded into the
-    compiled program. One compilation per unique prefill_len value (~18 for
-    Sudoku clue counts 17-35), cached across batches and function calls.
-
-    Note: only greedy decoding (temperature=0) is supported. Temperature > 0
-    would require jax.random.fold_in(base_key, step_i) in the body.
-    """
-    def body(carry, step_i):
-        sequences, cache, done_mask, steps_taken = carry
-        pos = prefill_len + step_i   # static int + traced int = traced int
-        bs = sequences.shape[0]
-        input_token = jax.lax.dynamic_slice(sequences, (0, pos - 1), (bs, 1))
-        logits, cache = model.apply(
-            {"params": params}, input_token, cache=cache, cache_index=pos - 1,
-        )
-        next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
-        valid = (next_token >= 0) & (next_token <= 728)
-        active = ~done_mask
-        update_mask = active & valid
-        new_col = jnp.where(
-            update_mask[:, None],
-            next_token[:, None],
-            jax.lax.dynamic_slice(sequences, (0, pos), (bs, 1)),
-        )
-        sequences = jax.lax.dynamic_update_slice(sequences, new_col, (0, pos))
-        steps_taken = steps_taken + update_mask.astype(jnp.int32)
-        done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
-        return (sequences, cache, done_mask, steps_taken), None
-
-    (sequences, _, done_mask, steps_taken), _ = jax.lax.scan(
-        body,
-        (sequences, cache, done_mask, steps_taken),
-        jnp.arange(1, n_decode),
-        unroll=1,  # emit a while loop — fast compilation, compact HLO
-    )
-    return sequences, done_mask, steps_taken
-
-
 def generate_traces_batched_cached(
     model, params, puzzles: list[str], batch_size: int = 64, temperature: float = 0.0,
 ) -> tuple[list[list[tuple[int, int, int]]], list[list[int]]]:
@@ -127,6 +75,57 @@ def generate_traces_batched_cached(
         clue_tokens = encode_clues(p)
         prefill_len = len(clue_tokens)
         groups.setdefault(prefill_len, []).append((idx, p))
+
+    # JIT functions closed over `model` — defined once here so JAX can cache
+    # compiled versions across all groups and batches within this call.
+    # Flax modules are not hashable, so model cannot be a static_argname;
+    # closing over it is the standard pattern.
+
+    @jax.jit
+    def _prefill(params, sequences, cache):
+        logits, new_cache = model.apply(
+            {"params": params}, sequences, cache=cache, cache_index=0,
+        )
+        return logits, new_cache
+
+    @functools.partial(jax.jit, static_argnames=("prefill_len", "n_decode"))
+    def _decode_scan(params, sequences, cache, done_mask, steps_taken, max_empties,
+                     prefill_len, n_decode):
+        """Decode n_decode-1 steps via lax.scan — one XLA dispatch per batch.
+
+        prefill_len and n_decode are static so they are constant-folded.
+        One compilation per unique prefill_len (~18 for clue counts 17-35),
+        cached across all batches in this call.
+        """
+        def body(carry, step_i):
+            sequences, cache, done_mask, steps_taken = carry
+            pos = prefill_len + step_i   # static int + traced int = traced int
+            bs = sequences.shape[0]
+            input_token = jax.lax.dynamic_slice(sequences, (0, pos - 1), (bs, 1))
+            logits, cache = model.apply(
+                {"params": params}, input_token, cache=cache, cache_index=pos - 1,
+            )
+            next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
+            valid = (next_token >= 0) & (next_token <= 728)
+            active = ~done_mask
+            update_mask = active & valid
+            new_col = jnp.where(
+                update_mask[:, None],
+                next_token[:, None],
+                jax.lax.dynamic_slice(sequences, (0, pos), (bs, 1)),
+            )
+            sequences = jax.lax.dynamic_update_slice(sequences, new_col, (0, pos))
+            steps_taken = steps_taken + update_mask.astype(jnp.int32)
+            done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
+            return (sequences, cache, done_mask, steps_taken), None
+
+        (sequences, _, done_mask, steps_taken), _ = jax.lax.scan(
+            body,
+            (sequences, cache, done_mask, steps_taken),
+            jnp.arange(1, n_decode),
+            unroll=1,  # emit a while loop — fast compilation, compact HLO
+        )
+        return sequences, done_mask, steps_taken
 
     import time
 
@@ -165,7 +164,7 @@ def generate_traces_batched_cached(
             cache = init_kv_cache(cfg, bs)
 
             # Prefill — single dispatch
-            logits, cache = _prefill(params, sequences, cache, model)
+            logits, cache = _prefill(params, sequences, cache)
 
             # First decode token from SEP-position logit (greedy)
             next_token = jnp.argmax(logits[:, prefill_len - 1, :], axis=-1).astype(jnp.int32)
@@ -179,7 +178,7 @@ def generate_traces_batched_cached(
             # Decode remaining steps — single XLA dispatch via lax.scan
             sequences, done_mask, steps_taken = _decode_scan(
                 params, sequences, cache, done_mask, steps_taken, max_empties,
-                model, prefill_len, n_decode,
+                prefill_len, n_decode,
             )
 
             # Extract traces and sequences — this is the only host-device sync per batch
