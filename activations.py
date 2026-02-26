@@ -124,22 +124,23 @@ def generate_traces_batched_cached(
 
             cache = init_kv_cache(cfg, bs)
 
-            # Prefill — first call per unique prefill_len triggers XLA compilation
+            # Prefill — sequences has fixed shape (bs, MAX_SEQ_LEN) so XLA compiles once
             if is_first_in_group:
-                print(f"    Prefilling (bs={bs}, first in group — may compile)...", flush=True)
+                compile_note = " [compiling]" if group_idx == 0 else ""
+                print(f"    Prefilling (bs={bs}, prefill_len={prefill_len}){compile_note}...", flush=True)
             t0 = time.perf_counter()
-            logits, cache = prefill(params, prefill_tokens, cache)
+            logits, cache = prefill(params, sequences, cache)
             jax.effects_barrier()
             prefill_ms = (time.perf_counter() - t0) * 1000
             if is_first_in_group:
-                print(f"    Prefill: {prefill_ms:.0f} ms{'  [includes compile]' if is_first_in_group else ''}", flush=True)
+                print(f"    Prefill: {prefill_ms:.0f} ms{'  [includes compile]' if group_idx == 0 else ''}", flush=True)
 
             # First decode token from last prefill logit
             if temperature <= 0:
-                next_token = jnp.argmax(logits[:, -1, :], axis=-1).astype(jnp.int32)
+                next_token = jnp.argmax(logits[:, prefill_len - 1, :], axis=-1).astype(jnp.int32)
             else:
                 next_token = jax.random.categorical(
-                    jax.random.PRNGKey(0), logits[:, -1, :] / temperature
+                    jax.random.PRNGKey(0), logits[:, prefill_len - 1, :] / temperature
                 ).astype(jnp.int32)
 
             valid = (next_token >= 0) & (next_token <= 728)
