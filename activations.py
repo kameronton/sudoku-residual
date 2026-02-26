@@ -89,9 +89,11 @@ def generate_traces_batched_cached(
         )
         return logits, new_cache
 
+    n_groups = len(groups)
     processed = 0
-    for prefill_len, group in groups.items():
+    for group_idx, (prefill_len, group) in enumerate(groups.items()):
         n_decode = MAX_SEQ_LEN - prefill_len
+        print(f"  Group {group_idx+1}/{n_groups}: prefill_len={prefill_len}, {len(group)} puzzles, {n_decode} decode steps", flush=True)
 
         for batch_start in range(0, len(group), batch_size):
             batch = group[batch_start : batch_start + batch_size]
@@ -114,8 +116,11 @@ def generate_traces_batched_cached(
 
             cache = init_kv_cache(cfg, bs)
 
-            # Prefill
+            # Prefill (first call per unique prefill_len triggers XLA compilation)
+            print(f"    Prefilling batch {batch_start//batch_size + 1} (bs={bs})...", flush=True)
             logits, cache = prefill(params, prefill_tokens, cache)
+            jax.effects_barrier()
+            print(f"    Prefill done. Decoding {n_decode} steps...", flush=True)
 
             # First decode token from last prefill logit
             if temperature <= 0:
@@ -170,7 +175,7 @@ def generate_traces_batched_cached(
                 all_sequences[orig_idx] = [int(sequences[i, p]) for p in range(end_pos)]
 
             processed += bs
-            print(f"  Generated {min(processed, n)}/{n}", end="\r")
+            print(f"  Generated {processed}/{n}", flush=True)
 
     print()
     return all_traces, all_sequences
