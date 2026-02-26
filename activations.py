@@ -258,7 +258,7 @@ def collect_activations(intermediates_fn, params, sequences: list[list[int]], ba
     return np.concatenate(all_acts, axis=0).astype(np.float32)
 
 
-def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], sequences: list[list[int]], compress: bool = True, n_clues: np.ndarray | None = None):
+def save_probe_dataset(path: str, activations: np.ndarray | None, puzzles: list[str], sequences: list[list[int]], compress: bool = True, n_clues: np.ndarray | None = None):
     """Save activations, puzzles, and token sequences together."""
     puzzle_arr = np.array(puzzles, dtype=f"U{len(puzzles[0])}")
     # Pad sequences to same length for storage
@@ -267,19 +267,22 @@ def save_probe_dataset(path: str, activations: np.ndarray, puzzles: list[str], s
     for i, s in enumerate(sequences):
         seq_arr[i, :len(s)] = s
     save_fn = np.savez_compressed if compress else np.savez
-    arrays = dict(activations=activations, puzzles=puzzle_arr, sequences=seq_arr)
+    arrays = dict(puzzles=puzzle_arr, sequences=seq_arr)
+    if activations is not None:
+        arrays["activations"] = activations
     if n_clues is not None:
         arrays["n_clues"] = n_clues
     print(f"Saving probe dataset to {path} ({'compressed' if compress else 'uncompressed'})...")
     save_fn(path, **arrays)
     size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
-    print(f"Saved probe dataset to {path} ({activations.shape}, {size_mb:.0f} MB)")
+    shape_info = str(activations.shape) if activations is not None else "traces only"
+    print(f"Saved probe dataset to {path} ({shape_info}, {size_mb:.0f} MB)")
 
 
 def load_probe_dataset(path: str):
     """Load cached activations, puzzles, sequences, and optionally n_clues."""
     data = np.load(path)
-    activations = data["activations"]
+    activations = data["activations"] if "activations" in data else None
     puzzles = list(data["puzzles"])
     seq_arr = data["sequences"]
     # Convert back to list of lists, stripping padding
@@ -288,7 +291,8 @@ def load_probe_dataset(path: str):
         seq = row[row != PAD_TOKEN].tolist()
         sequences.append(seq)
     n_clues = data["n_clues"] if "n_clues" in data else None
-    print(f"Loaded probe dataset from {path} ({activations.shape})")
+    shape_info = str(activations.shape) if activations is not None else "traces only"
+    print(f"Loaded probe dataset from {path} ({shape_info})")
     return activations, puzzles, sequences, n_clues
 
 
@@ -321,9 +325,11 @@ def generate_probe_dataset(
     cache_path: str | None = None,
     compress: bool = True,
     ckpt_step: int | None = None,
-) -> tuple[np.ndarray, list[str], list[list[int]], np.ndarray]:
-    """Load checkpoint, generate traces, collect activations, and optionally save.
+    traces_only: bool = False,
+) -> tuple[np.ndarray | None, list[str], list[list[int]], np.ndarray]:
+    """Load checkpoint, generate traces, optionally collect activations, and save.
 
+    When traces_only=True, skips activation collection and returns None for activations.
     Returns (activations, puzzles, sequences, n_clues).
     """
     print(f"Loading checkpoint from {ckpt_dir}" + (f" (step {ckpt_step})" if ckpt_step else ""))
@@ -338,10 +344,16 @@ def generate_probe_dataset(
     avg_len = np.mean([len(s) for s in sequences])
     print(f"Average sequence length: {avg_len:.1f}")
 
+    n_clues = derive_n_clues(puzzles)
+
+    if traces_only:
+        if cache_path:
+            save_probe_dataset(cache_path, None, puzzles, sequences, compress=compress, n_clues=n_clues)
+        return None, puzzles, sequences, n_clues
+
     print("Collecting activations...")
     intermediates_fn = make_intermediates_fn(model)
     activations = collect_activations(intermediates_fn, params, sequences, batch_size)
-    n_clues = derive_n_clues(puzzles)
 
     if cache_path:
         save_probe_dataset(cache_path, activations, puzzles, sequences, compress=compress, n_clues=n_clues)

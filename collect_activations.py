@@ -1,12 +1,13 @@
 """Collect activations for experiments discovered from results/*/config.json.
 
 Usage:
-    uv run python collect_activations.py                    # run all
-    uv run python collect_activations.py --dry-run          # print what would run
-    uv run python collect_activations.py --filter no_sep    # subset by name
-    uv run python collect_activations.py --name baseline    # single experiment
-    uv run python collect_activations.py --name baseline --all-steps  # all checkpoints
-    uv run python collect_activations.py --n_puzzles 1000   # override puzzle count
+    uv run python collect_activations.py                             # run all
+    uv run python collect_activations.py --dry-run                   # print what would run
+    uv run python collect_activations.py --filter no_sep             # subset by name
+    uv run python collect_activations.py --name baseline             # single experiment
+    uv run python collect_activations.py --name baseline --all-steps # all checkpoints
+    uv run python collect_activations.py --n_puzzles 1000            # override puzzle count
+    uv run python collect_activations.py --traces-only               # skip activation collection
 """
 
 import os
@@ -21,6 +22,7 @@ def main():
     opts = parse_batch_args()
     n_puzzles = int(opts["_extra"].get("n_puzzles", DEFAULT_N_PUZZLES))
     batch_size = int(opts["_extra"].get("batch_size", DEFAULT_BATCH_SIZE))
+    traces_only = opts["_extra"].get("traces_only", False)
 
     runs = resolve_runs(opts)
     if not runs:
@@ -56,6 +58,7 @@ def main():
             cache_path=cache_path,
             compress=False,
             ckpt_step=ckpt_step,
+            traces_only=traces_only,
         )
 
     print(f"\nAll {len(runs)} activations collected.")
