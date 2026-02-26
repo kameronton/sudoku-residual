@@ -21,3 +21,9 @@ sudoku-3m.csv
 
 # Ignore compiled solver
 solver
+
+# Ignore everything about sudoku dataset generation
+dataset/
+
+# Local experiment overrides (Colab / per-machine, not committed)
+experiments_local.py

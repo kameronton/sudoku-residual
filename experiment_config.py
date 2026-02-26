@@ -7,39 +7,14 @@ run_eval.py) import EXPERIMENTS and COMMON from here.
 import os
 import sys
 
-# ── Shared defaults (override per-run as needed) ─────────────────────
-COMMON = dict(
-    traces_path="traces_unbiased.npz",
-    dtype="bfloat16",
-    batch_size=512,
-    num_tokens=218_700_000,
-    lr=0.001,
-    eval_every=1000,
-    num_checkpoints=1,
-    n_layers=8,
-    n_heads=8,
-    d_model=576,
-    d_ff=3456,
-    schedule_type="linear",
-    loss_mask="after_clues",
-    weight_decay=0.1,
-    warmup_tokens=1_000_000,
-    seed=42,
-)
-
 # ── Experiment definitions ───────────────────────────────────────────
-# Each entry: (name, {overrides})
-# name is used for ckpt_dir and log_path automatically.
-EXPERIMENTS = [
-    ("baseline", {}),
-    ("baseline_mask_all", {"loss_mask": "all"}),
-    ("baseline_no_pos_emb", {"no_pos_emb": True}),
-    ("baseline_mask_all_no_pos_emb", {"loss_mask": "all", "no_pos_emb": True}),
-    ("no_sep", {"traces_path": "traces_unbiased_no_sep.npz"}),
-    ("no_sep_no_pos_emb", {"traces_path": "traces_unbiased_no_sep.npz", "no_pos_emb": True}),
-    ("no_sep_mask_all", {"traces_path": "traces_unbiased_no_sep.npz", "loss_mask": "all"}),
-    ("no_sep_mask_all_no_pos_emb", {"traces_path": "traces_unbiased_no_sep.npz", "loss_mask": "all", "no_pos_emb": True}),
-]
+# Load from experiments_local.py if present (git-ignored, for Colab/local overrides),
+# otherwise fall back to the committed defaults in default_experiments.py.
+try:
+    from experiments_local import COMMON, EXPERIMENTS
+    print("experiment_config: loaded from experiments_local.py", flush=True)
+except ImportError:
+    from default_experiments import COMMON, EXPERIMENTS
 
 
 RESULTS_DIR = "results"
