@@ -1,5 +1,6 @@
 """Trace generation, activation collection, and dataset I/O."""
 
+import functools
 import os
 import random
 
@@ -52,6 +53,58 @@ def encode_clues(puzzle: str, randomize_order: bool = False) -> list[int]:
     return tokens
 
 
+@functools.partial(jax.jit, static_argnames=("model",))
+def _prefill(params, sequences, cache, model):
+    """Prefill the KV cache with the full (padded) sequence."""
+    logits, new_cache = model.apply(
+        {"params": params}, sequences, cache=cache, cache_index=0,
+    )
+    return logits, new_cache
+
+
+@functools.partial(jax.jit, static_argnames=("model", "prefill_len", "n_decode"))
+def _decode_scan(params, sequences, cache, done_mask, steps_taken, max_empties,
+                 model, prefill_len, n_decode):
+    """Decode n_decode-1 steps via lax.scan — one XLA dispatch per batch.
+
+    prefill_len and n_decode are static so they are constant-folded into the
+    compiled program. One compilation per unique prefill_len value (~18 for
+    Sudoku clue counts 17-35), cached across batches and function calls.
+
+    Note: only greedy decoding (temperature=0) is supported. Temperature > 0
+    would require jax.random.fold_in(base_key, step_i) in the body.
+    """
+    def body(carry, step_i):
+        sequences, cache, done_mask, steps_taken = carry
+        pos = prefill_len + step_i   # static int + traced int = traced int
+        bs = sequences.shape[0]
+        input_token = jax.lax.dynamic_slice(sequences, (0, pos - 1), (bs, 1))
+        logits, cache = model.apply(
+            {"params": params}, input_token, cache=cache, cache_index=pos - 1,
+        )
+        next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
+        valid = (next_token >= 0) & (next_token <= 728)
+        active = ~done_mask
+        update_mask = active & valid
+        new_col = jnp.where(
+            update_mask[:, None],
+            next_token[:, None],
+            jax.lax.dynamic_slice(sequences, (0, pos), (bs, 1)),
+        )
+        sequences = jax.lax.dynamic_update_slice(sequences, new_col, (0, pos))
+        steps_taken = steps_taken + update_mask.astype(jnp.int32)
+        done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
+        return (sequences, cache, done_mask, steps_taken), None
+
+    (sequences, _, done_mask, steps_taken), _ = jax.lax.scan(
+        body,
+        (sequences, cache, done_mask, steps_taken),
+        jnp.arange(1, n_decode),
+        unroll=1,  # emit a while loop — fast compilation, compact HLO
+    )
+    return sequences, done_mask, steps_taken
+
+
 def generate_traces_batched_cached(
     model, params, puzzles: list[str], batch_size: int = 64, temperature: float = 0.0,
 ) -> tuple[list[list[tuple[int, int, int]]], list[list[int]]]:
@@ -75,20 +128,6 @@ def generate_traces_batched_cached(
         prefill_len = len(clue_tokens)
         groups.setdefault(prefill_len, []).append((idx, p))
 
-    @jax.jit
-    def prefill(params, tokens, cache):
-        logits, new_cache = model.apply(
-            {"params": params}, tokens, cache=cache, cache_index=0,
-        )
-        return logits, new_cache
-
-    @jax.jit
-    def decode_step(params, token, cache, cache_index):
-        logits, new_cache = model.apply(
-            {"params": params}, token, cache=cache, cache_index=cache_index,
-        )
-        return logits, new_cache
-
     import time
 
     n_groups = len(groups)
@@ -102,7 +141,13 @@ def generate_traces_batched_cached(
 
         for batch_start in range(0, len(group), batch_size):
             batch = group[batch_start : batch_start + batch_size]
-            bs = len(batch)
+            actual_bs = len(batch)
+
+            # Pad partial last batch to full batch_size so KV cache shape is always
+            # (batch_size, ...) — avoids recompilation for different partial sizes
+            if actual_bs < batch_size:
+                batch = batch + [batch[-1]] * (batch_size - actual_bs)
+            bs = batch_size
 
             # Encode clues — all same prefill_len in this group
             token_lists = [encode_clues(p, randomize_order=True) for _, p in batch]
@@ -114,23 +159,16 @@ def generate_traces_batched_cached(
             )
 
             # Build full sequence buffer and fill prefill portion
-            # sequences has fixed shape (bs, MAX_SEQ_LEN) so prefill XLA kernel compiles once
             sequences = jnp.full((bs, MAX_SEQ_LEN), PAD_TOKEN, dtype=jnp.int32)
             sequences = sequences.at[:, :prefill_len].set(prefill_tokens)
 
             cache = init_kv_cache(cfg, bs)
 
-            # Prefill
-            logits, cache = prefill(params, sequences, cache)
+            # Prefill — single dispatch
+            logits, cache = _prefill(params, sequences, cache, model)
 
-            # First decode token from SEP-position logit
-            if temperature <= 0:
-                next_token = jnp.argmax(logits[:, prefill_len - 1, :], axis=-1).astype(jnp.int32)
-            else:
-                next_token = jax.random.categorical(
-                    jax.random.PRNGKey(0), logits[:, prefill_len - 1, :] / temperature
-                ).astype(jnp.int32)
-
+            # First decode token from SEP-position logit (greedy)
+            next_token = jnp.argmax(logits[:, prefill_len - 1, :], axis=-1).astype(jnp.int32)
             valid = (next_token >= 0) & (next_token <= 728)
             sequences = sequences.at[:, prefill_len].set(
                 jnp.where(valid, next_token, PAD_TOKEN)
@@ -138,31 +176,15 @@ def generate_traces_batched_cached(
             done_mask = ~valid
             steps_taken = valid.astype(jnp.int32)
 
-            # Decode remaining steps
-            for step_i in range(1, n_decode):
-                pos = prefill_len + step_i
-                input_token = sequences[:, pos - 1:pos]  # (bs, 1)
-                logits, cache = decode_step(params, input_token, cache, pos - 1)
-
-                if temperature <= 0:
-                    next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
-                else:
-                    next_token = jax.random.categorical(
-                        jax.random.PRNGKey(step_i), logits[:, 0, :] / temperature
-                    ).astype(jnp.int32)
-
-                valid = (next_token >= 0) & (next_token <= 728)
-                active = ~done_mask & (pos < MAX_SEQ_LEN)
-                update_mask = active & valid
-
-                sequences = sequences.at[:, pos].set(
-                    jnp.where(update_mask, next_token, sequences[:, pos])
-                )
-                steps_taken = steps_taken + update_mask.astype(jnp.int32)
-                done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
+            # Decode remaining steps — single XLA dispatch via lax.scan
+            sequences, done_mask, steps_taken = _decode_scan(
+                params, sequences, cache, done_mask, steps_taken, max_empties,
+                model, prefill_len, n_decode,
+            )
 
             # Extract traces and sequences — this is the only host-device sync per batch
-            for i in range(bs):
+            # Only process actual (non-padded) examples
+            for i in range(actual_bs):
                 orig_idx = batch[i][0]
                 trace = []
                 end_pos = prefill_len + int(steps_taken[i])
@@ -174,7 +196,7 @@ def generate_traces_batched_cached(
                 all_traces[orig_idx] = trace
                 all_sequences[orig_idx] = [int(sequences[i, p]) for p in range(end_pos)]
 
-            processed += bs
+            processed += actual_bs
             elapsed = time.perf_counter() - t_start
             print(f"  Generated {processed}/{n}  ({elapsed:.1f}s)", flush=True)
 
