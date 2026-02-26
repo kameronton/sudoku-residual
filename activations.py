@@ -1,5 +1,6 @@
 """Trace generation, activation collection, and dataset I/O."""
 
+import functools
 import os
 import random
 
@@ -87,22 +88,18 @@ def generate_traces_batched_cached(
         )
         return logits, new_cache
 
-    @jax.jit
+    @functools.partial(jax.jit, static_argnames=("prefill_len", "n_decode"))
     def _decode_scan(params, sequences, cache, done_mask, steps_taken, max_empties,
-                     prefill_len):
-        """Decode via lax.scan — always runs MAX_SEQ_LEN-1 steps, ONE compilation total.
+                     prefill_len, n_decode):
+        """Decode n_decode-1 steps via lax.scan — one XLA dispatch per batch.
 
-        prefill_len is a regular traced scalar (not static), so this function
-        compiles exactly once regardless of how many distinct prefill lengths exist.
-
-        Steps beyond the useful decode range have active=False (from the
-        pos < MAX_SEQ_LEN guard), so they are no-ops on sequences/steps_taken.
-        XLA's dynamic_slice/dynamic_update_slice clamp OOB indices, making
-        those extra steps safe even though they still run the model forward pass.
+        prefill_len and n_decode are static so they are constant-folded.
+        One compilation per unique prefill_len (~18 for clue counts 17-35),
+        cached across all batches in this call.
         """
         def body(carry, step_i):
             sequences, cache, done_mask, steps_taken = carry
-            pos = prefill_len + step_i   # both traced → traced
+            pos = prefill_len + step_i   # static int + traced int = traced int
             bs = sequences.shape[0]
             input_token = jax.lax.dynamic_slice(sequences, (0, pos - 1), (bs, 1))
             logits, cache = model.apply(
@@ -110,7 +107,7 @@ def generate_traces_batched_cached(
             )
             next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
             valid = (next_token >= 0) & (next_token <= 728)
-            active = ~done_mask & (pos < MAX_SEQ_LEN)
+            active = ~done_mask
             update_mask = active & valid
             new_col = jnp.where(
                 update_mask[:, None],
@@ -125,8 +122,8 @@ def generate_traces_batched_cached(
         (sequences, _, done_mask, steps_taken), _ = jax.lax.scan(
             body,
             (sequences, cache, done_mask, steps_taken),
-            jnp.arange(1, MAX_SEQ_LEN),  # fixed shape (81,) → single compilation
-            unroll=1,
+            jnp.arange(1, n_decode),
+            unroll=1,  # emit a while loop — fast compilation, compact HLO
         )
         return sequences, done_mask, steps_taken
 
@@ -181,22 +178,27 @@ def generate_traces_batched_cached(
             # Decode remaining steps — single XLA dispatch via lax.scan
             sequences, done_mask, steps_taken = _decode_scan(
                 params, sequences, cache, done_mask, steps_taken, max_empties,
-                jnp.int32(prefill_len),
+                prefill_len, n_decode,
             )
 
-            # Extract traces and sequences — this is the only host-device sync per batch
-            # Only process actual (non-padded) examples
+            # Transfer entire arrays at once — two device-to-host syncs per batch.
+            # Individual int(jax_array[i, p]) calls each incur ~0.4ms round-trip
+            # latency on cloud TPU; for 512 examples × 82 tokens that adds up to
+            # ~27s per batch. np.array() transfers in one shot regardless of size.
+            sequences_np = np.array(sequences)      # (bs, MAX_SEQ_LEN)
+            steps_taken_np = np.array(steps_taken)  # (bs,)
+
             for i in range(actual_bs):
                 orig_idx = batch[i][0]
+                end_pos = prefill_len + int(steps_taken_np[i])
                 trace = []
-                end_pos = prefill_len + int(steps_taken[i])
                 for pos in range(prefill_len, end_pos):
-                    token = int(sequences[i, pos])
+                    token = int(sequences_np[i, pos])
                     if 0 <= token <= 728:
                         r, c, d = decode_fill(token)
                         trace.append((r, c, d))
                 all_traces[orig_idx] = trace
-                all_sequences[orig_idx] = [int(sequences[i, p]) for p in range(end_pos)]
+                all_sequences[orig_idx] = sequences_np[i, :end_pos].tolist()
 
             processed += actual_bs
             elapsed = time.perf_counter() - t_start
