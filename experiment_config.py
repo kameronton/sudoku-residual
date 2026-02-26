@@ -33,7 +33,7 @@ def parse_batch_args(argv: list[str] | None = None) -> dict:
     """
     if argv is None:
         argv = sys.argv[1:]
-    result = {"dry_run": False, "filter": None, "name": None, "all_steps": False, "_extra": {}}
+    result = {"dry_run": False, "filter": None, "name": None, "all_steps": False, "traces_only": False, "_extra": {}}
     i = 0
     while i < len(argv):
         if argv[i] == "--dry-run":
@@ -41,6 +41,9 @@ def parse_batch_args(argv: list[str] | None = None) -> dict:
             i += 1
         elif argv[i] == "--all-steps":
             result["all_steps"] = True
+            i += 1
+        elif argv[i] == "--traces-only":
+            result["traces_only"] = True
             i += 1
         elif argv[i] == "--filter" and i + 1 < len(argv):
             result["filter"] = argv[i + 1]

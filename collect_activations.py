@@ -22,7 +22,7 @@ def main():
     opts = parse_batch_args()
     n_puzzles = int(opts["_extra"].get("n_puzzles", DEFAULT_N_PUZZLES))
     batch_size = int(opts["_extra"].get("batch_size", DEFAULT_BATCH_SIZE))
-    traces_only = opts["_extra"].get("traces_only", False)
+    traces_only = opts["traces_only"]
 
     runs = resolve_runs(opts)
     if not runs:
