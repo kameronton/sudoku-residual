@@ -12,6 +12,11 @@ import orbax.checkpoint as ocp
 from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
 from model import GPT2Model, TransformerConfig, init_kv_cache
 
+# Module-level cache: id(model) -> (_prefill, _decode_scan).
+# Keyed by model identity so compiled XLA programs survive across multiple
+# calls to generate_traces_batched_cached (e.g. several experiments in a row).
+_JIT_CACHE: dict[int, tuple] = {}
+
 
 def load_checkpoint(ckpt_dir: str, model_cfg: TransformerConfig = None, ckpt_step: int | None = None):
     """Restore params from the latest checkpoint. Returns (params, model).
@@ -78,56 +83,58 @@ def generate_traces_batched_cached(
         prefill_len = len(clue_tokens)
         groups.setdefault(prefill_len, []).append((idx, p))
 
-    # JIT functions closed over `model` — defined once here so JAX can cache
-    # compiled versions across all groups and batches within this call.
-    # Flax modules are not hashable, so model cannot be a static_argname;
-    # closing over it is the standard pattern.
-
-    @jax.jit
-    def _prefill(params, sequences, cache):
-        logits, new_cache = model.apply(
-            {"params": params}, sequences, cache=cache, cache_index=0,
-        )
-        return logits, new_cache
-
-    @functools.partial(jax.jit, static_argnames=("prefill_len", "n_decode"))
-    def _decode_scan(params, sequences, cache, done_mask, steps_taken, max_empties,
-                     prefill_len, n_decode):
-        """Decode n_decode-1 steps via lax.scan — one XLA dispatch per batch.
-
-        prefill_len and n_decode are static so they are constant-folded.
-        One compilation per unique prefill_len (~18 for clue counts 17-35),
-        cached across all batches in this call.
-        """
-        def body(carry, step_i):
-            sequences, cache, done_mask, steps_taken = carry
-            pos = prefill_len + step_i   # static int + traced int = traced int
-            bs = sequences.shape[0]
-            input_token = jax.lax.dynamic_slice(sequences, (0, pos - 1), (bs, 1))
-            logits, cache = model.apply(
-                {"params": params}, input_token, cache=cache, cache_index=pos - 1,
+    # JIT functions closed over `model` (Flax modules are not hashable so
+    # model cannot be a static_argname). Cached in _JIT_CACHE by model id so
+    # compiled XLA programs survive across calls for the same checkpoint.
+    if id(model) not in _JIT_CACHE:
+        @jax.jit
+        def _prefill(params, sequences, cache):
+            logits, new_cache = model.apply(
+                {"params": params}, sequences, cache=cache, cache_index=0,
             )
-            next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
-            valid = (next_token >= 0) & (next_token <= 728)
-            active = ~done_mask
-            update_mask = active & valid
-            new_col = jnp.where(
-                update_mask[:, None],
-                next_token[:, None],
-                jax.lax.dynamic_slice(sequences, (0, pos), (bs, 1)),
-            )
-            sequences = jax.lax.dynamic_update_slice(sequences, new_col, (0, pos))
-            steps_taken = steps_taken + update_mask.astype(jnp.int32)
-            done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
-            return (sequences, cache, done_mask, steps_taken), None
+            return logits, new_cache
 
-        (sequences, _, done_mask, steps_taken), _ = jax.lax.scan(
-            body,
-            (sequences, cache, done_mask, steps_taken),
-            jnp.arange(1, n_decode),
-            unroll=1,  # emit a while loop — fast compilation, compact HLO
-        )
-        return sequences, done_mask, steps_taken
+        @functools.partial(jax.jit, static_argnames=("prefill_len", "n_decode"))
+        def _decode_scan(params, sequences, cache, done_mask, steps_taken, max_empties,
+                         prefill_len, n_decode):
+            """Decode n_decode-1 steps via lax.scan — one XLA dispatch per batch.
+
+            prefill_len and n_decode are static so they are constant-folded.
+            One compilation per unique prefill_len (~18 for clue counts 17-35).
+            """
+            def body(carry, step_i):
+                sequences, cache, done_mask, steps_taken = carry
+                pos = prefill_len + step_i
+                bs = sequences.shape[0]
+                input_token = jax.lax.dynamic_slice(sequences, (0, pos - 1), (bs, 1))
+                logits, cache = model.apply(
+                    {"params": params}, input_token, cache=cache, cache_index=pos - 1,
+                )
+                next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
+                valid = (next_token >= 0) & (next_token <= 728)
+                active = ~done_mask
+                update_mask = active & valid
+                new_col = jnp.where(
+                    update_mask[:, None],
+                    next_token[:, None],
+                    jax.lax.dynamic_slice(sequences, (0, pos), (bs, 1)),
+                )
+                sequences = jax.lax.dynamic_update_slice(sequences, new_col, (0, pos))
+                steps_taken = steps_taken + update_mask.astype(jnp.int32)
+                done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
+                return (sequences, cache, done_mask, steps_taken), None
+
+            (sequences, _, done_mask, steps_taken), _ = jax.lax.scan(
+                body,
+                (sequences, cache, done_mask, steps_taken),
+                jnp.arange(1, n_decode),
+                unroll=1,  # emit a while loop — fast compilation, compact HLO
+            )
+            return sequences, done_mask, steps_taken
+
+        _JIT_CACHE[id(model)] = (_prefill, _decode_scan)
+
+    _prefill, _decode_scan = _JIT_CACHE[id(model)]
 
     import time
 
