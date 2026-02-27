@@ -178,6 +178,34 @@ static int eliminate(State *s, int cell, uint16_t d_bit) {
     return 1;
 }
 
+/* Count solutions up to limit; returns as soon as limit is reached. */
+static int count_solutions(State *s, int limit) {
+    int min_count = 10;
+    int best = -1;
+    for (int i = 0; i < 81; i++) {
+        if (s->values[i] == 0) return 0; /* contradiction */
+        int cnt = __builtin_popcount(s->values[i]);
+        if (cnt > 1 && cnt < min_count) {
+            min_count = cnt;
+            best = i;
+        }
+    }
+    if (best == -1) return 1; /* all cells determined */
+
+    int total = 0;
+    uint16_t bits = s->values[best];
+    for (int d = 0; d < 9; d++) {
+        uint16_t bit = 1 << d;
+        if (!(bits & bit)) continue;
+        State copy = *s;
+        if (assign(&copy, best, bit)) {
+            total += count_solutions(&copy, limit - total);
+            if (total >= limit) return total;
+        }
+    }
+    return total;
+}
+
 static int search(State *s) {
     /* MRV with random tie-breaking */
     int min_count = 10;
@@ -215,7 +243,12 @@ static int search(State *s) {
     return 0;
 }
 
-static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int *trace_len) {
+/*
+ * Returns: 0 = no solution, 1 = solved (unique if check_unique=0),
+ *          2 = multiple solutions (only when check_unique=1).
+ */
+static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int *trace_len,
+                 int check_unique) {
     State s;
     for (int i = 0; i < 81; i++)
         s.values[i] = ALL_BITS;
@@ -244,6 +277,9 @@ static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int
             return 0;
     }
 
+    /* Save state after constraint propagation for uniqueness check */
+    State s_after_clues = s;
+
     /* Check if solved */
     int solved = 1;
     for (int i = 0; i < 81; i++) {
@@ -261,14 +297,22 @@ static int solve(const char *puzzle, char *solution, uint8_t trace_out[][3], int
 
     memcpy(trace_out, s.trace, s.trace_len * 3);
     *trace_len = s.trace_len;
+
+    /* Uniqueness check: look for a second solution */
+    if (check_unique && count_solutions(&s_after_clues, 2) >= 2)
+        return 2;
+
     return 1;
 }
 
 int main(int argc, char **argv) {
     unsigned seed = 42;
+    int check_unique = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
             seed = (unsigned)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--check-unique") == 0)
+            check_unique = 1;
     }
     srand(seed);
     init_tables();
@@ -289,7 +333,7 @@ int main(int argc, char **argv) {
         /* Check first char is digit or dot */
         if (!(line[0] >= '0' && line[0] <= '9') && line[0] != '.') continue;
 
-        int ok = solve(line, solution, trace, &trace_len);
+        int ok = solve(line, solution, trace, &trace_len, check_unique);
         uint8_t status = (uint8_t)ok;
         fwrite(&status, 1, 1, stdout);
         fwrite(solution, 1, 81, stdout);

@@ -40,8 +40,8 @@ def load_checkpoint(ckpt_dir: str, model_cfg: TransformerConfig = None, ckpt_ste
     return restored.params, model
 
 
-def encode_clues(puzzle: str, randomize_order: bool = False) -> list[int]:
-    """Encode puzzle clues + <sep> as token list."""
+def encode_clues(puzzle: str, randomize_order: bool = False, use_sep: bool = True) -> list[int]:
+    """Encode puzzle clues as a token list, optionally followed by <sep>."""
     tokens = []
     for i in range(81):
         if puzzle[i] in "123456789":
@@ -49,12 +49,14 @@ def encode_clues(puzzle: str, randomize_order: bool = False) -> list[int]:
             tokens.append(encode_fill(r, c, int(puzzle[i])))
     if randomize_order:
         random.shuffle(tokens)
-    tokens.append(SEP_TOKEN)
+    if use_sep:
+        tokens.append(SEP_TOKEN)
     return tokens
 
 
 def generate_traces_batched_cached(
     model, params, puzzles: list[str], batch_size: int = 64, temperature: float = 0.0,
+    use_sep: bool = True,
 ) -> tuple[list[list[tuple[int, int, int]]], list[list[int]]]:
     """Batched autoregressive trace generation with KV cache.
 
@@ -62,17 +64,17 @@ def generate_traces_batched_cached(
     a single prefill shape, then uses cached single-token decode steps.
 
     Returns (traces, sequences) where sequences are the actual token lists
-    (clues + SEP + trace tokens) the model produced, preserving clue order.
+    (clues [+ SEP] + trace tokens) the model produced, preserving clue order.
     """
     cfg = model.config
     n = len(puzzles)
     all_traces: list[list[tuple[int, int, int]] | None] = [None] * n
     all_sequences: list[list[int] | None] = [None] * n
 
-    # Group puzzles by prefill length (n_clues + 1 for SEP)
+    # Group puzzles by prefill length (n_clues [+ 1 for SEP])
     groups: dict[int, list[tuple[int, str]]] = {}
     for idx, p in enumerate(puzzles):
-        clue_tokens = encode_clues(p)
+        clue_tokens = encode_clues(p, use_sep=use_sep)
         prefill_len = len(clue_tokens)
         groups.setdefault(prefill_len, []).append((idx, p))
 
@@ -149,7 +151,7 @@ def generate_traces_batched_cached(
             bs = batch_size
 
             # Encode clues — all same prefill_len in this group
-            token_lists = [encode_clues(p, randomize_order=True) for _, p in batch]
+            token_lists = [encode_clues(p, randomize_order=True, use_sep=use_sep) for _, p in batch]
             prefill_tokens = jnp.array(token_lists, dtype=jnp.int32)
 
             max_empties = jnp.array(
@@ -209,11 +211,11 @@ def generate_traces_batched_cached(
     return all_traces, all_sequences
 
 
-def traces_to_sequences(puzzles: list[str], traces: list[list[tuple[int, int, int]]]) -> list[list[int]]:
+def traces_to_sequences(puzzles: list[str], traces: list[list[tuple[int, int, int]]], use_sep: bool = True) -> list[list[int]]:
     """Convert puzzles + traces into full token sequences (row-major clue order)."""
     sequences = []
     for puzzle, trace in zip(puzzles, traces):
-        tokens = encode_clues(puzzle)
+        tokens = encode_clues(puzzle, use_sep=use_sep)
         for r, c, d in trace:
             tokens.append(encode_fill(r, c, d))
         sequences.append(tokens)
@@ -369,8 +371,15 @@ def generate_probe_dataset(
     puzzles = load_puzzles(traces_path, n_puzzles)
     print(f"Loaded {len(puzzles)} puzzles")
 
+    # Auto-detect whether the training data used a SEP token
+    _npz = np.load(traces_path, allow_pickle=False)
+    _seq0 = _npz["sequences_test"][0]
+    _nc0 = int(_npz["n_clues_test"][0])
+    use_sep = bool(_nc0 < len(_seq0) and _seq0[_nc0] == SEP_TOKEN)
+    print(f"SEP token: {'yes' if use_sep else 'no'}")
+
     print("Generating traces...")
-    traces, sequences = generate_traces_batched_cached(model, params, puzzles, batch_size)
+    traces, sequences = generate_traces_batched_cached(model, params, puzzles, batch_size, use_sep=use_sep)
     avg_len = np.mean([len(s) for s in sequences])
     print(f"Average sequence length: {avg_len:.1f}")
 
