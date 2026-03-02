@@ -49,6 +49,7 @@ class TrainConfig:
     no_pos_emb: bool = False
     dtype: str = "float32"
     schedule_type: str = "linear"  # or "cosine"
+    schedule_frac: float = 1.0     # fraction of total_steps over which schedule runs; remainder holds at end_value
     loss_mask: str = "after_clues"  # "all" or "after_clues"
 
 
@@ -124,11 +125,12 @@ def parse_args() -> TrainConfig:
 # ---------------------------------------------------------------------------
 
 def make_schedule(cfg: TrainConfig, total_steps: int, warmup_steps: int, schedule_type: str = "linear") -> optax.Schedule:
+    schedule_steps = max(warmup_steps + 1, round(total_steps * cfg.schedule_frac))
     if schedule_type == "linear":
         return optax.linear_onecycle_schedule(
-            transition_steps=total_steps,
+            transition_steps=schedule_steps,
             peak_value=cfg.lr,
-            pct_start=warmup_steps / max(total_steps, 1),
+            pct_start=warmup_steps / max(schedule_steps, 1),
             div_factor=10.0,
             final_div_factor=100.0,
             )
@@ -137,8 +139,8 @@ def make_schedule(cfg: TrainConfig, total_steps: int, warmup_steps: int, schedul
             init_value=0.0,
             peak_value=cfg.lr,
             warmup_steps=warmup_steps,
-            decay_steps=max(total_steps, warmup_steps + 1),
-            end_value=cfg.lr * 0.1,
+            decay_steps=schedule_steps,
+            end_value=cfg.lr * 0.01,
         )
     else:
         raise ValueError(f"Unsupported schedule type: {schedule_type}")
@@ -254,6 +256,9 @@ def train(cfg: TrainConfig):
         ckpt_every = 0
         total_steps = total_steps_ideal
     print(f"Token budget: {cfg.num_tokens:,} tokens -> {total_steps:,} steps ({tokens_per_step} tok/step)", flush=True)
+    schedule_steps = max(warmup_steps + 1, round(total_steps * cfg.schedule_frac))
+    frac_str = f" (schedule_frac={cfg.schedule_frac} -> {schedule_steps} steps)" if cfg.schedule_frac < 1.0 else ""
+    print(f"LR schedule: {cfg.schedule_type}{frac_str}", flush=True)
     if ckpt_every > 0:
         print(f"Checkpointing every {ckpt_every} steps ({cfg.num_checkpoints} checkpoints)", flush=True)
 
