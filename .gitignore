@@ -25,5 +25,8 @@ solver
 # Ignore everything about sudoku dataset generation
 dataset/
 
+# Separate untracked space
+playground/
+
 # Local experiment overrides (Colab / per-machine, not committed)
 experiments_local.py
