@@ -368,34 +368,54 @@ def generate_probe_dataset(
 ) -> tuple[np.ndarray | None, list[str], list[list[int]], np.ndarray]:
     """Load checkpoint, generate traces, optionally collect activations, and save.
 
+    If cache_path already contains sequences (e.g. from a --traces-only run),
+    autoregressive generation is skipped and activations are collected directly.
     When traces_only=True, skips activation collection and returns None for activations.
     Returns (activations, puzzles, sequences, n_clues).
     """
-    print(f"Loading checkpoint from {ckpt_dir}" + (f" (step {ckpt_step})" if ckpt_step else ""))
-    params, model = load_checkpoint(ckpt_dir, ckpt_step=ckpt_step)
-    print("Model loaded")
+    # Reuse cached traces if present — skip expensive autoregressive generation
+    has_cached_traces = (
+        cache_path is not None
+        and os.path.exists(cache_path)
+        and "sequences" in np.load(cache_path, allow_pickle=False).files
+    )
 
-    puzzles = load_puzzles(traces_path, n_puzzles)
-    print(f"Loaded {len(puzzles)} puzzles")
+    if has_cached_traces:
+        print(f"Found cached traces in {cache_path} — skipping autoregressive generation")
+        _, puzzles, sequences, n_clues = load_probe_dataset(cache_path)
+        if traces_only:
+            return None, puzzles, sequences, n_clues
+    else:
+        print(f"Loading checkpoint from {ckpt_dir}" + (f" (step {ckpt_step})" if ckpt_step else ""))
+        params, model = load_checkpoint(ckpt_dir, ckpt_step=ckpt_step)
+        print("Model loaded")
 
-    # Auto-detect whether the training data used a SEP token
-    _npz = np.load(traces_path, allow_pickle=False)
-    _seq0 = _npz["sequences_test"][0]
-    _nc0 = int(_npz["n_clues_test"][0])
-    use_sep = bool(_nc0 < len(_seq0) and _seq0[_nc0] == SEP_TOKEN)
-    print(f"SEP token: {'yes' if use_sep else 'no'}")
+        puzzles = load_puzzles(traces_path, n_puzzles)
+        print(f"Loaded {len(puzzles)} puzzles")
 
-    print("Generating traces...")
-    traces, sequences = generate_traces_batched_cached(model, params, puzzles, batch_size, use_sep=use_sep)
-    avg_len = np.mean([len(s) for s in sequences])
-    print(f"Average sequence length: {avg_len:.1f}")
+        _npz = np.load(traces_path, allow_pickle=False)
+        _seq0 = _npz["sequences_test"][0]
+        _nc0 = int(_npz["n_clues_test"][0])
+        use_sep = bool(_nc0 < len(_seq0) and _seq0[_nc0] == SEP_TOKEN)
+        print(f"SEP token: {'yes' if use_sep else 'no'}")
 
-    n_clues = derive_n_clues(puzzles)
+        print("Generating traces...")
+        traces, sequences = generate_traces_batched_cached(model, params, puzzles, batch_size, use_sep=use_sep)
+        avg_len = np.mean([len(s) for s in sequences])
+        print(f"Average sequence length: {avg_len:.1f}")
 
-    if traces_only:
-        if cache_path:
-            save_probe_dataset(cache_path, None, puzzles, sequences, compress=compress, n_clues=n_clues)
-        return None, puzzles, sequences, n_clues
+        n_clues = derive_n_clues(puzzles)
+
+        if traces_only:
+            if cache_path:
+                save_probe_dataset(cache_path, None, puzzles, sequences, compress=compress, n_clues=n_clues)
+            return None, puzzles, sequences, n_clues
+
+    # Activation collection — load model now if we reused cached traces
+    if has_cached_traces:
+        print(f"Loading checkpoint from {ckpt_dir}" + (f" (step {ckpt_step})" if ckpt_step else ""))
+        params, model = load_checkpoint(ckpt_dir, ckpt_step=ckpt_step)
+        print("Model loaded")
 
     print("Collecting activations...")
     intermediates_fn = make_intermediates_fn(model)

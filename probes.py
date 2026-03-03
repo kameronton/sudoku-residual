@@ -182,8 +182,12 @@ def plot_all_layers_per_digit(
     from matplotlib.colors import Normalize
 
     n_layers = len(all_per_digit)
-    ncols = min(n_layers, 3)
-    nrows = (n_layers + ncols - 1) // ncols
+    if n_layers == 8:
+        ncols = 4
+        nrows = 2
+    else:
+        ncols = min(n_layers, 3)
+        nrows = (n_layers + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows),
                              gridspec_kw={"wspace": 0.1, "hspace": 0.1})
     if n_layers == 1:
@@ -251,7 +255,114 @@ def plot_all_layers_per_digit(
 
 
 def metric_name_for_mode(mode: str) -> str:
-    return "F1" if mode == "candidates" else "Accuracy"
+    return "F1" if mode in ("candidates", "structure") else "Accuracy"
+
+
+def build_structure_targets(puzzles: list[str], subtype: str, idx: int) -> np.ndarray:
+    """Build (n, 9) binary targets: target[i, d] = 1 if digit d+1 is present in the substructure."""
+    n = len(puzzles)
+    targets = np.zeros((n, 9))
+    for i, puzzle in enumerate(puzzles):
+        if subtype == "row":
+            cells = puzzle[idx * 9:(idx + 1) * 9]
+        elif subtype == "col":
+            cells = [puzzle[r * 9 + idx] for r in range(9)]
+        else:  # box
+            br, bc = (idx // 3) * 3, (idx % 3) * 3
+            cells = [puzzle[(br + dr) * 9 + (bc + dc)] for dr in range(3) for dc in range(3)]
+        for ch in cells:
+            if ch in "123456789":
+                targets[i, int(ch) - 1] = 1.0
+    return targets
+
+
+def probe_structure(acts: np.ndarray, puzzles: list[str], subtype: str, idx: int) -> float:
+    """Fit and evaluate a structure probe for one row/col/box. Returns mean F1 across 9 digits."""
+    targets = build_structure_targets(puzzles, subtype, idx)
+    indices = np.arange(len(puzzles))
+    idx_train, idx_test = train_test_split(indices, test_size=0.2, random_state=42)
+    ridge = fit_probe(acts[idx_train], targets[idx_train])
+    preds = (ridge.predict(acts[idx_test]) > 0.5).astype(int)
+    per_digit = [f1_score(targets[idx_test, d], preds[:, d], zero_division=0.0) for d in range(9)]
+    return float(np.mean(per_digit))
+
+
+def run_structure_probe_loop(
+    activations: np.ndarray,
+    probe_grids: list[str],
+    probe_positions: list[int],
+) -> dict[int, dict[str, list[float]]]:
+    """Run structure probing: 27 probes per layer (9 rows, 9 cols, 9 boxes).
+
+    Returns dict[layer, dict[subtype, list[float]]] where each list has 9 F1 scores.
+    """
+    n_layers = activations.shape[1]
+    all_scores = {}
+    for layer in range(n_layers):
+        acts = get_activations_at_positions(activations, probe_positions, layer)
+        print(f"\nLayer {layer}, activations shape: {acts.shape}")
+        layer_scores: dict[str, list[float]] = {"row": [], "col": [], "box": []}
+        for subtype in ("row", "col", "box"):
+            for idx in range(9):
+                print(f"  Layer {layer} | {subtype} {idx}/9", end="\r")
+                layer_scores[subtype].append(probe_structure(acts, probe_grids, subtype, idx))
+        for subtype in ("row", "col", "box"):
+            avg = np.nanmean(layer_scores[subtype])
+            print(f"  Layer {layer} | Mean F1 ({subtype}): {avg:.3f}")
+        all_scores[layer] = layer_scores
+    return all_scores
+
+
+def plot_structure(
+    all_scores: dict[int, dict[str, list[float]]],
+    output_path: str = "probe_structure.png",
+    show: bool = True,
+):
+    """Plot structure probe F1: n_layers rows x 3 cols (row/col/box substructures).
+
+    Row/col subtypes are shown as a 1x9 horizontal heatmap strip.
+    Box subtype is shown as a 3x3 heatmap matching the Sudoku grid layout.
+    """
+    import matplotlib.pyplot as plt
+
+    n_layers = len(all_scores)
+    subtypes = ["row", "col", "box"]
+    col_titles = ["Rows", "Columns", "Boxes"]
+    fig, axes = plt.subplots(n_layers, 3, figsize=(6.5, 1.5 * n_layers), constrained_layout=True)
+    if n_layers == 1:
+        axes = axes[np.newaxis, :]
+
+    ims = []
+    for layer_idx, (layer, scores) in enumerate(sorted(all_scores.items())):
+        for col_idx, subtype in enumerate(subtypes):
+            ax = axes[layer_idx, col_idx]
+            vals = np.array(scores[subtype])
+            if subtype == "box":
+                data = vals.reshape(3, 3)
+            elif subtype == "row":
+                data = vals.reshape(9, 1)
+            else:  # col
+                data = vals.reshape(1, 9)
+            im = ax.imshow(data, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+            if layer_idx == 0:
+                ims.append(im)
+            for r in range(data.shape[0]):
+                for c in range(data.shape[1]):
+                    ax.text(c, r, f"{data[r, c]:.2f}", ha="center", va="center", fontsize=5)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if layer_idx == 0:
+                ax.set_title(col_titles[col_idx], fontsize=9)
+            if col_idx == 0:
+                ax.set_ylabel(f"L{layer}", fontsize=8, rotation=0, labelpad=20, va="center")
+
+    fig.colorbar(ims[0], ax=axes.ravel().tolist(), shrink=0.5, label="F1", pad=0.02)
+    fig.suptitle("Structure probe F1 (row / col / box)", fontsize=11)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved {output_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
 
 
 def prepare_probe_inputs(
@@ -304,6 +415,15 @@ def build_grid_at_step(sequence: list[int], position: int) -> str:
             r, c, d = decode_fill(tok)
             grid[r * 9 + c] = str(d)
     return "".join(grid)
+
+
+def compute_deltas(activations: np.ndarray) -> np.ndarray:
+    """Replace cumulative activations with per-layer deltas.
+
+    activations: (n_puzzles, n_layers, seq_len, d_model)
+    Returns same shape: delta[0] = acts[0], delta[i] = acts[i] - acts[i-1] for i >= 1.
+    """
+    return np.concatenate([activations[:, :1], np.diff(activations, axis=1)], axis=1)
 
 
 def get_activations_at_positions(activations: np.ndarray, positions: list[int], layer: int) -> np.ndarray:
@@ -387,8 +507,9 @@ def main():
     parser.add_argument("--n_puzzles", type=int, default=6400)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--no-compress", action="store_true", help="Skip compression when saving probe cache")
-    parser.add_argument("--mode", default="state_filled", choices=["filled", "state_filled", "candidates"])
+    parser.add_argument("--mode", default="state_filled", choices=["filled", "state_filled", "candidates", "structure"])
     parser.add_argument("--per-digit", action="store_true", help="Per-digit F1 heatmap (candidates mode only)")
+    parser.add_argument("--use-deltas", action="store_true", help="Probe layer-wise deltas (acts[i] - acts[i-1]) instead of cumulative activations")
     parser.add_argument("--step", type=int, default=0, help="Trace step to probe at (0 = SEP/initial board, 1 = after first fill, ...)")
     parser.add_argument("--filter", choices=["all", "solved", "unsolved"], default="all",
                         help="Filter puzzles for both train and eval")
@@ -429,20 +550,28 @@ def main():
         print("No puzzles remaining after filtering.")
         return
 
-    # --- Probing loop + plot ---
-    all_accuracies, all_per_digit = run_probe_loop(
-        activations, probe_grids, probe_positions, args.mode,
-    )
+    if args.use_deltas:
+        activations = compute_deltas(activations)
 
     output = args.output
     if output == "probe_accuracies.png" and args.step > 0:
         output = f"probe_step{args.step}.png"
+    if args.use_deltas:
+        output = output.replace(".png", "_deltas.png")
 
-    metric = metric_name_for_mode(args.mode)
-    if args.per_digit and all_per_digit:
-        plot_all_layers_per_digit(all_per_digit, output.replace(".png", "_per_digit.png"))
+    # --- Probing loop + plot ---
+    if args.mode == "structure":
+        all_scores = run_structure_probe_loop(activations, probe_grids, probe_positions)
+        plot_structure(all_scores, output)
     else:
-        plot_all_layers(all_accuracies, output, metric_name=metric)
+        all_accuracies, all_per_digit = run_probe_loop(
+            activations, probe_grids, probe_positions, args.mode,
+        )
+        metric = metric_name_for_mode(args.mode)
+        if args.per_digit and all_per_digit:
+            plot_all_layers_per_digit(all_per_digit, output.replace(".png", "_per_digit.png"))
+        else:
+            plot_all_layers(all_accuracies, output, metric_name=metric)
 
 
 if __name__ == "__main__":

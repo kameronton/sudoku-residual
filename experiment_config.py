@@ -51,10 +51,14 @@ def parse_batch_args(argv: list[str] | None = None) -> dict:
         elif argv[i] == "--name" and i + 1 < len(argv):
             result["name"] = argv[i + 1]
             i += 2
-        elif argv[i].startswith("--") and i + 1 < len(argv):
+        elif argv[i].startswith("--") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
             key = argv[i].lstrip("-")
             result["_extra"][key] = argv[i + 1]
             i += 2
+        elif argv[i].startswith("--"):
+            key = argv[i].lstrip("-")
+            result["_extra"][key] = True
+            i += 1
         else:
             i += 1
     return result

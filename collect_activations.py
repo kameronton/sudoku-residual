@@ -47,8 +47,11 @@ def main():
         print(f"\n{'='*60}\n{header}\n{'='*60}")
 
         if os.path.exists(cache_path):
-            print(f"  Skipping (already exists: {cache_path})")
-            continue
+            import numpy as _np
+            if "activations" in _np.load(cache_path, allow_pickle=False).files:
+                print(f"  Skipping (activations already exist: {cache_path})")
+                continue
+            # File exists but contains only traces — fall through to collect activations
 
         generate_probe_dataset(
             ckpt_dir=cfg["ckpt_dir"],
