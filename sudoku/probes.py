@@ -8,10 +8,10 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score
 
-from data import SEP_TOKEN, decode_fill
-from solver import solve
-from evaluate import evaluate_puzzle
-from activations import (
+from sudoku.data import SEP_TOKEN, decode_fill
+from sudoku.solver import solve
+from sudoku.evaluate import evaluate_puzzle
+from sudoku.activations import (
     load_probe_dataset, derive_n_clues, anchor_positions,
     generate_probe_dataset, sequences_to_traces,
 )

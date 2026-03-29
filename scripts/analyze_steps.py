@@ -3,7 +3,7 @@
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-from data import decode_fill, SEP_TOKEN, PAD_TOKEN
+from sudoku.data import decode_fill, SEP_TOKEN, PAD_TOKEN
 
 
 def load_sequences(path: str) -> np.ndarray:

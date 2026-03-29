@@ -9,7 +9,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from solver import solve
+from sudoku.solver import solve
 
 # ---------------------------------------------------------------------------
 # Tokenization

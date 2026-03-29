@@ -11,7 +11,7 @@ Usage:
 import os
 from datetime import datetime
 
-from experiment_config import parse_batch_args, resolve_runs
+from sudoku.experiment_config import parse_batch_args, resolve_runs
 
 
 def main():
@@ -30,8 +30,8 @@ def main():
             print(f"  {name}{step_info}: {cache} [{exists}] -> {output_dir}/eval.txt")
         return
 
-    from activations import load_probe_dataset, derive_n_clues, sequences_to_traces
-    from evaluate import evaluate_traces, summarize_stats
+    from sudoku.activations import load_probe_dataset, derive_n_clues, sequences_to_traces
+    from sudoku.evaluate import evaluate_traces, summarize_stats
 
     for i, (name, _, ckpt_step, output_dir) in enumerate(runs):
         cache_path = f"{output_dir}/activations.npz"

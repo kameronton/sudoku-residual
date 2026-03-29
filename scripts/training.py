@@ -17,9 +17,9 @@ import orbax.checkpoint as ocp
 from flax.training import train_state
 from tqdm import tqdm
 
-from data import PAD_TOKEN, SEP_TOKEN, encode_fill, MAX_SEQ_LEN
-from model import GPT2Model, TransformerConfig
-from visualize import print_grid
+from sudoku.data import PAD_TOKEN, SEP_TOKEN, encode_fill, MAX_SEQ_LEN
+from sudoku.model import GPT2Model, TransformerConfig
+from sudoku.visualize import print_grid
 
 
 # ---------------------------------------------------------------------------

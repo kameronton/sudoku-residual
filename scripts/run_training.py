@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 
-from experiment_config import COMMON, parse_batch_args, filter_experiments, experiment_dir
+from sudoku.experiment_config import COMMON, parse_batch_args, filter_experiments, experiment_dir
 
 
 def build_config(name: str, overrides: dict) -> dict:
@@ -25,7 +25,7 @@ def build_config(name: str, overrides: dict) -> dict:
 
 def config_to_args(cfg: dict) -> list[str]:
     """Convert a config dict to CLI args for training.py."""
-    args = ["uv", "run", "python", "training.py"]
+    args = ["uv", "run", "python", "scripts/training.py"]
     for k, v in cfg.items():
         if isinstance(v, bool):
             if v:

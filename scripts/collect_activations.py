@@ -12,7 +12,7 @@ Usage:
 
 import os
 
-from experiment_config import parse_batch_args, resolve_runs
+from sudoku.experiment_config import parse_batch_args, resolve_runs
 
 DEFAULT_N_PUZZLES = 6400
 DEFAULT_BATCH_SIZE = 64
@@ -36,7 +36,7 @@ def main():
         return
 
     # Import here so --dry-run works without JAX installed
-    from activations import generate_probe_dataset
+    from sudoku.activations import generate_probe_dataset
 
     for i, (name, cfg, ckpt_step, output_dir) in enumerate(runs):
         cache_path = f"{output_dir}/activations.npz"

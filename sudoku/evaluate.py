@@ -4,8 +4,8 @@ import argparse
 
 import numpy as np
 
-from solver import solve
-from visualize import print_grid
+from sudoku.solver import solve
+from sudoku.visualize import print_grid
 
 
 def _is_consistent(grid: list[str], r: int, c: int, d: int) -> bool:

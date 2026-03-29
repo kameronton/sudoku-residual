@@ -12,7 +12,7 @@ Usage:
 
 import os
 
-from experiment_config import parse_batch_args, resolve_runs
+from sudoku.experiment_config import parse_batch_args, resolve_runs
 
 
 def main():
@@ -36,8 +36,8 @@ def main():
         return
 
     # Import heavy deps only when actually running
-    from activations import load_probe_dataset, derive_n_clues
-    from probes import (
+    from sudoku.activations import load_probe_dataset, derive_n_clues
+    from sudoku.probes import (
         prepare_probe_inputs, run_probe_loop, run_structure_probe_loop, compute_deltas,
         plot_all_layers, plot_all_layers_per_digit, plot_structure, metric_name_for_mode,
     )

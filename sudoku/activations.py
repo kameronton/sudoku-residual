@@ -9,8 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 
-from data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
-from model import GPT2Model, TransformerConfig, init_kv_cache
+from sudoku.data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
+from sudoku.model import GPT2Model, TransformerConfig, init_kv_cache
 
 # Module-level cache: id(model) -> (_prefill, _decode_scan).
 # Keyed by model identity so compiled XLA programs survive across multiple

@@ -14,7 +14,7 @@ try:
     from experiments_local import COMMON, EXPERIMENTS
     print("experiment_config: loaded from experiments_local.py", flush=True)
 except ImportError:
-    from default_experiments import COMMON, EXPERIMENTS
+    from sudoku.default_experiments import COMMON, EXPERIMENTS
 
 
 RESULTS_DIR = "results"
