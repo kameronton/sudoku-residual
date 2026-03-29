@@ -112,9 +112,6 @@ def collate_batch(dataset: SudokuDataset, indices: Sequence[int]) -> np.ndarray:
 # Preprocessing / prepare
 # ---------------------------------------------------------------------------
 
-_SOLVER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solver")
-
-
 def _read_csv(data_path: str, max_puzzles: int | None = None):
     """Read puzzle/solution pairs from CSV."""
     puzzles, solutions = [], []
@@ -128,11 +125,11 @@ def _read_csv(data_path: str, max_puzzles: int | None = None):
     return puzzles, solutions
 
 
-def _traces_from_c_solver(puzzles, solutions):
+def _traces_from_c_solver(puzzles, solutions, solver_bin):
     """Run the C solver binary, return list of traces (None for failures)."""
     input_bytes = "\n".join(puzzles).encode()
     proc = subprocess.run(
-        [_SOLVER_BIN], input=input_bytes, stdout=subprocess.PIPE, check=True,
+        [solver_bin, "solve"], input=input_bytes, stdout=subprocess.PIPE, check=True,
     )
     buf = proc.stdout
     traces = []
@@ -199,7 +196,8 @@ def _save_splits(
 
 
 def prepare_data(
-    data_path: str, trace_mode: str, output: str, max_puzzles: int | None = None,
+    data_path: str, trace_mode: str, output: str, solver_bin: str | None = None,
+    max_puzzles: int | None = None,
     no_sep_token: bool = True, randomize_clues: bool = False,
     train_frac: float = 0.90, val_frac: float = 0.05, test_frac: float = 0.05,
     seed: int = 42,
@@ -207,11 +205,12 @@ def prepare_data(
     puzzles, solutions = _read_csv(data_path, max_puzzles)
 
     # Generate traces
-    if trace_mode == "constraint" and os.path.isfile(_SOLVER_BIN):
-        print(f"Using C solver: {_SOLVER_BIN}")
-        traces = _traces_from_c_solver(puzzles, solutions)
-    elif trace_mode == "constraint":
-        traces = _traces_from_python_solver(puzzles, solutions)
+    if trace_mode == "constraint":
+        if solver_bin and os.path.isfile(solver_bin):
+            print(f"Using C solver: {solver_bin}")
+            traces = _traces_from_c_solver(puzzles, solutions, solver_bin)
+        else:
+            traces = _traces_from_python_solver(puzzles, solutions)
     else:
         traces = [random_trace(p, s) for p, s in zip(puzzles, solutions)]
 
@@ -268,6 +267,7 @@ if __name__ == "__main__":
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--data_path", default="sudoku-3m.csv")
     parser.add_argument("--trace_mode", default="random", choices=["random", "constraint"])
+    parser.add_argument("--solver_bin", required=True, help="Path to the sudoku solver binary")
     parser.add_argument("--output", default="traces_random.npz")
     parser.add_argument("--max_puzzles", type=int, default=None)
     parser.add_argument("--randomize_clues", action="store_true")
@@ -279,7 +279,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.prepare:
         prepare_data(
-            args.data_path, args.trace_mode, args.output, args.max_puzzles,
+            args.data_path, args.trace_mode, args.output,
+            solver_bin=args.solver_bin, max_puzzles=args.max_puzzles,
             no_sep_token=not args.sep_token, randomize_clues=args.randomize_clues,
             train_frac=args.train_frac, val_frac=args.val_frac,
             test_frac=args.test_frac, seed=args.seed,
