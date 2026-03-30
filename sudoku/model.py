@@ -13,8 +13,8 @@ class TransformerConfig:
     n_heads: int = 4
     d_model: int = 128
     d_ff: int = 512
-    vocab_size: int = 731
-    max_seq_len: int = 82 # Since there are only 81 cells, we can use a shorter sequence length, even if we'll allow to backtrack eventually
+    vocab_size: int = 731   # standard vocab; BT format uses 734 — always set explicitly
+    max_seq_len: int = 82   # standard format; BT format uses longer sequences — always set explicitly
     use_pos_emb: bool = True
     dtype: str = "float32"  # "float32", "bfloat16", or "float16"
 

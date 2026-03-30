@@ -17,7 +17,8 @@ import orbax.checkpoint as ocp
 from flax.training import train_state
 from tqdm import tqdm
 
-from sudoku.data import PAD_TOKEN, SEP_TOKEN, encode_fill, MAX_SEQ_LEN
+from sudoku.data import PAD_TOKEN, SEP_TOKEN, encode_fill, MAX_SEQ_LEN, VOCAB_SIZE
+from sudoku.data_bt import VOCAB_SIZE_BT
 from sudoku.model import GPT2Model, TransformerConfig
 from sudoku.visualize import print_grid
 
@@ -148,29 +149,29 @@ def make_schedule(cfg: TrainConfig, total_steps: int, warmup_steps: int, schedul
 
 def create_train_state(rng, cfg: TrainConfig, model_cfg: TransformerConfig, total_steps: int, warmup_steps: int):
     model = GPT2Model(model_cfg)
-    dummy = jnp.ones((1, 82), dtype=jnp.int32)
+    dummy = jnp.ones((1, model_cfg.max_seq_len), dtype=jnp.int32)
     params = model.init(rng, dummy)["params"]
     schedule = make_schedule(cfg, total_steps, warmup_steps, schedule_type=cfg.schedule_type)
     tx = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-def _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep):
+def _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep, pad_token):
     """Build per-token loss mask based on masking mode."""
     positions = jnp.arange(targets.shape[1])[None, :]  # (1, T-1)
     if loss_mask == "all":
-        return (targets != PAD_TOKEN).astype(jnp.float32)
+        return (targets != pad_token).astype(jnp.float32)
     else:  # "after_clues"
         boundary = n_clues_batch[:, None] if has_sep else (n_clues_batch[:, None] - 1)
-        return ((positions >= boundary) & (targets != PAD_TOKEN)).astype(jnp.float32)
+        return ((positions >= boundary) & (targets != pad_token)).astype(jnp.float32)
 
 
-@partial(jax.jit, static_argnames=("loss_mask", "has_sep"), donate_argnums=(0,))
-def train_step(state, batch, n_clues_batch, loss_mask, has_sep):
+@partial(jax.jit, static_argnames=("loss_mask", "has_sep", "pad_token"), donate_argnums=(0,))
+def train_step(state, batch, n_clues_batch, loss_mask, has_sep, pad_token):
     """Single training step. batch is (B, T) int32 tokens."""
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
-    mask = _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep)
+    mask = _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep, pad_token)
 
     def loss_fn(params):
         logits = state.apply_fn({"params": params}, inputs)
@@ -188,11 +189,11 @@ def train_step(state, batch, n_clues_batch, loss_mask, has_sep):
     return state, loss
 
 
-@partial(jax.jit, static_argnames=("loss_mask", "has_sep"))
-def eval_step(state, batch, n_clues_batch, loss_mask, has_sep):
+@partial(jax.jit, static_argnames=("loss_mask", "has_sep", "pad_token"))
+def eval_step(state, batch, n_clues_batch, loss_mask, has_sep, pad_token):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
-    mask = _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep)
+    mask = _build_loss_mask(targets, n_clues_batch, loss_mask, has_sep, pad_token)
     logits = state.apply_fn({"params": state.params}, inputs)
     per_token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
     masked_loss = per_token_loss * mask
@@ -211,6 +212,9 @@ def train(cfg: TrainConfig):
     npz = np.load(cfg.traces_path)
     raw_train = npz["sequences_train"]
     raw_val = npz["sequences_val"]
+    # Detect vocab size and pad token from NPZ metadata (BT format stores vocab_size=734)
+    vocab_size = int(npz["vocab_size"]) if "vocab_size" in npz else VOCAB_SIZE
+    pad_token  = PAD_TOKEN  # 730 in both standard and BT formats
     # Load n_clues metadata (fallback: derive from SEP position)
     if "n_clues_train" in npz:
         nc_train = npz["n_clues_train"]
@@ -234,6 +238,7 @@ def train(cfg: TrainConfig):
     device_nc_val = jax.device_put(jnp.array(nc_val, dtype=jnp.int32))
     del raw_train, raw_val, nc_train, nc_val
     print(f"Dataset: {n_train} train, {n_val} val (preloaded to {jax.devices()[0].platform})", flush=True)
+    print(f"Vocab size: {vocab_size} (pad_token={pad_token})", flush=True)
     print(f"Loss mask: {cfg.loss_mask} (has_sep={has_sep})", flush=True)
     print(f"Max sequence length: {max_seq_len}", flush=True)
 
@@ -268,6 +273,7 @@ def train(cfg: TrainConfig):
         n_heads=cfg.n_heads,
         d_model=cfg.d_model,
         d_ff=cfg.d_ff,
+        vocab_size=vocab_size,
         use_pos_emb=not cfg.no_pos_emb,
         max_seq_len=max_seq_len,
         dtype=cfg.dtype,
@@ -342,14 +348,14 @@ def train(cfg: TrainConfig):
                 vend = min(vstart + cfg.batch_size, n_val)
                 vb = device_val[vstart:vend]
                 vnc = device_nc_val[vstart:vend]
-                vl = eval_step(state, vb, vnc, cfg.loss_mask, has_sep)
+                vl = eval_step(state, vb, vnc, cfg.loss_mask, has_sep, pad_token)
                 val_losses.append(float(vl))
         else:
             for _ in range(min(10, max(1, n_val // cfg.batch_size))):
                 vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
                 vb = device_val[vi]
                 vnc = device_nc_val[vi]
-                vl = eval_step(state, vb, vnc, cfg.loss_mask, has_sep)
+                vl = eval_step(state, vb, vnc, cfg.loss_mask, has_sep, pad_token)
                 val_losses.append(float(vl))
         return float(np.mean(val_losses))
 
@@ -364,7 +370,7 @@ def train(cfg: TrainConfig):
             batch = device_train[batch_idx]
             nc_batch = device_nc_train[batch_idx]
 
-            state, loss = train_step(state, batch, nc_batch, cfg.loss_mask, has_sep)
+            state, loss = train_step(state, batch, nc_batch, cfg.loss_mask, has_sep, pad_token)
             step += 1
             logger.total_tokens += tokens_per_step
             pbar.update(tokens_per_step)
