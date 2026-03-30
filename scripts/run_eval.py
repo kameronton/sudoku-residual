@@ -30,8 +30,8 @@ def main():
             print(f"  {name}{step_info}: {cache} [{exists}] -> {output_dir}/eval.txt")
         return
 
-    from sudoku.activations import load_probe_dataset, derive_n_clues, sequences_to_traces
-    from sudoku.evaluate import evaluate_traces, summarize_stats
+    from sudoku.activations import load_probe_dataset, derive_n_clues
+    from sudoku.evaluate import evaluate_sequences, summarize_stats
 
     for i, (name, _, ckpt_step, output_dir) in enumerate(runs):
         cache_path = f"{output_dir}/activations.npz"
@@ -50,8 +50,7 @@ def main():
         if n_clues is None:
             n_clues = derive_n_clues(puzzles)
 
-        traces = sequences_to_traces(sequences, n_clues)
-        all_stats = evaluate_traces(puzzles, traces)
+        all_stats = evaluate_sequences(puzzles, sequences, n_clues)
 
         summary = summarize_stats(all_stats)
         print(summary)

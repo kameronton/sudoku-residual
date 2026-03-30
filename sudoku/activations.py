@@ -10,6 +10,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 
 from sudoku.data import SEP_TOKEN, PAD_TOKEN, MAX_SEQ_LEN, decode_fill, encode_fill
+from sudoku.data_bt import SUCCESS_TOKEN, PUSH_TOKEN, POP_TOKEN
 from sudoku.model import GPT2Model, TransformerConfig, init_kv_cache
 
 # Module-level cache: id(model) -> (_prefill, _decode_scan).
@@ -95,12 +96,15 @@ def generate_traces_batched_cached(
             return logits, new_cache
 
         @functools.partial(jax.jit, static_argnames=("prefill_len", "n_decode"))
-        def _decode_scan(params, sequences, cache, done_mask, steps_taken, max_empties,
+        def _decode_scan(params, sequences, cache, done_mask, steps_taken,
                          prefill_len, n_decode):
             """Decode n_decode-1 steps via lax.scan — one XLA dispatch per batch.
 
             prefill_len and n_decode are static so they are constant-folded.
             One compilation per unique prefill_len (~18 for clue counts 17-35).
+
+            Unified for standard and BT: writes all non-PAD tokens (fill + control)
+            to the buffer. Stops on PAD_TOKEN (730) or SUCCESS_TOKEN (733).
             """
             def body(carry, step_i):
                 sequences, cache, done_mask, steps_taken = carry
@@ -111,17 +115,18 @@ def generate_traces_batched_cached(
                     {"params": params}, input_token, cache=cache, cache_index=pos - 1,
                 )
                 next_token = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
-                valid = (next_token >= 0) & (next_token <= 728)
+                is_pad = (next_token == PAD_TOKEN)
+                is_success = (next_token == SUCCESS_TOKEN)
                 active = ~done_mask
-                update_mask = active & valid
+                write_mask = active & ~is_pad
                 new_col = jnp.where(
-                    update_mask[:, None],
+                    write_mask[:, None],
                     next_token[:, None],
                     jax.lax.dynamic_slice(sequences, (0, pos), (bs, 1)),
                 )
                 sequences = jax.lax.dynamic_update_slice(sequences, new_col, (0, pos))
-                steps_taken = steps_taken + update_mask.astype(jnp.int32)
-                done_mask = done_mask | (active & ~valid) | (steps_taken >= max_empties)
+                steps_taken = steps_taken + write_mask.astype(jnp.int32)
+                done_mask = done_mask | (active & (is_pad | is_success))
                 return (sequences, cache, done_mask, steps_taken), None
 
             (sequences, _, done_mask, steps_taken), _ = jax.lax.scan(
@@ -143,7 +148,7 @@ def generate_traces_batched_cached(
     t_start = time.perf_counter()
 
     for group_idx, (prefill_len, group) in enumerate(groups.items()):
-        n_decode = MAX_SEQ_LEN - prefill_len
+        n_decode = cfg.max_seq_len - prefill_len
         compile_note = "  (first call — XLA will compile)" if group_idx == 0 else ""
         print(f"  Group {group_idx+1}/{n_groups}: prefill_len={prefill_len}, {len(group)} puzzles{compile_note}", flush=True)
 
@@ -161,13 +166,8 @@ def generate_traces_batched_cached(
             token_lists = [encode_clues(p, randomize_order=True, use_sep=use_sep) for _, p in batch]
             prefill_tokens = jnp.array(token_lists, dtype=jnp.int32)
 
-            max_empties = jnp.array(
-                [sum(1 for ch in p if ch not in "123456789") for _, p in batch],
-                dtype=jnp.int32,
-            )
-
             # Build full sequence buffer and fill prefill portion
-            sequences = jnp.full((bs, MAX_SEQ_LEN), PAD_TOKEN, dtype=jnp.int32)
+            sequences = jnp.full((bs, cfg.max_seq_len), PAD_TOKEN, dtype=jnp.int32)
             sequences = sequences.at[:, :prefill_len].set(prefill_tokens)
 
             cache = init_kv_cache(cfg, bs)
@@ -177,16 +177,18 @@ def generate_traces_batched_cached(
 
             # First decode token from SEP-position logit (greedy)
             next_token = jnp.argmax(logits[:, prefill_len - 1, :], axis=-1).astype(jnp.int32)
-            valid = (next_token >= 0) & (next_token <= 728)
+            is_pad = (next_token == PAD_TOKEN)
+            is_success = (next_token == SUCCESS_TOKEN)
+            write_mask = ~is_pad
             sequences = sequences.at[:, prefill_len].set(
-                jnp.where(valid, next_token, PAD_TOKEN)
+                jnp.where(write_mask, next_token, PAD_TOKEN)
             )
-            done_mask = ~valid
-            steps_taken = valid.astype(jnp.int32)
+            done_mask = is_pad | is_success
+            steps_taken = write_mask.astype(jnp.int32)
 
             # Decode remaining steps — single XLA dispatch via lax.scan
             sequences, done_mask, steps_taken = _decode_scan(
-                params, sequences, cache, done_mask, steps_taken, max_empties,
+                params, sequences, cache, done_mask, steps_taken,
                 prefill_len, n_decode,
             )
 
@@ -200,13 +202,22 @@ def generate_traces_batched_cached(
             for i in range(actual_bs):
                 orig_idx = batch[i][0]
                 end_pos = prefill_len + int(steps_taken_np[i])
-                trace = []
-                for pos in range(prefill_len, end_pos):
-                    token = int(sequences_np[i, pos])
-                    if 0 <= token <= 728:
-                        r, c, d = decode_fill(token)
-                        trace.append((r, c, d))
-                all_traces[orig_idx] = trace
+                raw_tokens = sequences_np[i, prefill_len:end_pos].tolist()
+                # Simulate push/pop stack to get final board fills
+                grid: dict[int, tuple[int, int, int]] = {}
+                stack: list[dict[int, tuple[int, int, int]]] = []
+                for tok in raw_tokens:
+                    if tok == PUSH_TOKEN:
+                        stack.append(dict(grid))
+                    elif tok == POP_TOKEN:
+                        if stack:
+                            grid = stack.pop()
+                    elif tok == SUCCESS_TOKEN:
+                        break
+                    elif 0 <= tok <= 728:
+                        r, c, d = decode_fill(tok)
+                        grid[r * 9 + c] = (r, c, d)
+                all_traces[orig_idx] = list(grid.values())
                 all_sequences[orig_idx] = sequences_np[i, :end_pos].tolist()
 
             processed += actual_bs

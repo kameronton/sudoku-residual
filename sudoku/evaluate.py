@@ -4,6 +4,8 @@ import argparse
 
 import numpy as np
 
+from sudoku.data import SEP_TOKEN, decode_fill
+from sudoku.data_bt import PUSH_TOKEN, POP_TOKEN, SUCCESS_TOKEN
 from sudoku.solver import solve
 from sudoku.visualize import print_grid
 
@@ -111,6 +113,92 @@ def evaluate_traces(
     return all_stats
 
 
+def evaluate_sequence(
+    tokens_after_boundary: list[int],
+    puzzle: str,
+    solution: str,
+) -> dict:
+    """Replay token sequence with push/pop stack, check correctness after each fill.
+
+    Works for both standard (no PUSH/POP) and BT (with PUSH/POP) sequences.
+    For standard sequences the stack simulation is a no-op.
+
+    Returns dict with: solved, cell_accuracy, n_correct, n_empties, unmatched_pops.
+    """
+    grid = list(puzzle)
+    stack: list[list[str]] = []
+    unmatched_pops = 0
+    n_empties = sum(1 for ch in puzzle if ch not in "123456789")
+
+    for tok in tokens_after_boundary:
+        if tok == PUSH_TOKEN:
+            stack.append(grid[:])
+        elif tok == POP_TOKEN:
+            if stack:
+                grid = stack.pop()
+            else:
+                unmatched_pops += 1
+        elif tok == SUCCESS_TOKEN:
+            break
+        elif 0 <= tok <= 728:
+            r, c, d = decode_fill(tok)
+            grid[r * 9 + c] = str(d)
+            if "".join(grid) == solution:
+                return {
+                    "solved": True,
+                    "cell_accuracy": 1.0,
+                    "n_empties": n_empties,
+                    "n_correct": n_empties,
+                    "unmatched_pops": unmatched_pops,
+                }
+
+    n_correct = sum(
+        1 for i in range(81)
+        if puzzle[i] not in "123456789" and grid[i] == solution[i]
+    )
+    return {
+        "solved": False,
+        "cell_accuracy": n_correct / n_empties if n_empties > 0 else 1.0,
+        "n_empties": n_empties,
+        "n_correct": n_correct,
+        "unmatched_pops": unmatched_pops,
+    }
+
+
+def evaluate_sequences(
+    puzzles: list[str],
+    sequences: list[list[int]],
+    n_clues: np.ndarray,
+    quiet: bool = True,
+) -> list[dict]:
+    """Evaluate generated sequences with stack simulation.
+
+    Works for both standard and BT sequences. Solves each puzzle for ground
+    truth internally.
+    """
+    all_stats = []
+    for i, (puzzle, seq) in enumerate(zip(puzzles, sequences)):
+        result = solve(puzzle)
+        if result is None:
+            raise ValueError(f"Solver failed: {puzzle[:20]}...")
+        solution = result[0]
+
+        nc = int(n_clues[i])
+        start = nc + 1 if nc < len(seq) and seq[nc] == SEP_TOKEN else nc
+        tokens_after = seq[start:]
+
+        stats = evaluate_sequence(tokens_after, puzzle, solution)
+        all_stats.append(stats)
+
+        if not quiet:
+            print(
+                f"Puzzle {i+1}: solved={stats['solved']}  "
+                f"acc={stats['cell_accuracy']:.1%}  "
+                f"pops={stats['unmatched_pops']}"
+            )
+    return all_stats
+
+
 def first_inconsistent_cell(
     trace: list[tuple[int, int, int]], puzzle: str,
 ) -> tuple[int, int, int] | None:
@@ -182,28 +270,41 @@ def plot_first_mistake_heatmap(
 
 
 def summarize_stats(all_stats: list[dict]) -> str:
-    """Format aggregate evaluation statistics as a string."""
+    """Format aggregate evaluation statistics as a string.
+
+    Handles both old-style stats (from evaluate_puzzle) and new-style stats
+    (from evaluate_sequence).
+    """
     n = len(all_stats)
     avg_acc = np.mean([s["cell_accuracy"] for s in all_stats])
-    n_solved = sum(s["puzzle_solved"] for s in all_stats)
-    avg_correct = np.mean([s["correct"] for s in all_stats])
+    # Support both key names: "solved" (new) and "puzzle_solved" (old)
+    n_solved = sum(s.get("solved", s.get("puzzle_solved", False)) for s in all_stats)
+    avg_correct = np.mean([s.get("n_correct", s.get("correct", 0)) for s in all_stats])
     avg_empties = np.mean([s["n_empties"] for s in all_stats])
-    total_wc = sum(s["wrong_consistent"] for s in all_stats)
-    total_ic = sum(s["inconsistent"] for s in all_stats)
-    total_oc = sum(s["overwrites_clue"] for s in all_stats)
-    total_of = sum(s["overwrites_fill"] for s in all_stats)
-    total_miss = sum(s["missing"] for s in all_stats)
     lines = [
         f"\n{'='*60}",
         f"Results on {n} puzzles:",
         f"  Cell accuracy:     {avg_acc:.1%} ({avg_correct:.1f}/{avg_empties:.1f} avg)",
         f"  Puzzles solved:    {n_solved}/{n} ({n_solved/n:.1%})",
-        f"  Wrong consistent:  {total_wc}",
-        f"  Inconsistent:      {total_ic}",
-        f"  Clue overwrites:   {total_oc}",
-        f"  Fill overwrites:   {total_of}",
-        f"  Missing fills:     {total_miss}",
     ]
+    # Old-style detailed stats
+    if "wrong_consistent" in all_stats[0]:
+        total_wc = sum(s["wrong_consistent"] for s in all_stats)
+        total_ic = sum(s["inconsistent"] for s in all_stats)
+        total_oc = sum(s["overwrites_clue"] for s in all_stats)
+        total_of = sum(s["overwrites_fill"] for s in all_stats)
+        total_miss = sum(s["missing"] for s in all_stats)
+        lines += [
+            f"  Wrong consistent:  {total_wc}",
+            f"  Inconsistent:      {total_ic}",
+            f"  Clue overwrites:   {total_oc}",
+            f"  Fill overwrites:   {total_of}",
+            f"  Missing fills:     {total_miss}",
+        ]
+    # BT diagnostics
+    total_pops = sum(s.get("unmatched_pops", 0) for s in all_stats)
+    if total_pops > 0:
+        lines.append(f"  Unmatched POPs:    {total_pops}")
     return "\n".join(lines)
 
 
@@ -217,18 +318,19 @@ def main():
     parser.add_argument("--output", default=None, help="Output path for plots")
     args = parser.parse_args()
 
-    from activations import load_probe_dataset, derive_n_clues, sequences_to_traces
+    from sudoku.activations import load_probe_dataset, derive_n_clues, sequences_to_traces
 
     _, puzzles, sequences, n_clues = load_probe_dataset(args.cache_path)
     if n_clues is None:
         n_clues = derive_n_clues(puzzles)
-    traces = sequences_to_traces(sequences, n_clues)
 
     if args.n is not None:
         puzzles = puzzles[:args.n]
-        traces = traces[:args.n]
+        sequences = sequences[:args.n]
+        n_clues = n_clues[:args.n]
 
     if args.mistake_map or args.mistake_position:
+        traces = sequences_to_traces(sequences, n_clues)
         positions = []
         steps_from_end = []
         for puzzle, trace in zip(puzzles, traces):
@@ -247,7 +349,7 @@ def main():
             plot_mistake_position_distribution(steps_from_end, args.output or "first_mistake_position.png")
         return
 
-    all_stats = evaluate_traces(puzzles, traces, quiet=args.quiet)
+    all_stats = evaluate_sequences(puzzles, sequences, n_clues, quiet=args.quiet)
     print(summarize_stats(all_stats))
 
 
