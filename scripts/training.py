@@ -52,6 +52,7 @@ class TrainConfig:
     schedule_type: str = "linear"  # or "cosine"
     schedule_frac: float = 1.0     # fraction of total_steps over which schedule runs; remainder holds at end_value
     loss_mask: str = "after_clues"  # "all" or "after_clues"
+    pack_len: int = 0              # >0 enables sequence packing; sets context window length
 
 
 class TrainLogger:
@@ -201,6 +202,138 @@ def eval_step(state, batch, n_clues_batch, loss_mask, has_sep, pad_token):
     return loss
 
 
+# ---------------------------------------------------------------------------
+# Sequence packing utilities
+# ---------------------------------------------------------------------------
+
+def pack_sequences(seqs, n_clues_arr, pack_len, pad_token):
+    """Greedily pack variable-length sequences into fixed-length rows.
+
+    Args:
+        seqs:        (N, orig_seq_len) int array, padded with pad_token
+        n_clues_arr: (N,) int32 — number of clue tokens per sequence
+        pack_len:    target row length
+        pad_token:   padding token id
+
+    Returns four (M, pack_len) arrays:
+        packed_seqs  — same dtype as seqs
+        positions    — int32, local position within document (resets per doc)
+        is_trace     — bool, True for tokens that should be predicted as targets
+        doc_ids      — int32, document index per position; -1 for padding slots
+    """
+    N = seqs.shape[0]
+    # Actual lengths: count non-pad tokens (padding is always a suffix)
+    seq_lens = (seqs != pad_token).sum(axis=1).astype(np.int32)
+
+    rows_packed   = []
+    rows_positions = []
+    rows_is_trace  = []
+    rows_doc_ids   = []
+
+    def new_row():
+        return (
+            np.full(pack_len, pad_token, dtype=seqs.dtype),
+            np.zeros(pack_len, dtype=np.int32),
+            np.zeros(pack_len, dtype=bool),
+            np.full(pack_len, -1, dtype=np.int32),
+        )
+
+    pack, pos_arr, is_trace_arr, doc_ids_arr = new_row()
+    cursor = 0
+    doc_id = 0
+
+    for i in range(N):
+        L = int(seq_lens[i])
+        if L == 0:
+            continue
+        if cursor + L > pack_len:
+            rows_packed.append(pack)
+            rows_positions.append(pos_arr)
+            rows_is_trace.append(is_trace_arr)
+            rows_doc_ids.append(doc_ids_arr)
+            pack, pos_arr, is_trace_arr, doc_ids_arr = new_row()
+            cursor = 0
+        local_pos = np.arange(L, dtype=np.int32)
+        pack[cursor:cursor + L]       = seqs[i, :L]
+        pos_arr[cursor:cursor + L]    = local_pos
+        # END_CLUES is at index n_clues; trace starts at n_clues+1
+        is_trace_arr[cursor:cursor + L] = local_pos > n_clues_arr[i]
+        doc_ids_arr[cursor:cursor + L]  = doc_id
+        cursor += L
+        doc_id += 1
+
+    if cursor > 0:
+        rows_packed.append(pack)
+        rows_positions.append(pos_arr)
+        rows_is_trace.append(is_trace_arr)
+        rows_doc_ids.append(doc_ids_arr)
+
+    return (
+        np.stack(rows_packed),
+        np.stack(rows_positions),
+        np.stack(rows_is_trace),
+        np.stack(rows_doc_ids),
+    )
+
+
+@jax.jit
+def build_attn_mask(doc_ids):
+    """Build block-diagonal causal attention mask from document IDs.
+
+    Args:
+        doc_ids: (B, T) int32 — document index per position; -1 for padding
+
+    Returns:
+        (B, 1, T, T) bool — True where attention is allowed
+    """
+    same_doc = doc_ids[:, :, None] == doc_ids[:, None, :]    # (B, T, T)
+    T = doc_ids.shape[1]
+    causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+    return (same_doc & causal)[:, None, :, :]                 # (B, 1, T, T)
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def train_step_packed(state, batch, is_trace, attn_mask, positions):
+    """Training step for packed sequences.
+
+    Args:
+        batch:     (B, pack_len) int32
+        is_trace:  (B, pack_len) bool — True for positions that are trace tokens
+        attn_mask: (B, 1, pack_len, pack_len) bool
+        positions: (B, pack_len) int32 — local position within each document
+    """
+    inputs  = batch[:, :-1]
+    targets = batch[:, 1:]
+    mask = is_trace[:, 1:].astype(jnp.float32)  # targets we want to predict
+
+    def loss_fn(params):
+        logits = state.apply_fn(
+            {"params": params}, inputs,
+            attn_mask=attn_mask[:, :, :-1, :-1],
+            positions=positions[:, :-1],
+        )
+        per_token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        return jnp.sum(per_token_loss * mask) / (jnp.sum(mask) + 1e-9)
+
+    loss, grads = jax.value_and_grad(loss_fn)(state.params)
+    state = state.apply_gradients(grads=grads)
+    return state, loss
+
+
+@jax.jit
+def eval_step_packed(state, batch, is_trace, attn_mask, positions):
+    inputs  = batch[:, :-1]
+    targets = batch[:, 1:]
+    mask = is_trace[:, 1:].astype(jnp.float32)
+    logits = state.apply_fn(
+        {"params": state.params}, inputs,
+        attn_mask=attn_mask[:, :, :-1, :-1],
+        positions=positions[:, :-1],
+    )
+    per_token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+    return jnp.sum(per_token_loss * mask) / (jnp.sum(mask) + 1e-9)
+
+
 def train(cfg: TrainConfig):
     # Seed everything
     random.seed(cfg.seed)
@@ -228,23 +361,36 @@ def train(cfg: TrainConfig):
 
     n_train = raw_train.shape[0]
     n_val = raw_val.shape[0]
-    max_seq_len = raw_train.shape[1]
+    orig_seq_len = raw_train.shape[1]
     val_indices = np.arange(n_val)
 
-    # Upload to device — avoids CPU→device transfer every step
-    device_train = jax.device_put(jnp.array(raw_train, dtype=jnp.int32))
-    device_val = jax.device_put(jnp.array(raw_val, dtype=jnp.int32))
-    device_nc_train = jax.device_put(jnp.array(nc_train, dtype=jnp.int32))
-    device_nc_val = jax.device_put(jnp.array(nc_val, dtype=jnp.int32))
-    del raw_train, raw_val, nc_train, nc_val
-    print(f"Dataset: {n_train} train, {n_val} val (preloaded to {jax.devices()[0].platform})", flush=True)
+    packing = cfg.pack_len > 0
+    max_seq_len = cfg.pack_len if packing else orig_seq_len
+
+    if packing:
+        # Keep CPU copies for per-epoch packing; only val goes to device now
+        raw_train_cpu = raw_train.astype(np.int32)
+        nc_train_cpu  = nc_train.astype(np.int32)
+        device_val    = jax.device_put(jnp.array(raw_val, dtype=jnp.int32))
+        device_nc_val = jax.device_put(jnp.array(nc_val, dtype=jnp.int32))
+        del raw_train, raw_val, nc_train, nc_val
+        print(f"Dataset: {n_train} train, {n_val} val (packing enabled, pack_len={cfg.pack_len})", flush=True)
+    else:
+        # Upload to device — avoids CPU→device transfer every step
+        device_train    = jax.device_put(jnp.array(raw_train, dtype=jnp.int32))
+        device_val      = jax.device_put(jnp.array(raw_val,   dtype=jnp.int32))
+        device_nc_train = jax.device_put(jnp.array(nc_train,  dtype=jnp.int32))
+        device_nc_val   = jax.device_put(jnp.array(nc_val,    dtype=jnp.int32))
+        del raw_train, raw_val, nc_train, nc_val
+        print(f"Dataset: {n_train} train, {n_val} val (preloaded to {jax.devices()[0].platform})", flush=True)
     print(f"Vocab size: {vocab_size} (pad_token={pad_token})", flush=True)
     print(f"Loss mask: {cfg.loss_mask} (has_sep={has_sep})", flush=True)
     print(f"Max sequence length: {max_seq_len}", flush=True)
 
     # Compute token budget and steps
     tokens_per_step = cfg.batch_size * (max_seq_len - 1)
-    steps_per_epoch = n_train // cfg.batch_size
+    # For packing, steps_per_epoch is determined after packing each epoch; use a rough estimate here
+    steps_per_epoch = n_train // cfg.batch_size  # overridden each epoch in packing mode
     warmup_steps = cfg.warmup_tokens // tokens_per_step
     total_steps_ideal = cfg.num_tokens // tokens_per_step
     if cfg.num_checkpoints > 0:
@@ -343,72 +489,22 @@ def train(cfg: TrainConfig):
 
     def compute_val_loss():
         val_losses = []
-        if cfg.full_val:
-            for vstart in range(0, n_val, cfg.batch_size):
-                vend = min(vstart + cfg.batch_size, n_val)
-                vb = device_val[vstart:vend]
-                vnc = device_nc_val[vstart:vend]
-                vl = eval_step(state, vb, vnc, cfg.loss_mask, has_sep, pad_token)
-                val_losses.append(float(vl))
-        else:
-            for _ in range(min(10, max(1, n_val // cfg.batch_size))):
+        n_batches = min(10, max(1, n_val // cfg.batch_size))
+        indices = val_indices if cfg.full_val else None
+        vstart_range = range(0, n_val, cfg.batch_size) if cfg.full_val else range(n_batches)
+        for v in vstart_range:
+            if cfg.full_val:
+                vend = min(v + cfg.batch_size, n_val)
+                vi = np.arange(v, vend)
+            else:
                 vi = np.random.choice(val_indices, size=min(cfg.batch_size, n_val), replace=False)
-                vb = device_val[vi]
-                vnc = device_nc_val[vi]
-                vl = eval_step(state, vb, vnc, cfg.loss_mask, has_sep, pad_token)
-                val_losses.append(float(vl))
+            vb  = device_val[vi]
+            vnc = device_nc_val[vi]
+            vl  = eval_step(state, vb, vnc, cfg.loss_mask, has_sep, pad_token)
+            val_losses.append(float(vl))
         return float(np.mean(val_losses))
 
-    step = start_step
-    epoch = 0
-    while step < total_steps:
-        perm = np.random.permutation(n_train)
-        for batch_start in range(0, steps_per_epoch * cfg.batch_size, cfg.batch_size):
-            if step >= total_steps:
-                break
-            batch_idx = perm[batch_start:batch_start + cfg.batch_size]
-            batch = device_train[batch_idx]
-            nc_batch = device_nc_train[batch_idx]
-
-            state, loss = train_step(state, batch, nc_batch, cfg.loss_mask, has_sep, pad_token)
-            step += 1
-            logger.total_tokens += tokens_per_step
-            pbar.update(tokens_per_step)
-
-            if step % cfg.eval_every == 0:
-                train_loss = float(loss)
-                val_loss = compute_val_loss()
-                epoch_float = epoch + (batch_start // cfg.batch_size + 1) / steps_per_epoch
-                logger.log_eval(step, epoch_float, train_loss, val_loss)
-                logger.save()
-                tok_s = logger.tokens_per_sec
-                pbar.set_postfix_str(
-                    f"train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f} | tok/s={tok_s / 1000:.1f}K"
-                )
-                tqdm.write(f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f}")
-
-            if ckpt_every > 0 and step % ckpt_every == 0:
-                ckpt_mgr.save(step, args=ocp.args.Composite(
-                    params=ocp.args.StandardSave(state.params),
-                    opt_state=ocp.args.StandardSave(state.opt_state),
-                    step=ocp.args.JsonSave(int(state.step)),
-                    model_config=ocp.args.JsonSave(dataclasses.asdict(model_cfg)),
-                    train_config=ocp.args.JsonSave(dataclasses.asdict(cfg)),
-                    schedule_config=ocp.args.JsonSave({"total_steps": total_steps, "warmup_steps": warmup_steps}),
-                ))
-                ckpt_mgr.wait_until_finished()
-                logger.log_checkpoint(step)
-                tqdm.write(f"  checkpoint saved at step {step}")
-
-        epoch += 1
-        tqdm.write(f"  epoch {epoch} complete at step {step}")
-
-    pbar.close()
-
-    # Final checkpoint only when no intermediate checkpoints were configured.
-    # When ckpt_every > 0, total_steps is an exact multiple of ckpt_every so
-    # the last in-loop save already fires at step == total_steps.
-    if ckpt_every == 0:
+    def save_checkpoint(step):
         ckpt_mgr.save(step, args=ocp.args.Composite(
             params=ocp.args.StandardSave(state.params),
             opt_state=ocp.args.StandardSave(state.opt_state),
@@ -418,6 +514,110 @@ def train(cfg: TrainConfig):
             schedule_config=ocp.args.JsonSave({"total_steps": total_steps, "warmup_steps": warmup_steps}),
         ))
         ckpt_mgr.wait_until_finished()
+        logger.log_checkpoint(step)
+        tqdm.write(f"  checkpoint saved at step {step}")
+
+    step = start_step
+    epoch = 0
+
+    if packing:
+        # ---------------------------------------------------------------
+        # Packing training loop
+        # ---------------------------------------------------------------
+        while step < total_steps:
+            perm = np.random.permutation(n_train)
+            packed_seqs, packed_pos, packed_is_trace, packed_doc_ids = pack_sequences(
+                raw_train_cpu[perm], nc_train_cpu[perm], cfg.pack_len, pad_token
+            )
+            n_packed = packed_seqs.shape[0]
+            steps_per_epoch = n_packed // cfg.batch_size
+            utilization = float((packed_seqs != pad_token).sum()) / packed_seqs.size
+            tqdm.write(
+                f"  epoch {epoch + 1}: packed {n_train} seqs → {n_packed} rows"
+                f" (utilization={utilization:.1%})"
+            )
+
+            device_packed   = jax.device_put(jnp.array(packed_seqs,      dtype=jnp.int32))
+            device_pos      = jax.device_put(jnp.array(packed_pos,       dtype=jnp.int32))
+            device_is_trace = jax.device_put(jnp.array(packed_is_trace,  dtype=jnp.bool_))
+            device_doc_ids  = jax.device_put(jnp.array(packed_doc_ids,   dtype=jnp.int32))
+
+            for batch_start in range(0, steps_per_epoch * cfg.batch_size, cfg.batch_size):
+                if step >= total_steps:
+                    break
+                bi = np.arange(batch_start, batch_start + cfg.batch_size)
+                batch      = device_packed[bi]
+                is_trace_b = device_is_trace[bi]
+                positions_b = device_pos[bi]
+                doc_ids_b  = device_doc_ids[bi]
+                attn_mask_b = build_attn_mask(doc_ids_b)
+
+                state, loss = train_step_packed(state, batch, is_trace_b, attn_mask_b, positions_b)
+                step += 1
+                logger.total_tokens += tokens_per_step
+                pbar.update(tokens_per_step)
+
+                if step % cfg.eval_every == 0:
+                    train_loss = float(loss)
+                    val_loss = compute_val_loss()
+                    epoch_float = epoch + (batch_start // cfg.batch_size + 1) / steps_per_epoch
+                    logger.log_eval(step, epoch_float, train_loss, val_loss)
+                    logger.save()
+                    tok_s = logger.tokens_per_sec
+                    pbar.set_postfix_str(
+                        f"train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f} | tok/s={tok_s / 1000:.1f}K"
+                    )
+                    tqdm.write(f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f}")
+
+                if ckpt_every > 0 and step % ckpt_every == 0:
+                    save_checkpoint(step)
+
+            epoch += 1
+            tqdm.write(f"  epoch {epoch} complete at step {step}")
+
+    else:
+        # ---------------------------------------------------------------
+        # Standard (non-packing) training loop
+        # ---------------------------------------------------------------
+        while step < total_steps:
+            perm = np.random.permutation(n_train)
+            for batch_start in range(0, steps_per_epoch * cfg.batch_size, cfg.batch_size):
+                if step >= total_steps:
+                    break
+                batch_idx = perm[batch_start:batch_start + cfg.batch_size]
+                batch    = device_train[batch_idx]
+                nc_batch = device_nc_train[batch_idx]
+
+                state, loss = train_step(state, batch, nc_batch, cfg.loss_mask, has_sep, pad_token)
+                step += 1
+                logger.total_tokens += tokens_per_step
+                pbar.update(tokens_per_step)
+
+                if step % cfg.eval_every == 0:
+                    train_loss = float(loss)
+                    val_loss = compute_val_loss()
+                    epoch_float = epoch + (batch_start // cfg.batch_size + 1) / steps_per_epoch
+                    logger.log_eval(step, epoch_float, train_loss, val_loss)
+                    logger.save()
+                    tok_s = logger.tokens_per_sec
+                    pbar.set_postfix_str(
+                        f"train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f} | tok/s={tok_s / 1000:.1f}K"
+                    )
+                    tqdm.write(f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f}")
+
+                if ckpt_every > 0 and step % ckpt_every == 0:
+                    save_checkpoint(step)
+
+            epoch += 1
+            tqdm.write(f"  epoch {epoch} complete at step {step}")
+
+    pbar.close()
+
+    # Final checkpoint only when no intermediate checkpoints were configured.
+    # When ckpt_every > 0, total_steps is an exact multiple of ckpt_every so
+    # the last in-loop save already fires at step == total_steps.
+    if ckpt_every == 0:
+        save_checkpoint(step)
 
     logger.save()
 

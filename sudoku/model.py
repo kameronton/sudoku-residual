@@ -27,7 +27,7 @@ class CausalSelfAttention(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, cache=None, cache_index=None):
+    def __call__(self, x, cache=None, cache_index=None, attn_mask=None):
         cfg = self.config
         B, T, C = x.shape
         head_dim = C // cfg.n_heads
@@ -67,9 +67,12 @@ class CausalSelfAttention(nn.Module):
         scale = head_dim ** -0.5
         attn = (q @ k.transpose(0, 1, 3, 2)) * scale  # (B, nh, T, T)
 
-        # Causal mask
-        mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        attn = jnp.where(mask[None, None, :, :], attn, jnp.finfo(dtype).min)
+        # Causal mask (or custom packed-sequence mask)
+        if attn_mask is not None:
+            attn = jnp.where(attn_mask, attn, jnp.finfo(dtype).min)
+        else:
+            mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+            attn = jnp.where(mask[None, None, :, :], attn, jnp.finfo(dtype).min)
         attn = nn.softmax(attn, axis=-1)
 
         out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, T, C)  # (B, T, C)
@@ -81,7 +84,7 @@ class TransformerBlock(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, cache=None, cache_index=None):
+    def __call__(self, x, cache=None, cache_index=None, attn_mask=None):
         cfg = self.config
         dtype = cfg.jax_dtype
         # Pre-norm: LN -> attention -> residual
@@ -89,7 +92,7 @@ class TransformerBlock(nn.Module):
         if cache is not None:
             h, updated_cache = CausalSelfAttention(cfg)(h, cache=cache, cache_index=cache_index)
         else:
-            h = CausalSelfAttention(cfg)(h)
+            h = CausalSelfAttention(cfg)(h, attn_mask=attn_mask)
             updated_cache = None
         x = x + h
         # Pre-norm: LN -> FFN -> residual
@@ -107,7 +110,8 @@ class GPT2Model(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, tokens, cache=None, cache_index=None, return_intermediates=False):
+    def __call__(self, tokens, cache=None, cache_index=None, return_intermediates=False,
+                 attn_mask=None, positions=None):
         cfg = self.config
         B, T = tokens.shape
 
@@ -115,11 +119,13 @@ class GPT2Model(nn.Module):
         tok_emb = nn.Embed(cfg.vocab_size, cfg.d_model, dtype=dtype, name="token_emb")(tokens)
 
         if cfg.use_pos_emb:
-            if cache_index is not None:
-                positions = jax.lax.dynamic_slice(jnp.arange(cfg.max_seq_len), (cache_index,), (T,))[None, :]
+            if positions is not None:
+                pos_ids = positions  # (B, T) — per-document local positions for packing
+            elif cache_index is not None:
+                pos_ids = jax.lax.dynamic_slice(jnp.arange(cfg.max_seq_len), (cache_index,), (T,))[None, :]
             else:
-                positions = jnp.arange(T)[None, :]
-            pos_emb = nn.Embed(cfg.max_seq_len, cfg.d_model, dtype=dtype, name="pos_emb")(positions)
+                pos_ids = jnp.arange(T)[None, :]
+            pos_emb = nn.Embed(cfg.max_seq_len, cfg.d_model, dtype=dtype, name="pos_emb")(pos_ids)
             x = tok_emb + pos_emb  # (B, T, d_model)
         else:
             x = tok_emb
@@ -132,7 +138,7 @@ class GPT2Model(nn.Module):
                 x, new_cache = TransformerBlock(cfg, name=f"block_{i}")(x, cache=layer_cache, cache_index=cache_index)
                 updated_caches.append(new_cache)
             else:
-                x = TransformerBlock(cfg, name=f"block_{i}")(x)
+                x = TransformerBlock(cfg, name=f"block_{i}")(x, attn_mask=attn_mask)
                 if return_intermediates:
                     intermediates.append(x)
 
