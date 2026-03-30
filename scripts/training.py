@@ -64,6 +64,8 @@ class TrainLogger:
         self.entries: list[dict] = []
         self.checkpoints: list[int] = []
         self.total_tokens: int = 0
+        self.total_meaningful_tokens: int = 0
+        self.total_puzzles: int = 0
         self._t0: float = time.time()
 
     def log_eval(self, step: int, epoch: float, train_loss: float, val_loss: float):
@@ -72,6 +74,8 @@ class TrainLogger:
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "total_puzzles": self.total_puzzles,
+            "total_meaningful_tokens": self.total_meaningful_tokens,
         })
 
     def log_checkpoint(self, step: int):
@@ -90,6 +94,8 @@ class TrainLogger:
         return {
             "total_steps": last.get("step", 0),
             "total_tokens": self.total_tokens,
+            "total_meaningful_tokens": self.total_meaningful_tokens,
+            "total_puzzles": self.total_puzzles,
             "wall_time_s": elapsed,
             "tokens_per_sec": self.tokens_per_sec,
             "final_train_loss": last.get("train_loss"),
@@ -102,6 +108,8 @@ class TrainLogger:
             "entries": self.entries,
             "checkpoints": self.checkpoints,
             "total_tokens": self.total_tokens,
+            "total_meaningful_tokens": self.total_meaningful_tokens,
+            "total_puzzles": self.total_puzzles,
             "summary": self.summary(),
         }
         tmp = self.log_path + ".tmp"
@@ -215,20 +223,25 @@ def pack_sequences(seqs, n_clues_arr, pack_len, pad_token):
         pack_len:    target row length
         pad_token:   padding token id
 
-    Returns four (M, pack_len) arrays:
-        packed_seqs  — same dtype as seqs
-        positions    — int32, local position within document (resets per doc)
-        is_trace     — bool, True for tokens that should be predicted as targets
-        doc_ids      — int32, document index per position; -1 for padding slots
+    Returns six arrays:
+        packed_seqs      (M, pack_len) — same dtype as seqs
+        positions        (M, pack_len) int32 — local position within document
+        is_trace         (M, pack_len) bool  — True for tokens that are prediction targets
+        doc_ids          (M, pack_len) int32 — document index; -1 for padding slots
+        n_docs_per_row   (M,)          int32 — number of documents packed into each row
+        n_trace_per_row  (M,)          int32 — number of trace tokens in each row
     """
     N = seqs.shape[0]
     # Actual lengths: count non-pad tokens (padding is always a suffix)
     seq_lens = (seqs != pad_token).sum(axis=1).astype(np.int32)
+    max_pos = np.arange(pack_len, dtype=np.int32)  # reused for all sequences
 
-    rows_packed   = []
-    rows_positions = []
-    rows_is_trace  = []
-    rows_doc_ids   = []
+    rows_packed      = []
+    rows_positions   = []
+    rows_is_trace    = []
+    rows_doc_ids     = []
+    rows_n_docs      = []
+    rows_n_trace     = []
 
     def new_row():
         return (
@@ -241,6 +254,7 @@ def pack_sequences(seqs, n_clues_arr, pack_len, pad_token):
     pack, pos_arr, is_trace_arr, doc_ids_arr = new_row()
     cursor = 0
     doc_id = 0
+    n_docs_row = 0
 
     for i in range(N):
         L = int(seq_lens[i])
@@ -251,28 +265,36 @@ def pack_sequences(seqs, n_clues_arr, pack_len, pad_token):
             rows_positions.append(pos_arr)
             rows_is_trace.append(is_trace_arr)
             rows_doc_ids.append(doc_ids_arr)
+            rows_n_docs.append(n_docs_row)
+            rows_n_trace.append(int(is_trace_arr.sum()))
             pack, pos_arr, is_trace_arr, doc_ids_arr = new_row()
             cursor = 0
-        local_pos = np.arange(L, dtype=np.int32)
-        pack[cursor:cursor + L]       = seqs[i, :L]
-        pos_arr[cursor:cursor + L]    = local_pos
+            n_docs_row = 0
+        local_pos = max_pos[:L]
+        pack[cursor:cursor + L]         = seqs[i, :L]
+        pos_arr[cursor:cursor + L]      = local_pos
         # END_CLUES is at index n_clues; trace starts at n_clues+1
         is_trace_arr[cursor:cursor + L] = local_pos > n_clues_arr[i]
         doc_ids_arr[cursor:cursor + L]  = doc_id
         cursor += L
         doc_id += 1
+        n_docs_row += 1
 
     if cursor > 0:
         rows_packed.append(pack)
         rows_positions.append(pos_arr)
         rows_is_trace.append(is_trace_arr)
         rows_doc_ids.append(doc_ids_arr)
+        rows_n_docs.append(n_docs_row)
+        rows_n_trace.append(int(is_trace_arr.sum()))
 
     return (
         np.stack(rows_packed),
         np.stack(rows_positions),
         np.stack(rows_is_trace),
         np.stack(rows_doc_ids),
+        np.array(rows_n_docs,  dtype=np.int32),
+        np.array(rows_n_trace, dtype=np.int32),
     )
 
 
@@ -490,7 +512,6 @@ def train(cfg: TrainConfig):
     def compute_val_loss():
         val_losses = []
         n_batches = min(10, max(1, n_val // cfg.batch_size))
-        indices = val_indices if cfg.full_val else None
         vstart_range = range(0, n_val, cfg.batch_size) if cfg.full_val else range(n_batches)
         for v in vstart_range:
             if cfg.full_val:
@@ -526,48 +547,61 @@ def train(cfg: TrainConfig):
         # ---------------------------------------------------------------
         while step < total_steps:
             perm = np.random.permutation(n_train)
-            packed_seqs, packed_pos, packed_is_trace, packed_doc_ids = pack_sequences(
-                raw_train_cpu[perm], nc_train_cpu[perm], cfg.pack_len, pad_token
-            )
+            packed_seqs, packed_pos, packed_is_trace, packed_doc_ids, packed_n_docs, packed_n_trace = \
+                pack_sequences(raw_train_cpu[perm], nc_train_cpu[perm], cfg.pack_len, pad_token)
             n_packed = packed_seqs.shape[0]
             steps_per_epoch = n_packed // cfg.batch_size
-            utilization = float((packed_seqs != pad_token).sum()) / packed_seqs.size
+            utilization = float(packed_n_trace.sum()) / (n_packed * cfg.pack_len)
             tqdm.write(
                 f"  epoch {epoch + 1}: packed {n_train} seqs → {n_packed} rows"
-                f" (utilization={utilization:.1%})"
+                f" ({packed_n_docs.sum():,} puzzles, utilization={utilization:.1%})"
             )
 
-            device_packed   = jax.device_put(jnp.array(packed_seqs,      dtype=jnp.int32))
-            device_pos      = jax.device_put(jnp.array(packed_pos,       dtype=jnp.int32))
-            device_is_trace = jax.device_put(jnp.array(packed_is_trace,  dtype=jnp.bool_))
-            device_doc_ids  = jax.device_put(jnp.array(packed_doc_ids,   dtype=jnp.int32))
+            device_packed   = jax.device_put(jnp.array(packed_seqs,     dtype=jnp.int32))
+            device_pos      = jax.device_put(jnp.array(packed_pos,      dtype=jnp.int32))
+            device_is_trace = jax.device_put(jnp.array(packed_is_trace, dtype=jnp.bool_))
+            device_doc_ids  = jax.device_put(jnp.array(packed_doc_ids,  dtype=jnp.int32))
 
-            for batch_start in range(0, steps_per_epoch * cfg.batch_size, cfg.batch_size):
+            # Pre-build batch plan: list of (row_indices, n_puzzles, n_trace_tokens)
+            row_perm = np.random.permutation(n_packed)
+            epoch_batches = []
+            for bs in range(0, steps_per_epoch * cfg.batch_size, cfg.batch_size):
+                bi = row_perm[bs:bs + cfg.batch_size]
+                epoch_batches.append((bi, int(packed_n_docs[bi].sum()), int(packed_n_trace[bi].sum())))
+
+            for batch_i, (bi, n_puz, n_trace) in enumerate(epoch_batches):
                 if step >= total_steps:
                     break
-                bi = np.arange(batch_start, batch_start + cfg.batch_size)
-                batch      = device_packed[bi]
-                is_trace_b = device_is_trace[bi]
+                batch       = device_packed[bi]
+                is_trace_b  = device_is_trace[bi]
                 positions_b = device_pos[bi]
-                doc_ids_b  = device_doc_ids[bi]
+                doc_ids_b   = device_doc_ids[bi]
                 attn_mask_b = build_attn_mask(doc_ids_b)
 
                 state, loss = train_step_packed(state, batch, is_trace_b, attn_mask_b, positions_b)
                 step += 1
                 logger.total_tokens += tokens_per_step
+                logger.total_meaningful_tokens += n_trace
+                logger.total_puzzles += n_puz
                 pbar.update(tokens_per_step)
 
                 if step % cfg.eval_every == 0:
                     train_loss = float(loss)
                     val_loss = compute_val_loss()
-                    epoch_float = epoch + (batch_start // cfg.batch_size + 1) / steps_per_epoch
+                    epoch_float = epoch + (batch_i + 1) / steps_per_epoch
                     logger.log_eval(step, epoch_float, train_loss, val_loss)
                     logger.save()
                     tok_s = logger.tokens_per_sec
                     pbar.set_postfix_str(
-                        f"train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f} | tok/s={tok_s / 1000:.1f}K"
+                        f"train={train_loss:.4f} | val={val_loss:.4f}"
+                        f" | epoch={epoch_float:.2f} | puz={logger.total_puzzles / 1000:.1f}K"
+                        f" | tok/s={tok_s / 1000:.1f}K"
                     )
-                    tqdm.write(f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f}")
+                    tqdm.write(
+                        f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f}"
+                        f" | epoch={epoch_float:.2f} | puzzles={logger.total_puzzles:,}"
+                        f" | meaningful_tok={logger.total_meaningful_tokens:,}"
+                    )
 
                 if ckpt_every > 0 and step % ckpt_every == 0:
                     save_checkpoint(step)
@@ -591,6 +625,7 @@ def train(cfg: TrainConfig):
                 state, loss = train_step(state, batch, nc_batch, cfg.loss_mask, has_sep, pad_token)
                 step += 1
                 logger.total_tokens += tokens_per_step
+                logger.total_puzzles += cfg.batch_size
                 pbar.update(tokens_per_step)
 
                 if step % cfg.eval_every == 0:
@@ -601,9 +636,14 @@ def train(cfg: TrainConfig):
                     logger.save()
                     tok_s = logger.tokens_per_sec
                     pbar.set_postfix_str(
-                        f"train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f} | tok/s={tok_s / 1000:.1f}K"
+                        f"train={train_loss:.4f} | val={val_loss:.4f}"
+                        f" | epoch={epoch_float:.2f} | puz={logger.total_puzzles / 1000:.1f}K"
+                        f" | tok/s={tok_s / 1000:.1f}K"
                     )
-                    tqdm.write(f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f} | epoch={epoch_float:.2f}")
+                    tqdm.write(
+                        f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f}"
+                        f" | epoch={epoch_float:.2f} | puzzles={logger.total_puzzles:,}"
+                    )
 
                 if ckpt_every > 0 and step % ckpt_every == 0:
                     save_checkpoint(step)
@@ -624,14 +664,19 @@ def train(cfg: TrainConfig):
     # Print summary
     summary = logger.summary()
     print(f"\nTraining complete. Summary:")
-    print(f"  Steps: {summary['total_steps']:,}")
-    print(f"  Tokens: {summary['total_tokens']:,}")
-    print(f"  Wall time: {summary['wall_time_s']:.1f}s")
-    print(f"  Throughput: {summary['tokens_per_sec'] / 1000:.1f}K tok/s")
+    print(f"  Steps:              {summary['total_steps']:,}")
+    print(f"  Tokens (total):     {summary['total_tokens']:,}")
+    if summary['total_meaningful_tokens']:
+        print(f"  Tokens (trace):     {summary['total_meaningful_tokens']:,}"
+              f"  ({100 * summary['total_meaningful_tokens'] / max(summary['total_tokens'], 1):.1f}%)")
+    if summary['total_puzzles']:
+        print(f"  Puzzles seen:       {summary['total_puzzles']:,}")
+    print(f"  Wall time:          {summary['wall_time_s']:.1f}s")
+    print(f"  Throughput:         {summary['tokens_per_sec'] / 1000:.1f}K tok/s")
     if summary['final_train_loss'] is not None:
-        print(f"  Final train loss: {summary['final_train_loss']:.4f}")
+        print(f"  Final train loss:   {summary['final_train_loss']:.4f}")
     if summary['final_val_loss'] is not None:
-        print(f"  Final val loss: {summary['final_val_loss']:.4f}")
+        print(f"  Final val loss:     {summary['final_val_loss']:.4f}")
 
 
 if __name__ == "__main__":
