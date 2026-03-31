@@ -214,7 +214,17 @@ def eval_step(state, batch, n_clues_batch, loss_mask, has_sep, pad_token):
 # Sequence packing utilities
 # ---------------------------------------------------------------------------
 
-def pack_sequences(seqs, n_clues_arr, pack_len, pad_token):
+@dataclass
+class PackedEpoch:
+    seqs:      np.ndarray  # (M, pack_len) — same dtype as input seqs
+    positions: np.ndarray  # (M, pack_len) int32 — local position within document
+    is_trace:  np.ndarray  # (M, pack_len) bool  — True for tokens that are prediction targets
+    doc_ids:   np.ndarray  # (M, pack_len) int32 — document index; -1 for padding slots
+    n_docs:    np.ndarray  # (M,) int32 — number of documents packed into each row
+    n_trace:   np.ndarray  # (M,) int32 — number of trace tokens in each row
+
+
+def pack_sequences(seqs, n_clues_arr, pack_len, pad_token) -> "PackedEpoch":
     """Greedily pack variable-length sequences into fixed-length rows.
 
     Args:
@@ -222,26 +232,18 @@ def pack_sequences(seqs, n_clues_arr, pack_len, pad_token):
         n_clues_arr: (N,) int32 — number of clue tokens per sequence
         pack_len:    target row length
         pad_token:   padding token id
-
-    Returns six arrays:
-        packed_seqs      (M, pack_len) — same dtype as seqs
-        positions        (M, pack_len) int32 — local position within document
-        is_trace         (M, pack_len) bool  — True for tokens that are prediction targets
-        doc_ids          (M, pack_len) int32 — document index; -1 for padding slots
-        n_docs_per_row   (M,)          int32 — number of documents packed into each row
-        n_trace_per_row  (M,)          int32 — number of trace tokens in each row
     """
     N = seqs.shape[0]
     # Actual lengths: count non-pad tokens (padding is always a suffix)
     seq_lens = (seqs != pad_token).sum(axis=1).astype(np.int32)
     max_pos = np.arange(pack_len, dtype=np.int32)  # reused for all sequences
 
-    rows_packed      = []
-    rows_positions   = []
-    rows_is_trace    = []
-    rows_doc_ids     = []
-    rows_n_docs      = []
-    rows_n_trace     = []
+    rows_packed    = []
+    rows_positions = []
+    rows_is_trace  = []
+    rows_doc_ids   = []
+    rows_n_docs    = []
+    rows_n_trace   = []
 
     def new_row():
         return (
@@ -288,13 +290,13 @@ def pack_sequences(seqs, n_clues_arr, pack_len, pad_token):
         rows_n_docs.append(n_docs_row)
         rows_n_trace.append(int(is_trace_arr.sum()))
 
-    return (
-        np.stack(rows_packed),
-        np.stack(rows_positions),
-        np.stack(rows_is_trace),
-        np.stack(rows_doc_ids),
-        np.array(rows_n_docs,  dtype=np.int32),
-        np.array(rows_n_trace, dtype=np.int32),
+    return PackedEpoch(
+        seqs      = np.stack(rows_packed),
+        positions = np.stack(rows_positions),
+        is_trace  = np.stack(rows_is_trace),
+        doc_ids   = np.stack(rows_doc_ids),
+        n_docs    = np.array(rows_n_docs,  dtype=np.int32),
+        n_trace   = np.array(rows_n_trace, dtype=np.int32),
     )
 
 
@@ -409,18 +411,15 @@ def train(cfg: TrainConfig):
     print(f"Loss mask: {cfg.loss_mask} (has_sep={has_sep})", flush=True)
     print(f"Max sequence length: {max_seq_len}", flush=True)
 
-    # For packing: do an initial pack now to estimate meaningful tokens per step.
-    # The result is stored and reused for epoch 0 so we don't pack twice.
+    # Pre-pack epoch 0 to estimate tokens/step; reused in training loop so we don't pack twice.
     prefetched_epoch = None
     if packing:
-        _perm0 = np.random.permutation(n_train)
+        perm0 = np.random.permutation(n_train)
         prefetched_epoch = pack_sequences(
-            raw_train_cpu[_perm0], nc_train_cpu[_perm0], cfg.pack_len, pad_token
+            raw_train_cpu[perm0], nc_train_cpu[perm0], cfg.pack_len, pad_token,
         )
-        _n_packed0 = prefetched_epoch[0].shape[0]
-        _spe0 = _n_packed0 // cfg.batch_size  # steps in first epoch
-        tokens_per_step = max(1, int(prefetched_epoch[5][:_spe0 * cfg.batch_size].sum() / _spe0))
-        steps_per_epoch = _spe0
+        steps_per_epoch = prefetched_epoch.seqs.shape[0] // cfg.batch_size
+        tokens_per_step = max(1, int(prefetched_epoch.n_trace[:steps_per_epoch * cfg.batch_size].sum() / steps_per_epoch))
     else:
         tokens_per_step = cfg.batch_size * (max_seq_len - 1)
         steps_per_epoch = n_train // cfg.batch_size
@@ -558,35 +557,33 @@ def train(cfg: TrainConfig):
         # ---------------------------------------------------------------
         while step < total_steps:
             if prefetched_epoch is not None:
-                packed_seqs, packed_pos, packed_is_trace, packed_doc_ids, packed_n_docs, packed_n_trace = prefetched_epoch
+                packed = prefetched_epoch
                 prefetched_epoch = None
             else:
                 perm = np.random.permutation(n_train)
-                packed_seqs, packed_pos, packed_is_trace, packed_doc_ids, packed_n_docs, packed_n_trace = \
-                    pack_sequences(raw_train_cpu[perm], nc_train_cpu[perm], cfg.pack_len, pad_token)
-            n_packed = packed_seqs.shape[0]
+                packed = pack_sequences(
+                    raw_train_cpu[perm], nc_train_cpu[perm], cfg.pack_len, pad_token,
+                )
+            n_packed = packed.seqs.shape[0]
             steps_per_epoch = n_packed // cfg.batch_size
-            utilization = float(packed_n_trace.sum()) / (n_packed * cfg.pack_len)
+            utilization = float(packed.n_trace.sum()) / (n_packed * cfg.pack_len)
             tqdm.write(
                 f"  epoch {epoch + 1}: packed {n_train} seqs → {n_packed} rows"
-                f" ({packed_n_docs.sum():,} puzzles, utilization={utilization:.1%})"
+                f" ({packed.n_docs.sum():,} puzzles, utilization={utilization:.1%})"
             )
 
-            device_packed   = jax.device_put(jnp.array(packed_seqs,     dtype=jnp.int32))
-            device_pos      = jax.device_put(jnp.array(packed_pos,      dtype=jnp.int32))
-            device_is_trace = jax.device_put(jnp.array(packed_is_trace, dtype=jnp.bool_))
-            device_doc_ids  = jax.device_put(jnp.array(packed_doc_ids,  dtype=jnp.int32))
+            device_packed   = jax.device_put(jnp.array(packed.seqs,      dtype=jnp.int32))
+            device_pos      = jax.device_put(jnp.array(packed.positions,  dtype=jnp.int32))
+            device_is_trace = jax.device_put(jnp.array(packed.is_trace,   dtype=jnp.bool_))
+            device_doc_ids  = jax.device_put(jnp.array(packed.doc_ids,    dtype=jnp.int32))
 
-            # Pre-build batch plan: list of (row_indices, n_puzzles, n_trace_tokens)
             row_perm = np.random.permutation(n_packed)
-            epoch_batches = []
-            for bs in range(0, steps_per_epoch * cfg.batch_size, cfg.batch_size):
-                bi = row_perm[bs:bs + cfg.batch_size]
-                epoch_batches.append((bi, int(packed_n_docs[bi].sum()), int(packed_n_trace[bi].sum())))
-
-            for batch_i, (bi, n_puz, n_trace) in enumerate(epoch_batches):
+            for batch_i in range(steps_per_epoch):
                 if step >= total_steps:
                     break
+                bi          = row_perm[batch_i * cfg.batch_size:(batch_i + 1) * cfg.batch_size]
+                n_puz       = int(packed.n_docs[bi].sum())
+                n_trace     = int(packed.n_trace[bi].sum())
                 batch       = device_packed[bi]
                 is_trace_b  = device_is_trace[bi]
                 positions_b = device_pos[bi]
