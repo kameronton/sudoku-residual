@@ -592,7 +592,8 @@ def train(cfg: TrainConfig):
 
                 state, loss = train_step_packed(state, batch, is_trace_b, attn_mask_b, positions_b)
                 step += 1
-                logger.total_tokens += n_trace
+                n_all = cfg.batch_size * (cfg.pack_len - 1)
+                logger.total_tokens += n_all
                 logger.total_meaningful_tokens += n_trace
                 logger.total_puzzles += n_puz
                 pbar.update(n_trace)
@@ -604,10 +605,11 @@ def train(cfg: TrainConfig):
                     logger.log_eval(step, epoch_float, train_loss, val_loss)
                     logger.save()
                     tok_s = logger.tokens_per_sec
+                    mtok_s = logger.total_meaningful_tokens / max(1e-9, time.time() - logger._t0)
                     pbar.set_postfix_str(
                         f"train={train_loss:.4f} | val={val_loss:.4f}"
                         f" | epoch={epoch_float:.2f} | puz={logger.total_puzzles / 1000:.1f}K"
-                        f" | tok/s={tok_s / 1000:.1f}K"
+                        f" | tok/s={tok_s / 1000:.1f}K | mtok/s={mtok_s / 1000:.1f}K"
                     )
                     tqdm.write(
                         f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f}"
