@@ -300,16 +300,8 @@ def pack_sequences(seqs, n_clues_arr, pack_len, pad_token) -> "PackedEpoch":
     )
 
 
-@jax.jit
-def build_attn_mask(doc_ids):
-    """Build block-diagonal causal attention mask from document IDs.
-
-    Args:
-        doc_ids: (B, T) int32 — document index per position; -1 for padding
-
-    Returns:
-        (B, 1, T, T) bool — True where attention is allowed
-    """
+def _build_attn_mask(doc_ids):
+    """Build block-diagonal causal attention mask from document IDs (fused inside JIT)."""
     same_doc = doc_ids[:, :, None] == doc_ids[:, None, :]    # (B, T, T)
     T = doc_ids.shape[1]
     causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
@@ -317,18 +309,19 @@ def build_attn_mask(doc_ids):
 
 
 @partial(jax.jit, donate_argnums=(0,))
-def train_step_packed(state, batch, is_trace, attn_mask, positions):
+def train_step_packed(state, batch, is_trace, doc_ids, positions):
     """Training step for packed sequences.
 
     Args:
         batch:     (B, pack_len) int32
         is_trace:  (B, pack_len) bool — True for positions that are trace tokens
-        attn_mask: (B, 1, pack_len, pack_len) bool
+        doc_ids:   (B, pack_len) int32 — document index; -1 for padding
         positions: (B, pack_len) int32 — local position within each document
     """
     inputs  = batch[:, :-1]
     targets = batch[:, 1:]
     mask = is_trace[:, 1:].astype(jnp.float32)  # targets we want to predict
+    attn_mask = _build_attn_mask(doc_ids)
 
     def loss_fn(params):
         logits = state.apply_fn(
@@ -342,20 +335,6 @@ def train_step_packed(state, batch, is_trace, attn_mask, positions):
     loss, grads = jax.value_and_grad(loss_fn)(state.params)
     state = state.apply_gradients(grads=grads)
     return state, loss
-
-
-@jax.jit
-def eval_step_packed(state, batch, is_trace, attn_mask, positions):
-    inputs  = batch[:, :-1]
-    targets = batch[:, 1:]
-    mask = is_trace[:, 1:].astype(jnp.float32)
-    logits = state.apply_fn(
-        {"params": state.params}, inputs,
-        attn_mask=attn_mask[:, :, :-1, :-1],
-        positions=positions[:, :-1],
-    )
-    per_token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-    return jnp.sum(per_token_loss * mask) / (jnp.sum(mask) + 1e-9)
 
 
 def train(cfg: TrainConfig):
@@ -588,9 +567,8 @@ def train(cfg: TrainConfig):
                 is_trace_b  = device_is_trace[bi]
                 positions_b = device_pos[bi]
                 doc_ids_b   = device_doc_ids[bi]
-                attn_mask_b = build_attn_mask(doc_ids_b)
 
-                state, loss = train_step_packed(state, batch, is_trace_b, attn_mask_b, positions_b)
+                state, loss = train_step_packed(state, batch, is_trace_b, doc_ids_b, positions_b)
                 step += 1
                 n_all = cfg.batch_size * (cfg.pack_len - 1)
                 logger.total_tokens += n_all
