@@ -168,10 +168,10 @@ def _traces_from_python_solver(puzzles, solutions):
 
 
 def _save_splits(
-    sequences: np.ndarray, puzzles: np.ndarray, output: str,
+    sequences: np.ndarray, puzzles: np.ndarray, solutions: np.ndarray, output: str,
     train_frac: float, val_frac: float, test_frac: float, seed: int,
 ):
-    """Shuffle and split sequences/puzzles into train/val/test, then save to NPZ."""
+    """Shuffle and split sequences/puzzles/solutions into train/val/test, then save to NPZ."""
     n = len(sequences)
     rng = np.random.RandomState(seed)
     indices = rng.permutation(n)
@@ -189,6 +189,7 @@ def _save_splits(
     for name, idx in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
         arrays[f"sequences_{name}"] = sequences[idx]
         arrays[f"puzzles_{name}"] = puzzles[idx]
+        arrays[f"solutions_{name}"] = solutions[idx]
         arrays[f"n_clues_{name}"] = n_clues[idx]
 
     np.savez_compressed(output, **arrays)
@@ -217,19 +218,22 @@ def prepare_data(
     # Tokenize
     sequences = []
     puzzle_strs = []
+    solution_strs = []
     failed = 0
-    for i, (puzzle, trace) in enumerate(zip(puzzles, traces)):
+    for i, (puzzle, solution, trace) in enumerate(zip(puzzles, solutions, traces)):
         if trace is None:
             failed += 1
             continue
         sequences.append(tokenize_trace(puzzle, trace, no_sep_token, randomize_clues))
         puzzle_strs.append(puzzle)
+        solution_strs.append(solution)
         if (i + 1) % 100_000 == 0:
             print(f"  processed {i + 1} puzzles...")
 
     arr = np.stack(sequences)
     puzzle_arr = np.array(puzzle_strs, dtype="U81")
-    _save_splits(arr, puzzle_arr, output, train_frac, val_frac, test_frac, seed)
+    solution_arr = np.array(solution_strs, dtype="U81")
+    _save_splits(arr, puzzle_arr, solution_arr, output, train_frac, val_frac, test_frac, seed)
     print(f"Saved {len(sequences)} sequences to {output} (failed: {failed})")
 
 

@@ -61,7 +61,7 @@ def main():
             continue
 
         print(f"  Loading {cache_path}...")
-        activations, puzzles, sequences, n_clues = load_probe_dataset(cache_path)
+        activations, puzzles, sequences, n_clues, _ = load_probe_dataset(cache_path)
         if n_clues is None:
             n_clues = derive_n_clues(puzzles)
 

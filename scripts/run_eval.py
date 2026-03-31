@@ -46,11 +46,11 @@ def main():
             continue
 
         print(f"  Loading {cache_path}...")
-        _, puzzles, sequences, n_clues = load_probe_dataset(cache_path)
+        _, puzzles, sequences, n_clues, solutions = load_probe_dataset(cache_path)
         if n_clues is None:
             n_clues = derive_n_clues(puzzles)
 
-        all_stats = evaluate_sequences(puzzles, sequences, n_clues)
+        all_stats = evaluate_sequences(puzzles, sequences, n_clues, solutions=solutions)
 
         summary = summarize_stats(all_stats)
         print(summary)

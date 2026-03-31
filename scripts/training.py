@@ -409,10 +409,21 @@ def train(cfg: TrainConfig):
     print(f"Loss mask: {cfg.loss_mask} (has_sep={has_sep})", flush=True)
     print(f"Max sequence length: {max_seq_len}", flush=True)
 
-    # Compute token budget and steps
-    tokens_per_step = cfg.batch_size * (max_seq_len - 1)
-    # For packing, steps_per_epoch is determined after packing each epoch; use a rough estimate here
-    steps_per_epoch = n_train // cfg.batch_size  # overridden each epoch in packing mode
+    # For packing: do an initial pack now to estimate meaningful tokens per step.
+    # The result is stored and reused for epoch 0 so we don't pack twice.
+    prefetched_epoch = None
+    if packing:
+        _perm0 = np.random.permutation(n_train)
+        prefetched_epoch = pack_sequences(
+            raw_train_cpu[_perm0], nc_train_cpu[_perm0], cfg.pack_len, pad_token
+        )
+        _n_packed0 = prefetched_epoch[0].shape[0]
+        _spe0 = _n_packed0 // cfg.batch_size  # steps in first epoch
+        tokens_per_step = max(1, int(prefetched_epoch[5][:_spe0 * cfg.batch_size].sum() / _spe0))
+        steps_per_epoch = _spe0
+    else:
+        tokens_per_step = cfg.batch_size * (max_seq_len - 1)
+        steps_per_epoch = n_train // cfg.batch_size
     warmup_steps = cfg.warmup_tokens // tokens_per_step
     total_steps_ideal = cfg.num_tokens // tokens_per_step
     if cfg.num_checkpoints > 0:
@@ -546,9 +557,13 @@ def train(cfg: TrainConfig):
         # Packing training loop
         # ---------------------------------------------------------------
         while step < total_steps:
-            perm = np.random.permutation(n_train)
-            packed_seqs, packed_pos, packed_is_trace, packed_doc_ids, packed_n_docs, packed_n_trace = \
-                pack_sequences(raw_train_cpu[perm], nc_train_cpu[perm], cfg.pack_len, pad_token)
+            if prefetched_epoch is not None:
+                packed_seqs, packed_pos, packed_is_trace, packed_doc_ids, packed_n_docs, packed_n_trace = prefetched_epoch
+                prefetched_epoch = None
+            else:
+                perm = np.random.permutation(n_train)
+                packed_seqs, packed_pos, packed_is_trace, packed_doc_ids, packed_n_docs, packed_n_trace = \
+                    pack_sequences(raw_train_cpu[perm], nc_train_cpu[perm], cfg.pack_len, pad_token)
             n_packed = packed_seqs.shape[0]
             steps_per_epoch = n_packed // cfg.batch_size
             utilization = float(packed_n_trace.sum()) / (n_packed * cfg.pack_len)
@@ -580,10 +595,10 @@ def train(cfg: TrainConfig):
 
                 state, loss = train_step_packed(state, batch, is_trace_b, attn_mask_b, positions_b)
                 step += 1
-                logger.total_tokens += tokens_per_step
+                logger.total_tokens += n_trace
                 logger.total_meaningful_tokens += n_trace
                 logger.total_puzzles += n_puz
-                pbar.update(tokens_per_step)
+                pbar.update(n_trace)
 
                 if step % cfg.eval_every == 0:
                     train_loss = float(loss)
@@ -666,7 +681,7 @@ def train(cfg: TrainConfig):
     print(f"\nTraining complete. Summary:")
     print(f"  Steps:              {summary['total_steps']:,}")
     print(f"  Tokens (total):     {summary['total_tokens']:,}")
-    if summary['total_meaningful_tokens']:
+    if summary['total_meaningful_tokens'] and summary['total_meaningful_tokens'] < summary['total_tokens']:
         print(f"  Tokens (trace):     {summary['total_meaningful_tokens']:,}"
               f"  ({100 * summary['total_meaningful_tokens'] / max(summary['total_tokens'], 1):.1f}%)")
     if summary['total_puzzles']:
