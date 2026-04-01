@@ -285,30 +285,41 @@ def load_puzzles(traces_path: str, n: int) -> list[str]:
     return puzzles
 
 
-def collect_activations(intermediates_fn, params, sequences: list[list[int]], batch_size: int):
+def collect_activations(intermediates_fn, params, sequences: list[list[int]], batch_size: int,
+                        out: np.ndarray | None = None):
     """Forward pass on complete sequences to get activations at all layers/tokens.
 
     Returns array of shape (n_puzzles, n_layers, max_seq_len, d_model).
+    If `out` is provided (e.g. a memmap), writes directly into it batch-by-batch
+    to avoid accumulating the full array in RAM.
     """
+    n = len(sequences)
     max_length = max(len(s) for s in sequences)
     padded = jnp.array(
         [s + [PAD_TOKEN] * (max_length - len(s)) for s in sequences],
         dtype=jnp.int32,
     )
 
-    all_acts = []
-    for start in range(0, len(sequences), batch_size):
-        print(f"  Forward pass {start}/{len(sequences)}", end="\r")
+    all_acts = [] if out is None else None
+    for start in range(0, n, batch_size):
+        print(f"  Forward pass {start}/{n}", end="\r")
+        end = min(start + batch_size, n)
         batch = padded[start : start + batch_size]
         _, intermediates = intermediates_fn(params, batch)
         # intermediates: (n_layers, batch, seq_len, d_model) -> (batch, n_layers, seq_len, d_model)
-        all_acts.append(np.array(intermediates.transpose(1, 0, 2, 3)))
+        batch_acts = np.array(intermediates.transpose(1, 0, 2, 3)).astype(np.float32)
+        if out is not None:
+            out[start:end] = batch_acts[:end - start]
+        else:
+            all_acts.append(batch_acts)
     print()
 
+    if out is not None:
+        return out
     return np.concatenate(all_acts, axis=0).astype(np.float32)
 
 
-def save_probe_dataset(path: str, activations: np.ndarray | None, puzzles: list[str], sequences: list[list[int]], compress: bool = True, n_clues: np.ndarray | None = None):
+def save_probe_dataset(path: str, activations: np.ndarray | None, puzzles: list[str], sequences: list[list[int]], compress: bool = True, n_clues: np.ndarray | None = None, solutions: list[str] | None = None):
     """Save activations, puzzles, and token sequences together."""
     puzzle_arr = np.array(puzzles, dtype=f"U{len(puzzles[0])}")
     # Pad sequences to same length for storage
@@ -322,6 +333,8 @@ def save_probe_dataset(path: str, activations: np.ndarray | None, puzzles: list[
         arrays["activations"] = activations
     if n_clues is not None:
         arrays["n_clues"] = n_clues
+    if solutions is not None:
+        arrays["solutions"] = np.array(solutions, dtype="U81")
     print(f"Saving probe dataset to {path} ({'compressed' if compress else 'uncompressed'})...")
     save_fn(path, **arrays)
     size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
@@ -330,7 +343,7 @@ def save_probe_dataset(path: str, activations: np.ndarray | None, puzzles: list[
 
 
 def load_probe_dataset(path: str):
-    """Load cached activations, puzzles, sequences, and optionally n_clues."""
+    """Load cached activations, puzzles, sequences, n_clues, and optionally solutions."""
     data = np.load(path)
     activations = data["activations"] if "activations" in data else None
     puzzles = list(data["puzzles"])
@@ -341,9 +354,10 @@ def load_probe_dataset(path: str):
         seq = row[row != PAD_TOKEN].tolist()
         sequences.append(seq)
     n_clues = data["n_clues"] if "n_clues" in data else None
+    solutions = list(data["solutions"]) if "solutions" in data else None
     shape_info = str(activations.shape) if activations is not None else "traces only"
     print(f"Loaded probe dataset from {path} ({shape_info})")
-    return activations, puzzles, sequences, n_clues
+    return activations, puzzles, sequences, n_clues, solutions
 
 
 def derive_n_clues(puzzles: list[str]) -> np.ndarray:
@@ -382,7 +396,7 @@ def generate_probe_dataset(
     If cache_path already contains sequences (e.g. from a --traces-only run),
     autoregressive generation is skipped and activations are collected directly.
     When traces_only=True, skips activation collection and returns None for activations.
-    Returns (activations, puzzles, sequences, n_clues).
+    Returns (activations, puzzles, sequences, n_clues, solutions).
     """
     # Reuse cached traces if present — skip expensive autoregressive generation
     has_cached_traces = (
@@ -393,9 +407,9 @@ def generate_probe_dataset(
 
     if has_cached_traces:
         print(f"Found cached traces in {cache_path} — skipping autoregressive generation")
-        _, puzzles, sequences, n_clues = load_probe_dataset(cache_path)
+        _, puzzles, sequences, n_clues, solutions = load_probe_dataset(cache_path)
         if traces_only:
-            return None, puzzles, sequences, n_clues
+            return None, puzzles, sequences, n_clues, solutions
     else:
         print(f"Loading checkpoint from {ckpt_dir}" + (f" (step {ckpt_step})" if ckpt_step else ""))
         params, model = load_checkpoint(ckpt_dir, ckpt_step=ckpt_step)
@@ -409,6 +423,7 @@ def generate_probe_dataset(
         _nc0 = int(_npz["n_clues_test"][0])
         use_sep = bool(_nc0 < len(_seq0) and _seq0[_nc0] == SEP_TOKEN)
         print(f"SEP token: {'yes' if use_sep else 'no'}")
+        solutions = list(_npz["solutions_test"][:n_puzzles]) if "solutions_test" in _npz.files else None
 
         print("Generating traces...")
         traces, sequences = generate_traces_batched_cached(model, params, puzzles, batch_size, use_sep=use_sep)
@@ -419,8 +434,8 @@ def generate_probe_dataset(
 
         if traces_only:
             if cache_path:
-                save_probe_dataset(cache_path, None, puzzles, sequences, compress=compress, n_clues=n_clues)
-            return None, puzzles, sequences, n_clues
+                save_probe_dataset(cache_path, None, puzzles, sequences, compress=compress, n_clues=n_clues, solutions=solutions)
+            return None, puzzles, sequences, n_clues, solutions
 
     # Activation collection — load model now if we reused cached traces
     if has_cached_traces:
@@ -430,9 +445,23 @@ def generate_probe_dataset(
 
     print("Collecting activations...")
     intermediates_fn = make_intermediates_fn(model)
-    activations = collect_activations(intermediates_fn, params, sequences, batch_size)
 
     if cache_path:
-        save_probe_dataset(cache_path, activations, puzzles, sequences, compress=compress, n_clues=n_clues)
+        # Stream activations into a temporary memmap to avoid peak RAM = 2× full array.
+        # np.savez (uncompressed) iterates memmaps in chunks, so saving also stays O(1 batch).
+        cfg = model.config
+        max_length = max(len(s) for s in sequences)
+        shape = (len(sequences), cfg.n_layers, max_length, cfg.d_model)
+        tmp_path = cache_path + ".tmp.npy"
+        acts_mm = np.lib.format.open_memmap(tmp_path, mode="w+", dtype=np.float32, shape=shape)
+        try:
+            collect_activations(intermediates_fn, params, sequences, batch_size, out=acts_mm)
+            save_probe_dataset(cache_path, acts_mm, puzzles, sequences, compress=compress, n_clues=n_clues, solutions=solutions)
+        finally:
+            del acts_mm
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        return None, puzzles, sequences, n_clues, solutions
 
-    return activations, puzzles, sequences, n_clues
+    activations = collect_activations(intermediates_fn, params, sequences, batch_size)
+    return activations, puzzles, sequences, n_clues, solutions

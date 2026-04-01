@@ -98,6 +98,35 @@ def tokenize_bt_trace(events: np.ndarray, randomize_clues: bool = False) -> np.n
     return tokens
 
 
+def extract_solution_str(events: np.ndarray) -> str:
+    """Simulate BT trace with push/pop stack to reconstruct the solution.
+
+    Replays all events after END_CLUES (1000), following the push/pop stack,
+    and returns the final board state when SUCCESS (1003) is reached.
+    """
+    grid = list(extract_puzzle_str(events))
+    stack: list[list[str]] = []
+    past_end_clues = False
+    for v in events:
+        v = int(v)
+        if not past_end_clues:
+            if v == 1000:
+                past_end_clues = True
+        elif v == 1001:  # PUSH
+            stack.append(grid[:])
+        elif v == 1002:  # POP
+            if stack:
+                grid = stack.pop()
+        elif v == 1003:  # SUCCESS
+            break
+        elif 1 <= v <= 999:  # fill placement
+            r = v // 100
+            c = (v // 10) % 10
+            d = v % 10
+            grid[r * 9 + c] = str(d)
+    return "".join(grid)
+
+
 def extract_puzzle_str(events: np.ndarray) -> str:
     """Reconstruct the 81-char puzzle string from the clue placements.
 
@@ -184,11 +213,13 @@ def prepare_bt_data(
         )
 
     # --- extract puzzle metadata ----------------------------------------
-    print("Extracting puzzle strings and clue counts ...")
+    print("Extracting puzzle strings, solutions, and clue counts ...")
     puzzles = np.empty(n_total, dtype="U81")
+    solutions = np.empty(n_total, dtype="U81")
     n_clues = np.empty(n_total, dtype=np.int32)
     for i, events in enumerate(raw_traces):
         puzzles[i] = extract_puzzle_str(events)
+        solutions[i] = extract_solution_str(events)
         # Count placement events before the first END_CLUES (1000)
         end_pos = int(np.argmax(events == 1000))
         n_clues[i] = end_pos
@@ -225,6 +256,9 @@ def prepare_bt_data(
         puzzles_train=puzzles[train_idx],
         puzzles_val=puzzles[val_idx],
         puzzles_test=puzzles[test_idx],
+        solutions_train=solutions[train_idx],
+        solutions_val=solutions[val_idx],
+        solutions_test=solutions[test_idx],
         n_clues_train=n_clues[train_idx],
         n_clues_val=n_clues[val_idx],
         n_clues_test=n_clues[test_idx],

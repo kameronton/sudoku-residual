@@ -97,14 +97,18 @@ def evaluate_traces(
     puzzles: list[str],
     traces: list[list[tuple[int, int, int]]],
     quiet: bool = True,
+    solutions: list[str] | None = None,
 ) -> list[dict]:
-    """Solve each puzzle for ground truth and evaluate traces. Returns per-puzzle stats."""
+    """Evaluate traces against ground-truth solutions. Returns per-puzzle stats."""
     all_stats = []
     for idx, (puzzle, trace) in enumerate(zip(puzzles, traces)):
-        result = solve(puzzle)
-        if result is None:
-            raise ValueError(f"Solver failed: {puzzle[:20]}...")
-        solution = result[0]
+        if solutions is not None:
+            solution = solutions[idx]
+        else:
+            result = solve(puzzle)
+            if result is None:
+                raise ValueError(f"Solver failed: {puzzle[:20]}...")
+            solution = result[0]
         if not quiet:
             print(f"\nPuzzle {idx + 1}/{len(puzzles)}:")
             print_grid(list(puzzle))
@@ -170,18 +174,22 @@ def evaluate_sequences(
     sequences: list[list[int]],
     n_clues: np.ndarray,
     quiet: bool = True,
+    solutions: list[str] | None = None,
 ) -> list[dict]:
     """Evaluate generated sequences with stack simulation.
 
-    Works for both standard and BT sequences. Solves each puzzle for ground
-    truth internally.
+    Works for both standard and BT sequences. Uses provided solutions if
+    available; otherwise falls back to solving each puzzle on the fly.
     """
     all_stats = []
     for i, (puzzle, seq) in enumerate(zip(puzzles, sequences)):
-        result = solve(puzzle)
-        if result is None:
-            raise ValueError(f"Solver failed: {puzzle[:20]}...")
-        solution = result[0]
+        if solutions is not None:
+            solution = solutions[i]
+        else:
+            result = solve(puzzle)
+            if result is None:
+                raise ValueError(f"Solver failed: {puzzle[:20]}...")
+            solution = result[0]
 
         nc = int(n_clues[i])
         start = nc + 1 if nc < len(seq) and seq[nc] == SEP_TOKEN else nc
@@ -320,7 +328,7 @@ def main():
 
     from sudoku.activations import load_probe_dataset, derive_n_clues, sequences_to_traces
 
-    _, puzzles, sequences, n_clues = load_probe_dataset(args.cache_path)
+    _, puzzles, sequences, n_clues, solutions = load_probe_dataset(args.cache_path)
     if n_clues is None:
         n_clues = derive_n_clues(puzzles)
 
@@ -328,6 +336,8 @@ def main():
         puzzles = puzzles[:args.n]
         sequences = sequences[:args.n]
         n_clues = n_clues[:args.n]
+        if solutions is not None:
+            solutions = solutions[:args.n]
 
     if args.mistake_map or args.mistake_position:
         traces = sequences_to_traces(sequences, n_clues)
@@ -349,7 +359,7 @@ def main():
             plot_mistake_position_distribution(steps_from_end, args.output or "first_mistake_position.png")
         return
 
-    all_stats = evaluate_sequences(puzzles, sequences, n_clues, quiet=args.quiet)
+    all_stats = evaluate_sequences(puzzles, sequences, n_clues, quiet=args.quiet, solutions=solutions)
     print(summarize_stats(all_stats))
 
 

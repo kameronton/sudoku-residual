@@ -517,11 +517,11 @@ def main():
 
     # --- Load data ---
     if os.path.exists(args.cache_path):
-        activations, puzzles, sequences, n_clues = load_probe_dataset(args.cache_path)
+        activations, puzzles, sequences, n_clues, _ = load_probe_dataset(args.cache_path)
     else:
         if not args.traces_path:
             raise ValueError("--traces_path required when no cache exists")
-        activations, puzzles, sequences, n_clues = generate_probe_dataset(
+        activations, puzzles, sequences, n_clues, _ = generate_probe_dataset(
             ckpt_dir=args.ckpt_dir, ckpt_step=args.ckpt_step,
             traces_path=args.traces_path,
             n_puzzles=args.n_puzzles, batch_size=args.batch_size,
