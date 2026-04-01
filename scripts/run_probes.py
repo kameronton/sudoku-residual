@@ -78,10 +78,12 @@ def main():
 
         print(f"  Running probes ({mode}, step={step}, {len(probe_grids)} puzzles)...")
         if mode == "structure":
-            all_scores = run_structure_probe_loop(activations, probe_grids, probe_positions)
+            all_scores, all_brier_struct = run_structure_probe_loop(activations, probe_grids, probe_positions)
             plot_structure(all_scores, output_path, show=False)
+            plot_structure(all_brier_struct, output_path.replace(".png", "_brier.png"),
+                           show=False, vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
         else:
-            all_accuracies, all_per_digit = run_probe_loop(
+            all_accuracies, all_per_digit, all_brier = run_probe_loop(
                 activations, probe_grids, probe_positions, mode=mode,
             )
             metric = metric_name_for_mode(mode)
@@ -89,6 +91,8 @@ def main():
                 plot_all_layers_per_digit(all_per_digit, output_path.replace(".png", "_per_digit.png"), show=False)
             else:
                 plot_all_layers(all_accuracies, output_path, metric_name=metric, show=False)
+            plot_all_layers(all_brier, output_path.replace(".png", "_brier.png"),
+                            metric_name="Brier", show=False, vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
 
     print(f"\nDone.")
 

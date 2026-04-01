@@ -4,9 +4,10 @@ import argparse
 import os
 
 import numpy as np
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import LogisticRegression
+from sklearn.multioutput import MultiOutputClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import roc_auc_score
 
 from sudoku.data import SEP_TOKEN, decode_fill
 from sudoku.solver import solve
@@ -64,67 +65,103 @@ def build_probe_targets(puzzles: list[str], cell_idx: int, mode: str):
     return targets, labels
 
 
-def fit_probe(X_train: np.ndarray, y_train: np.ndarray, alpha: float = 1.0) -> Ridge:
-    """Fit a Ridge probe on training data."""
-    ridge = Ridge(alpha=alpha)
-    ridge.fit(X_train, y_train)
-    return ridge
+def fit_probe(X_train: np.ndarray, y_train: np.ndarray, mode: str, C: float = 1.0):
+    """Fit a logistic probe.
 
-
-def eval_probe(ridge: Ridge, X_test: np.ndarray, y_test: np.ndarray, labels_test: np.ndarray, mode: str):
-    """Evaluate a fitted probe on test data.
-
-    Returns (metric, y_true, preds, per_digit).
+    y_train format:
+    - filled: (n,) binary {0, 1}
+    - state_filled: (n,) int {1..9}
+    - candidates / structure: (n, 9) binary multi-label
     """
-    raw_preds = ridge.predict(X_test)
+    if mode in ("candidates", "structure"):
+        clf = MultiOutputClassifier(LogisticRegression(C=C, max_iter=1000))
+        clf.fit(X_train, y_train.astype(int))
+    else:
+        clf = LogisticRegression(C=C, max_iter=1000)
+        clf.fit(X_train, y_train)
+    return clf
 
+
+def eval_probe(clf, X_test: np.ndarray, y_test: np.ndarray, mode: str):
+    """Evaluate a fitted probe using AUC and Brier score.
+
+    Returns (auc, brier, y_true, per_digit_auc, per_digit_brier).
+    per_digit_* are (9,) arrays for candidates/structure, None otherwise.
+    """
     if mode == "filled":
-        preds = raw_preds.argmax(axis=1)
-        y_true = (labels_test > 0).astype(int)
-        acc = accuracy_score(y_true, preds)
-        return acc, y_true, preds, None
+        probas = clf.predict_proba(X_test)[:, 1]
+        if len(np.unique(y_test)) < 2:
+            return float("nan"), float("nan"), y_test, None, None
+        brier = float(np.mean((probas - y_test) ** 2))
+        return roc_auc_score(y_test, probas), brier, y_test, None, None
+
     elif mode == "state_filled":
-        filled_test = labels_test > 0
-        if not filled_test.any():
-            return float("nan"), np.array([]), np.array([]), None
-        preds = raw_preds[filled_test].argmax(axis=1) + 1
-        y_true = labels_test[filled_test]
-        acc = accuracy_score(y_true, preds)
-        return acc, y_true, preds, None
-    elif mode == "candidates":
-        empty_test = labels_test == 0
-        if not empty_test.any():
-            return float("nan"), np.array([]), np.array([]), np.full(9, float("nan"))
-        binary_preds = (raw_preds[empty_test] > 0.5).astype(int)
-        y_true = y_test[empty_test]
-        per_digit = np.array([
-            f1_score(y_true[:, d], binary_preds[:, d], zero_division=0.0)
+        probas = clf.predict_proba(X_test)
+        full_probas = np.zeros((len(X_test), 9))
+        for j, cls in enumerate(clf.classes_):
+            full_probas[:, int(cls) - 1] = probas[:, j]
+        present = np.unique(y_test)
+        if len(present) < 2:
+            return float("nan"), float("nan"), y_test, None, None
+        col_idx = [int(c) - 1 for c in present]
+        auc = roc_auc_score(y_test, full_probas[:, col_idx], multi_class="ovr", average="macro")
+        y_onehot = np.zeros((len(y_test), 9))
+        y_onehot[np.arange(len(y_test)), y_test - 1] = 1.0
+        brier = float(np.mean((full_probas - y_onehot) ** 2))
+        return auc, brier, y_test, None, None
+
+    elif mode in ("candidates", "structure"):
+        proba_list = clf.predict_proba(X_test)
+        probas = np.column_stack([p[:, 1] for p in proba_list])
+        per_digit_auc = np.array([
+            roc_auc_score(y_test[:, d], probas[:, d])
+            if len(np.unique(y_test[:, d])) > 1 else float("nan")
             for d in range(9)
         ])
-        f1 = per_digit.mean()
-        return f1, y_true, binary_preds, per_digit
+        per_digit_brier = np.mean((probas - y_test) ** 2, axis=0)
+        return np.nanmean(per_digit_auc), float(np.mean(per_digit_brier)), y_test, per_digit_auc, per_digit_brier
+
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
 
 def probe_cell(activations: np.ndarray, puzzles: list[str], cell_idx: int, mode: str = "candidates"):
-    """Train and evaluate a ridge probe for a single cell.
+    """Train and evaluate a logistic probe for a single cell.
 
-    Returns (metric, y_true, preds, per_digit).
+    Returns (auc, y_true, per_digit_or_None).
     """
     targets, labels = build_probe_targets(puzzles, cell_idx, mode)
 
-    indices = np.arange(len(puzzles))
-    idx_train, idx_test = train_test_split(indices, test_size=0.2, random_state=42)
+    # Filter to cells relevant for this mode before fitting
+    if mode == "candidates":
+        rel = labels == 0
+    elif mode == "state_filled":
+        rel = labels > 0
+    else:  # filled: all cells are relevant
+        rel = np.ones(len(labels), dtype=bool)
 
-    ridge = fit_probe(activations[idx_train], targets[idx_train])
-    return eval_probe(ridge, activations[idx_test], targets[idx_test], labels[idx_test], mode)
+    rel_idx = np.where(rel)[0]
+    X = activations[rel_idx]
+    if mode == "state_filled":
+        y = labels[rel_idx]
+    elif mode == "filled":
+        y = (labels[rel_idx] > 0).astype(int)
+    else:
+        y = targets[rel_idx]
+
+    if len(X) < 4:
+        return float("nan"), y, (np.full(9, float("nan")) if mode == "candidates" else None)
+
+    idx = np.arange(len(rel_idx))
+    idx_train, idx_test = train_test_split(idx, test_size=0.2, random_state=42)
+    clf = fit_probe(X[idx_train], y[idx_train], mode)
+    return eval_probe(clf, X[idx_test], y[idx_test], mode)
 
 
 def plot_all_layers(
     all_accuracies: dict[int, list[float]],
     output_path: str = "probe_accuracies.png", metric_name: str = "Accuracy",
-    show: bool = True,
+    show: bool = True, vmin: float = 0.0, vmax: float = 1.0, cmap: str = "RdYlGn",
 ):
     """Plot 9x9 heatmap per layer with shared colorbar."""
     import matplotlib.pyplot as plt
@@ -145,7 +182,7 @@ def plot_all_layers(
     for idx, (layer, accs) in enumerate(sorted(all_accuracies.items())):
         ax = axes[idx]
         grid = np.array(accs).reshape(9, 9)
-        im = ax.imshow(grid, cmap="RdYlGn", vmin=0, vmax=1)
+        im = ax.imshow(grid, cmap=cmap, vmin=vmin, vmax=vmax)
         ims.append(im)
         avg = np.mean(accs)
         ax.set_title(f"Layer {layer} (mean={avg:.3f})")
@@ -255,7 +292,7 @@ def plot_all_layers_per_digit(
 
 
 def metric_name_for_mode(mode: str) -> str:
-    return "F1" if mode in ("candidates", "structure") else "Accuracy"
+    return "AUC"
 
 
 def build_structure_targets(puzzles: list[str], subtype: str, idx: int) -> np.ndarray:
@@ -276,47 +313,59 @@ def build_structure_targets(puzzles: list[str], subtype: str, idx: int) -> np.nd
     return targets
 
 
-def probe_structure(acts: np.ndarray, puzzles: list[str], subtype: str, idx: int) -> float:
-    """Fit and evaluate a structure probe for one row/col/box. Returns mean F1 across 9 digits."""
+def probe_structure(acts: np.ndarray, puzzles: list[str], subtype: str, idx: int) -> tuple[float, float]:
+    """Fit and evaluate a structure probe for one row/col/box. Returns (mean AUC, mean Brier)."""
     targets = build_structure_targets(puzzles, subtype, idx)
     indices = np.arange(len(puzzles))
     idx_train, idx_test = train_test_split(indices, test_size=0.2, random_state=42)
-    ridge = fit_probe(acts[idx_train], targets[idx_train])
-    preds = (ridge.predict(acts[idx_test]) > 0.5).astype(int)
-    per_digit = [f1_score(targets[idx_test, d], preds[:, d], zero_division=0.0) for d in range(9)]
-    return float(np.mean(per_digit))
+    clf = fit_probe(acts[idx_train], targets[idx_train], mode="structure")
+    proba_list = clf.predict_proba(acts[idx_test])
+    probas = np.column_stack([p[:, 1] for p in proba_list])
+    per_digit_auc = [
+        roc_auc_score(targets[idx_test, d], probas[:, d])
+        if len(np.unique(targets[idx_test, d])) > 1 else float("nan")
+        for d in range(9)
+    ]
+    per_digit_brier = np.mean((probas - targets[idx_test]) ** 2, axis=0)
+    return float(np.nanmean(per_digit_auc)), float(np.mean(per_digit_brier))
 
 
 def run_structure_probe_loop(
     activations: np.ndarray,
     probe_grids: list[str],
     probe_positions: list[int],
-) -> dict[int, dict[str, list[float]]]:
+) -> tuple[dict[int, dict[str, list[float]]], dict[int, dict[str, list[float]]]]:
     """Run structure probing: 27 probes per layer (9 rows, 9 cols, 9 boxes).
 
-    Returns dict[layer, dict[subtype, list[float]]] where each list has 9 F1 scores.
+    Returns (all_auc, all_brier), each dict[layer, dict[subtype, list[float]]].
     """
     n_layers = activations.shape[1]
     all_scores = {}
+    all_brier = {}
     for layer in range(n_layers):
         acts = get_activations_at_positions(activations, probe_positions, layer)
         print(f"\nLayer {layer}, activations shape: {acts.shape}")
         layer_scores: dict[str, list[float]] = {"row": [], "col": [], "box": []}
+        layer_brier: dict[str, list[float]] = {"row": [], "col": [], "box": []}
         for subtype in ("row", "col", "box"):
             for idx in range(9):
                 print(f"  Layer {layer} | {subtype} {idx}/9", end="\r")
-                layer_scores[subtype].append(probe_structure(acts, probe_grids, subtype, idx))
+                auc, brier = probe_structure(acts, probe_grids, subtype, idx)
+                layer_scores[subtype].append(auc)
+                layer_brier[subtype].append(brier)
         for subtype in ("row", "col", "box"):
-            avg = np.nanmean(layer_scores[subtype])
-            print(f"  Layer {layer} | Mean F1 ({subtype}): {avg:.3f}")
+            avg_auc = np.nanmean(layer_scores[subtype])
+            avg_brier = np.nanmean(layer_brier[subtype])
+            print(f"  Layer {layer} | Mean AUC ({subtype}): {avg_auc:.3f}  Brier: {avg_brier:.4f}")
         all_scores[layer] = layer_scores
-    return all_scores
+        all_brier[layer] = layer_brier
+    return all_scores, all_brier
 
 
 def plot_structure(
     all_scores: dict[int, dict[str, list[float]]],
     output_path: str = "probe_structure.png",
-    show: bool = True,
+    show: bool = True, vmin: float = 0.0, vmax: float = 1.0, cmap: str = "RdYlGn",
 ):
     """Plot structure probe F1: n_layers rows x 3 cols (row/col/box substructures).
 
@@ -343,7 +392,7 @@ def plot_structure(
                 data = vals.reshape(9, 1)
             else:  # col
                 data = vals.reshape(1, 9)
-            im = ax.imshow(data, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+            im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
             if layer_idx == 0:
                 ims.append(im)
             for r in range(data.shape[0]):
@@ -356,8 +405,8 @@ def plot_structure(
             if col_idx == 0:
                 ax.set_ylabel(f"L{layer}", fontsize=8, rotation=0, labelpad=20, va="center")
 
-    fig.colorbar(ims[0], ax=axes.ravel().tolist(), shrink=0.5, label="F1", pad=0.02)
-    fig.suptitle("Structure probe F1 (row / col / box)", fontsize=11)
+    fig.colorbar(ims[0], ax=axes.ravel().tolist(), shrink=0.5, pad=0.02)
+    fig.suptitle("Structure probe (row / col / box)", fontsize=11)
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     print(f"Saved {output_path}")
     if show:
@@ -466,35 +515,40 @@ def run_probe_loop(
     probe_grids: list[str],
     probe_positions: list[int],
     mode: str = "state_filled",
-) -> tuple[dict[int, list[float]], dict[int, np.ndarray]]:
+) -> tuple[dict[int, list[float]], dict[int, np.ndarray], dict[int, list[float]]]:
     """Run probing loop across all layers and cells.
 
-    Returns (all_accuracies, all_per_digit) dicts keyed by layer index.
+    Returns (all_auc, all_per_digit_auc, all_brier) dicts keyed by layer index.
     """
     n_layers = activations.shape[1]
     all_accuracies = {}
     all_per_digit = {}
+    all_brier = {}
 
     for layer in range(n_layers):
         acts = get_activations_at_positions(activations, probe_positions, layer)
         print(f"\nLayer {layer}, activations shape: {acts.shape}")
 
         accuracies = []
+        briers = []
         per_digit_layer = []
         for cell in range(81):
             print(f"  Layer {layer} | Cell {cell:2d}/81", end="\r")
-            metric_val, _, _, per_digit = probe_cell(acts, probe_grids, cell, mode=mode)
+            metric_val, brier_val, _, per_digit_auc, _ = probe_cell(acts, probe_grids, cell, mode=mode)
             accuracies.append(metric_val)
-            if per_digit is not None:
-                per_digit_layer.append(per_digit)
+            briers.append(brier_val)
+            if per_digit_auc is not None:
+                per_digit_layer.append(per_digit_auc)
 
-        avg = np.nanmean(accuracies)
-        print(f"  Layer {layer} | Mean {metric_name_for_mode(mode).lower()} ({mode}): {avg:.3f}")
+        avg_auc = np.nanmean(accuracies)
+        avg_brier = np.nanmean(briers)
+        print(f"  Layer {layer} | Mean {metric_name_for_mode(mode).lower()} ({mode}): {avg_auc:.3f}  Brier: {avg_brier:.4f}")
         all_accuracies[layer] = accuracies
+        all_brier[layer] = briers
         if per_digit_layer:
             all_per_digit[layer] = np.array(per_digit_layer)
 
-    return all_accuracies, all_per_digit
+    return all_accuracies, all_per_digit, all_brier
 
 
 def main():
@@ -561,10 +615,12 @@ def main():
 
     # --- Probing loop + plot ---
     if args.mode == "structure":
-        all_scores = run_structure_probe_loop(activations, probe_grids, probe_positions)
+        all_scores, all_brier_struct = run_structure_probe_loop(activations, probe_grids, probe_positions)
         plot_structure(all_scores, output)
+        plot_structure(all_brier_struct, output.replace(".png", "_brier.png"),
+                       vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
     else:
-        all_accuracies, all_per_digit = run_probe_loop(
+        all_accuracies, all_per_digit, all_brier = run_probe_loop(
             activations, probe_grids, probe_positions, args.mode,
         )
         metric = metric_name_for_mode(args.mode)
@@ -572,6 +628,8 @@ def main():
             plot_all_layers_per_digit(all_per_digit, output.replace(".png", "_per_digit.png"))
         else:
             plot_all_layers(all_accuracies, output, metric_name=metric)
+        plot_all_layers(all_brier, output.replace(".png", "_brier.png"),
+                        metric_name="Brier", vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
 
 
 if __name__ == "__main__":
