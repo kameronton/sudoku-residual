@@ -319,40 +319,57 @@ def collect_activations(intermediates_fn, params, sequences: list[list[int]], ba
     return np.concatenate(all_acts, axis=0).astype(np.float32)
 
 
+def _acts_npy_path(cache_path: str) -> str:
+    """Path of the standalone activations .npy file paired with a metadata .npz."""
+    return cache_path.replace(".npz", "_acts.npy")
+
+
 def save_probe_dataset(path: str, activations: np.ndarray | None, puzzles: list[str], sequences: list[list[int]], compress: bool = True, n_clues: np.ndarray | None = None, solutions: list[str] | None = None):
-    """Save activations, puzzles, and token sequences together."""
+    """Save metadata (puzzles, sequences, n_clues) to path (.npz) and activations to a
+    companion _acts.npy file.  Activations are stored as a plain .npy (not inside the ZIP)
+    so that np.load(_acts_npy_path, mmap_mode='r') creates a true OS-level mmap."""
     puzzle_arr = np.array(puzzles, dtype=f"U{len(puzzles[0])}")
-    # Pad sequences to same length for storage
     max_len = max(len(s) for s in sequences)
     seq_arr = np.full((len(sequences), max_len), PAD_TOKEN, dtype=np.int16)
     for i, s in enumerate(sequences):
         seq_arr[i, :len(s)] = s
-    save_fn = np.savez_compressed if compress else np.savez
     arrays = dict(puzzles=puzzle_arr, sequences=seq_arr)
-    if activations is not None:
-        arrays["activations"] = activations
     if n_clues is not None:
         arrays["n_clues"] = n_clues
     if solutions is not None:
         arrays["solutions"] = np.array(solutions, dtype="U81")
-    print(f"Saving probe dataset to {path} ({'compressed' if compress else 'uncompressed'})...")
-    save_fn(path, **arrays)
-    size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
-    shape_info = str(activations.shape) if activations is not None else "traces only"
-    print(f"Saved probe dataset to {path} ({shape_info}, {size_mb:.0f} MB)")
+    print(f"Saving metadata to {path}...")
+    np.savez(path, **arrays)
+
+    if activations is not None:
+        acts_path = _acts_npy_path(path)
+        print(f"Saving activations to {acts_path} {activations.shape}...")
+        np.save(acts_path, activations)
+        size_mb = os.path.getsize(acts_path) / 1e6
+        print(f"Saved {acts_path} ({size_mb:.0f} MB)")
+    else:
+        print(f"Saved {path} (traces only)")
 
 
 def load_probe_dataset(path: str):
-    """Load cached activations, puzzles, sequences, n_clues, and optionally solutions."""
-    data = np.load(path)
-    activations = data["activations"] if "activations" in data else None
+    """Load cached activations, puzzles, sequences, n_clues, and optionally solutions.
+
+    Activations are loaded from a companion _acts.npy file when present (true OS mmap),
+    falling back to the legacy embedded-in-NPZ format for backward compatibility.
+    """
+    data = np.load(path, allow_pickle=False)
+    acts_path = _acts_npy_path(path)
+    if os.path.exists(acts_path):
+        activations = np.load(acts_path, mmap_mode="r")
+    elif "activations" in data.files:
+        # Legacy format: activations embedded inside the NPZ/ZIP — no true mmap possible.
+        print(f"Note: activations embedded in {path}; re-collect to enable OS mmap.")
+        activations = data["activations"]
+    else:
+        activations = None
     puzzles = list(data["puzzles"])
     seq_arr = data["sequences"]
-    # Convert back to list of lists, stripping padding
-    sequences = []
-    for row in seq_arr:
-        seq = row[row != PAD_TOKEN].tolist()
-        sequences.append(seq)
+    sequences = [row[row != PAD_TOKEN].tolist() for row in seq_arr]
     n_clues = data["n_clues"] if "n_clues" in data else None
     solutions = list(data["solutions"]) if "solutions" in data else None
     shape_info = str(activations.shape) if activations is not None else "traces only"
@@ -447,20 +464,20 @@ def generate_probe_dataset(
     intermediates_fn = make_intermediates_fn(model)
 
     if cache_path:
-        # Stream activations into a temporary memmap to avoid peak RAM = 2× full array.
-        # np.savez (uncompressed) iterates memmaps in chunks, so saving also stays O(1 batch).
+        # Write activations directly to the final .npy destination via open_memmap —
+        # no temp file needed, and the result is immediately OS-mmappable on load.
         cfg = model.config
         max_length = max(len(s) for s in sequences)
         shape = (len(sequences), cfg.n_layers, max_length, cfg.d_model)
-        tmp_path = cache_path + ".tmp.npy"
-        acts_mm = np.lib.format.open_memmap(tmp_path, mode="w+", dtype=np.float32, shape=shape)
+        acts_path = _acts_npy_path(cache_path)
+        acts_mm = np.lib.format.open_memmap(acts_path, mode="w+", dtype=np.float32, shape=shape)
         try:
             collect_activations(intermediates_fn, params, sequences, batch_size, out=acts_mm)
-            save_probe_dataset(cache_path, acts_mm, puzzles, sequences, compress=compress, n_clues=n_clues, solutions=solutions)
         finally:
             del acts_mm
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        save_probe_dataset(cache_path, None, puzzles, sequences, compress=compress, n_clues=n_clues, solutions=solutions)
+        size_mb = os.path.getsize(acts_path) / 1e6
+        print(f"Saved activations to {acts_path} ({shape}, {size_mb:.0f} MB)")
         return None, puzzles, sequences, n_clues, solutions
 
     activations = collect_activations(intermediates_fn, params, sequences, batch_size)

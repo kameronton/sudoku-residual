@@ -38,7 +38,7 @@ def main():
     # Import heavy deps only when actually running
     from sudoku.activations import load_probe_dataset, derive_n_clues
     from sudoku.probes import (
-        prepare_probe_inputs, run_probe_loop, run_structure_probe_loop, compute_deltas,
+        prepare_probe_inputs, run_probe_loop, run_structure_probe_loop,
         plot_all_layers, plot_all_layers_per_digit, plot_structure, metric_name_for_mode,
     )
 
@@ -65,7 +65,7 @@ def main():
         if n_clues is None:
             n_clues = derive_n_clues(puzzles)
 
-        activations, probe_grids, probe_positions = prepare_probe_inputs(
+        activations, probe_grids, probe_positions, keep = prepare_probe_inputs(
             activations, puzzles, sequences, n_clues, step,
         )
 
@@ -73,18 +73,17 @@ def main():
             print("  No puzzles remaining after filtering.")
             continue
 
-        if use_deltas:
-            activations = compute_deltas(activations)
-
         print(f"  Running probes ({mode}, step={step}, {len(probe_grids)} puzzles)...")
         if mode == "structure":
-            all_scores, all_brier_struct = run_structure_probe_loop(activations, probe_grids, probe_positions)
+            all_scores, all_brier_struct = run_structure_probe_loop(
+                activations, probe_grids, probe_positions, keep=keep, use_deltas=use_deltas,
+            )
             plot_structure(all_scores, output_path, show=False)
             plot_structure(all_brier_struct, output_path.replace(".png", "_brier.png"),
                            show=False, vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
         else:
             all_accuracies, all_per_digit, all_brier = run_probe_loop(
-                activations, probe_grids, probe_positions, mode=mode,
+                activations, probe_grids, probe_positions, mode=mode, keep=keep, use_deltas=use_deltas,
             )
             metric = metric_name_for_mode(mode)
             if per_digit and all_per_digit:
