@@ -229,17 +229,6 @@ def generate_traces_batched_cached(
     return all_traces, all_sequences
 
 
-def traces_to_sequences(puzzles: list[str], traces: list[list[tuple[int, int, int]]], use_sep: bool = True) -> list[list[int]]:
-    """Convert puzzles + traces into full token sequences (row-major clue order)."""
-    sequences = []
-    for puzzle, trace in zip(puzzles, traces):
-        tokens = encode_clues(puzzle, use_sep=use_sep)
-        for r, c, d in trace:
-            tokens.append(encode_fill(r, c, d))
-        sequences.append(tokens)
-    return sequences
-
-
 def sequences_to_traces(sequences: list[list[int]], n_clues: np.ndarray | None = None) -> list[list[tuple[int, int, int]]]:
     """Extract trace tokens from sequences (everything after the clue/SEP boundary).
 
