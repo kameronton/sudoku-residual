@@ -132,6 +132,32 @@ def _search(s: _SolverState) -> bool:
     return False
 
 
+def apply_placement(
+    grid: str,
+    candidates: list[set[int]],
+    placement: tuple[int, int],
+) -> tuple[str, list[set[int]]]:
+    """Apply a single placement and update candidates via peer elimination.
+
+    Args:
+        grid:        81-char string; '0'/'.' = empty, '1'-'9' = filled digit.
+        candidates:  list of 81 sets of remaining candidate digits (1–9).
+        placement:   (cell_id, digit) — cell index 0–80 and digit 1–9.
+
+    Returns:
+        (new_grid, new_candidates) after filling the cell and removing the
+        placed digit from every peer's candidate set.
+    """
+    cell_id, digit = placement
+    new_grid = grid[:cell_id] + str(digit) + grid[cell_id + 1:]
+    new_candidates: list[set[int]] = candidates[:]
+    new_candidates[cell_id] = set()
+    for peer in _PEERS_INT[cell_id]:
+        if digit in new_candidates[peer]:
+            new_candidates[peer] = new_candidates[peer] - {digit}
+    return new_grid, new_candidates
+
+
 def solve(puzzle: str) -> tuple[str, list[tuple[int, int, int]]] | None:
     """Solve an 81-char puzzle string. Returns (solution_str, constraint_guided_trace) or None."""
     peers, units, elim_order = _shuffled_tables()
