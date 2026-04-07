@@ -21,6 +21,7 @@ def main():
     step = int(opts["_extra"].get("step", 0))
     per_digit = opts["_extra"].get("per-digit", False)
     use_deltas = opts["_extra"].get("use-deltas", False)
+    act_type = opts["_extra"].get("act-type", "post_mlp")
 
     runs = resolve_runs(opts)
     if not runs:
@@ -61,7 +62,7 @@ def main():
             continue
 
         print(f"  Loading {cache_path}...")
-        activations, puzzles, sequences, n_clues, _ = load_probe_dataset(cache_path)
+        activations, puzzles, sequences, n_clues, _ = load_probe_dataset(cache_path, act_type=act_type)
         if n_clues is None:
             n_clues = derive_n_clues(puzzles)
 

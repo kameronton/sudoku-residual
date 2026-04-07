@@ -84,7 +84,7 @@ class TransformerBlock(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    def __call__(self, x, cache=None, cache_index=None, attn_mask=None):
+    def __call__(self, x, cache=None, cache_index=None, attn_mask=None, return_intermediates=False):
         cfg = self.config
         dtype = cfg.jax_dtype
         # Pre-norm: LN -> attention -> residual
@@ -95,12 +95,18 @@ class TransformerBlock(nn.Module):
             h = CausalSelfAttention(cfg)(h, attn_mask=attn_mask)
             updated_cache = None
         x = x + h
+        post_attn = x
         # Pre-norm: LN -> FFN -> residual
         h = nn.LayerNorm(dtype=dtype)(x)
         h = nn.Dense(cfg.d_ff, dtype=dtype)(h)
         h = nn.gelu(h)
         h = nn.Dense(cfg.d_model, dtype=dtype)(h)
         x = x + h
+        if return_intermediates:
+            layer_acts = {"post_attn": post_attn, "post_mlp": x}
+            if updated_cache is not None:
+                return x, updated_cache, layer_acts
+            return x, layer_acts
         if updated_cache is not None:
             return x, updated_cache
         return x
@@ -131,16 +137,19 @@ class GPT2Model(nn.Module):
             x = tok_emb
 
         updated_caches = []
-        intermediates = []
+        intermediates: dict[str, jnp.ndarray] = {}
         for i in range(cfg.n_layers):
             layer_cache = cache[i] if cache is not None else None
             if layer_cache is not None:
                 x, new_cache = TransformerBlock(cfg, name=f"block_{i}")(x, cache=layer_cache, cache_index=cache_index)
                 updated_caches.append(new_cache)
             else:
-                x = TransformerBlock(cfg, name=f"block_{i}")(x, attn_mask=attn_mask)
                 if return_intermediates:
-                    intermediates.append(x)
+                    x, layer_acts = TransformerBlock(cfg, name=f"block_{i}")(x, attn_mask=attn_mask, return_intermediates=True)
+                    for k, v in layer_acts.items():
+                        intermediates[f"layer_{i}_{k}"] = v
+                else:
+                    x = TransformerBlock(cfg, name=f"block_{i}")(x, attn_mask=attn_mask)
 
         x = nn.LayerNorm(dtype=dtype)(x)
         logits = nn.Dense(cfg.vocab_size, dtype=dtype, name="lm_head")(x)  # (B, T, vocab_size)
@@ -148,7 +157,8 @@ class GPT2Model(nn.Module):
         if cache is not None:
             return logits, updated_caches
         if return_intermediates:
-            return logits, jnp.stack(intermediates)
+            # intermediates: dict mapping "layer_{i}_{descriptor}" -> (batch, seq_len, d_model)
+            return logits, intermediates
         return logits
 
 

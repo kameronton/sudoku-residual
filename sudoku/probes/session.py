@@ -104,15 +104,17 @@ class ProbeSession:
     Filter it with ActivationIndex methods, then call acts() / grids() / split().
     """
 
-    def __init__(self, cache_path: str, max_step: int | None = None):
+    def __init__(self, cache_path: str, max_step: int | None = None, act_type: str = "post_mlp"):
         """
-        cache_path  Path to the .npz metadata file; the companion _acts.npy is
-                    loaded automatically as an OS-level mmap.
+        cache_path  Path to the .npz metadata file; the companion _acts_{act_type}.npy
+                    is loaded automatically as an OS-level mmap.
         max_step    If set, include only trace positions with step <= max_step.
                     Saves memory for long BT traces.
+        act_type    Which activation descriptor to load (default: "post_mlp").
+                    Use "post_attn" for residual stream after attention, before MLP.
         """
         self.activations, self.puzzles, self.sequences, self.n_clues, self.solutions = \
-            load_probe_dataset(cache_path)
+            load_probe_dataset(cache_path, act_type=act_type)
         if self.n_clues is None:
             self.n_clues = derive_n_clues(self.puzzles)
 

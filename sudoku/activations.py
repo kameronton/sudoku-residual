@@ -257,6 +257,11 @@ def sequences_to_traces(sequences: list[list[int]], n_clues: np.ndarray | None =
     return traces
 
 
+# Ordered list of activation descriptors produced by TransformerBlock.
+# Determines which _acts_{descriptor}.npy files are written during collection.
+ACTIVATION_DESCRIPTORS = ("post_attn", "post_mlp")
+
+
 def make_intermediates_fn(model: GPT2Model):
     @jax.jit
     def forward(params, tokens):
@@ -274,13 +279,17 @@ def load_puzzles(traces_path: str, n: int) -> list[str]:
     return puzzles
 
 
-def collect_activations(intermediates_fn, params, sequences: list[list[int]], batch_size: int,
-                        out: np.ndarray | None = None):
+def collect_activations(
+    intermediates_fn, params, sequences: list[list[int]], batch_size: int,
+    out: dict[str, np.ndarray] | None = None,
+) -> dict[str, np.ndarray]:
     """Forward pass on complete sequences to get activations at all layers/tokens.
 
-    Returns array of shape (n_puzzles, n_layers, max_seq_len, d_model).
-    If `out` is provided (e.g. a memmap), writes directly into it batch-by-batch
-    to avoid accumulating the full array in RAM.
+    Returns a dict mapping activation descriptor (e.g. "post_mlp", "post_attn")
+    to an array of shape (n_puzzles, n_layers, max_seq_len, d_model).
+
+    If `out` is provided (dict of memmaps keyed by descriptor), writes directly
+    into each memmap batch-by-batch to avoid accumulating the full array in RAM.
     """
     n = len(sequences)
     max_length = max(len(s) for s in sequences)
@@ -289,34 +298,55 @@ def collect_activations(intermediates_fn, params, sequences: list[list[int]], ba
         dtype=jnp.int32,
     )
 
-    all_acts = [] if out is None else None
+    all_acts: dict[str, list[np.ndarray]] | None = (
+        None if out is not None else {desc: [] for desc in ACTIVATION_DESCRIPTORS}
+    )
+    n_layers = None
+
     for start in range(0, n, batch_size):
         print(f"  Forward pass {start}/{n}", end="\r")
         end = min(start + batch_size, n)
         batch = padded[start : start + batch_size]
         _, intermediates = intermediates_fn(params, batch)
-        # intermediates: (n_layers, batch, seq_len, d_model) -> (batch, n_layers, seq_len, d_model)
-        batch_acts = np.array(intermediates.transpose(1, 0, 2, 3)).astype(np.float32)
-        if out is not None:
-            out[start:end] = batch_acts[:end - start]
-        else:
-            all_acts.append(batch_acts)
+        # intermediates: dict "layer_{i}_{descriptor}" -> (batch, seq_len, d_model)
+
+        if n_layers is None:
+            n_layers = max(int(k.split("_")[1]) for k in intermediates) + 1
+
+        for desc in ACTIVATION_DESCRIPTORS:
+            # Stack layers: each (batch, seq_len, d_model) -> (n_layers, batch, seq_len, d_model)
+            # then transpose to (batch, n_layers, seq_len, d_model)
+            layers = [np.array(intermediates[f"layer_{i}_{desc}"]) for i in range(n_layers)]
+            batch_acts = np.stack(layers, axis=0).transpose(1, 0, 2, 3).astype(np.float32)
+            actual = batch_acts[:end - start]
+            if out is not None:
+                out[desc][start:end] = actual
+            else:
+                all_acts[desc].append(actual)
     print()
 
     if out is not None:
         return out
-    return np.concatenate(all_acts, axis=0).astype(np.float32)
+    return {desc: np.concatenate(v, axis=0) for desc, v in all_acts.items()}
 
 
-def _acts_npy_path(cache_path: str) -> str:
-    """Path of the standalone activations .npy file paired with a metadata .npz."""
-    return cache_path.replace(".npz", "_acts.npy")
+def _acts_npy_path(cache_path: str, act_type: str = "post_mlp") -> str:
+    """Path of the standalone activations .npy file for a given activation type."""
+    return cache_path.replace(".npz", f"_acts_{act_type}.npy")
 
 
-def save_probe_dataset(path: str, activations: np.ndarray | None, puzzles: list[str], sequences: list[list[int]], compress: bool = True, n_clues: np.ndarray | None = None, solutions: list[str] | None = None):
-    """Save metadata (puzzles, sequences, n_clues) to path (.npz) and activations to a
-    companion _acts.npy file.  Activations are stored as a plain .npy (not inside the ZIP)
-    so that np.load(_acts_npy_path, mmap_mode='r') creates a true OS-level mmap."""
+def save_probe_dataset(
+    path: str,
+    activations: dict[str, np.ndarray] | None,
+    puzzles: list[str],
+    sequences: list[list[int]],
+    compress: bool = True,
+    n_clues: np.ndarray | None = None,
+    solutions: list[str] | None = None,
+):
+    """Save metadata (puzzles, sequences, n_clues) to path (.npz) and activations to
+    companion _acts_{descriptor}.npy files, one per activation type.  Each .npy file
+    stores shape (n_puzzles, n_layers, seq_len, d_model) and supports OS-level mmap."""
     puzzle_arr = np.array(puzzles, dtype=f"U{len(puzzles[0])}")
     max_len = max(len(s) for s in sequences)
     seq_arr = np.full((len(sequences), max_len), PAD_TOKEN, dtype=np.int16)
@@ -331,25 +361,31 @@ def save_probe_dataset(path: str, activations: np.ndarray | None, puzzles: list[
     np.savez(path, **arrays)
 
     if activations is not None:
-        acts_path = _acts_npy_path(path)
-        print(f"Saving activations to {acts_path} {activations.shape}...")
-        np.save(acts_path, activations)
-        size_mb = os.path.getsize(acts_path) / 1e6
-        print(f"Saved {acts_path} ({size_mb:.0f} MB)")
+        for act_type, acts_arr in activations.items():
+            acts_path = _acts_npy_path(path, act_type)
+            print(f"Saving activations to {acts_path} {acts_arr.shape}...")
+            np.save(acts_path, acts_arr)
+            size_mb = os.path.getsize(acts_path) / 1e6
+            print(f"Saved {acts_path} ({size_mb:.0f} MB)")
     else:
         print(f"Saved {path} (traces only)")
 
 
-def load_probe_dataset(path: str):
+def load_probe_dataset(path: str, act_type: str = "post_mlp"):
     """Load cached activations, puzzles, sequences, n_clues, and optionally solutions.
 
-    Activations are loaded from a companion _acts.npy file when present (true OS mmap),
-    falling back to the legacy embedded-in-NPZ format for backward compatibility.
+    act_type selects which activation descriptor to load (default: "post_mlp").
+    Activations are loaded from a companion _acts_{act_type}.npy file (true OS mmap).
+    Falls back to legacy _acts.npy (treated as "post_mlp") for backward compatibility.
     """
     data = np.load(path, allow_pickle=False)
-    acts_path = _acts_npy_path(path)
+    acts_path = _acts_npy_path(path, act_type)
+    legacy_path = path.replace(".npz", "_acts.npy")
     if os.path.exists(acts_path):
         activations = np.load(acts_path, mmap_mode="r")
+    elif act_type == "post_mlp" and os.path.exists(legacy_path):
+        print(f"Note: loading legacy _acts.npy as '{act_type}'; re-collect to use new format.")
+        activations = np.load(legacy_path, mmap_mode="r")
     elif "activations" in data.files:
         # Legacy format: activations embedded inside the NPZ/ZIP — no true mmap possible.
         print(f"Note: activations embedded in {path}; re-collect to enable OS mmap.")
@@ -362,7 +398,7 @@ def load_probe_dataset(path: str):
     n_clues = data["n_clues"] if "n_clues" in data else None
     solutions = list(data["solutions"]) if "solutions" in data else None
     shape_info = str(activations.shape) if activations is not None else "traces only"
-    print(f"Loaded probe dataset from {path} ({shape_info})")
+    print(f"Loaded probe dataset from {path} ({shape_info}) [act_type={act_type!r}]")
     return activations, puzzles, sequences, n_clues, solutions
 
 
@@ -453,20 +489,25 @@ def generate_probe_dataset(
     intermediates_fn = make_intermediates_fn(model)
 
     if cache_path:
-        # Write activations directly to the final .npy destination via open_memmap —
+        # Write each activation type directly to its .npy destination via open_memmap —
         # no temp file needed, and the result is immediately OS-mmappable on load.
         cfg = model.config
         max_length = max(len(s) for s in sequences)
         shape = (len(sequences), cfg.n_layers, max_length, cfg.d_model)
-        acts_path = _acts_npy_path(cache_path)
-        acts_mm = np.lib.format.open_memmap(acts_path, mode="w+", dtype=np.float32, shape=shape)
+        memmaps: dict[str, np.ndarray] = {}
         try:
-            collect_activations(intermediates_fn, params, sequences, batch_size, out=acts_mm)
+            for desc in ACTIVATION_DESCRIPTORS:
+                acts_path = _acts_npy_path(cache_path, desc)
+                memmaps[desc] = np.lib.format.open_memmap(acts_path, mode="w+", dtype=np.float32, shape=shape)
+            collect_activations(intermediates_fn, params, sequences, batch_size, out=memmaps)
         finally:
-            del acts_mm
+            for mm in memmaps.values():
+                del mm
         save_probe_dataset(cache_path, None, puzzles, sequences, compress=compress, n_clues=n_clues, solutions=solutions)
-        size_mb = os.path.getsize(acts_path) / 1e6
-        print(f"Saved activations to {acts_path} ({shape}, {size_mb:.0f} MB)")
+        for desc in ACTIVATION_DESCRIPTORS:
+            acts_path = _acts_npy_path(cache_path, desc)
+            size_mb = os.path.getsize(acts_path) / 1e6
+            print(f"Saved {acts_path} ({shape}, {size_mb:.0f} MB)")
         return None, puzzles, sequences, n_clues, solutions
 
     activations = collect_activations(intermediates_fn, params, sequences, batch_size)

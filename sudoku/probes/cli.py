@@ -37,6 +37,9 @@ def main():
                         help="Per-digit F1 heatmap (candidates mode only)")
     parser.add_argument("--use-deltas", action="store_true",
                         help="Probe layer-wise deltas instead of cumulative activations")
+    parser.add_argument("--act-type", default="post_mlp",
+                        choices=["post_mlp", "post_attn"],
+                        help="Which activation type to probe (default: post_mlp)")
     parser.add_argument("--step", type=int, default=0,
                         help="Probe at anchor+step (0 = SEP/initial board)")
     parser.add_argument("--filter", choices=["all", "solved", "unsolved"], default="all")
@@ -55,7 +58,7 @@ def main():
             cache_path=args.cache_path, compress=not args.no_compress,
         )
 
-    session = ProbeSession(args.cache_path)
+    session = ProbeSession(args.cache_path, act_type=args.act_type)
 
     # --- Solve status filter: narrow to a subset of puzzle indices ---
     puzzle_subset = None
