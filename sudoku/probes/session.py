@@ -54,7 +54,8 @@ class ActivationIndex:
     puzzle_idx: np.ndarray  # (N,) int32 — row in activations/sequences arrays
     seq_pos:    np.ndarray  # (N,) int32 — token position in the sequence
     step:       np.ndarray  # (N,) int32 — offset from anchor (0 = SEP / last_clue)
-    n_filled:   np.ndarray  # (N,) int16 — cells filled at this position (incl. clues)
+    n_filled:   np.ndarray  # (N,) int16 — unique cells filled at this position (incl. clues)
+    tokens:     np.ndarray  # (N,) int16 - the tokeins
 
     def __len__(self) -> int:
         return len(self.puzzle_idx)
@@ -65,6 +66,7 @@ class ActivationIndex:
             seq_pos=   self.seq_pos[idx],
             step=      self.step[idx],
             n_filled=  self.n_filled[idx],
+            tokens= self.tokens[idx],
         )
 
     def filter(self, mask: np.ndarray) -> ActivationIndex:
@@ -127,25 +129,32 @@ class ProbeSession:
         seq_positions: list[int] = []
         steps:         list[int] = []
         n_filleds:     list[int] = []
+        tokens:        list[int] = []
 
         for i, (seq, nc) in enumerate(zip(self.sequences, self.n_clues)):
             # Anchor: SEP position (= n_clues) or last clue position (= n_clues - 1)
             anchor = int(nc) if self.has_sep else int(nc) - 1
 
-            # Compute n_filled incrementally, respecting BT push/pop semantics.
-            # Clue tokens (0-728) are counted too, so n_filled at the anchor
-            # equals n_clues[i] for standard traces.
+            # Track explicit grid state: grid[cell] is True when that cell is
+            # occupied.  n_filled is kept in sync incrementally (O(1) per token).
+            # Using a bool array rather than a counter ensures that filling the
+            # same cell twice — or with two different digits — is not double-counted.
+            # token = cell_idx * 9 + (digit - 1), so cell_idx = token // 9.
+            grid: list[bool] = [False] * 81
             n_filled = 0
-            stack: list[int] = []
+            stack: list[tuple[list[bool], int]] = []
 
             for pos, tok in enumerate(seq):
                 if 0 <= tok <= 728:
-                    n_filled += 1
+                    cell = tok // 9
+                    if not grid[cell]:
+                        grid[cell] = True
+                        n_filled += 1
                 elif tok == PUSH_TOKEN:
-                    stack.append(n_filled)
+                    stack.append((grid[:], n_filled))
                 elif tok == POP_TOKEN:
                     if stack:
-                        n_filled = stack.pop()
+                        grid, n_filled = stack.pop()
 
                 if pos < anchor:
                     continue
@@ -157,12 +166,14 @@ class ProbeSession:
                 seq_positions.append(pos)
                 steps.append(k)
                 n_filleds.append(n_filled)
+                tokens.append(tok)
 
         return ActivationIndex(
             puzzle_idx=np.array(puzzle_idxs,   dtype=np.int32),
             seq_pos=   np.array(seq_positions, dtype=np.int32),
             step=      np.array(steps,         dtype=np.int32),
             n_filled=  np.array(n_filleds,     dtype=np.int16),
+            tokens=    np.array(tokens,        dtype=np.int16)
         )
 
     # ------------------------------------------------------------------
