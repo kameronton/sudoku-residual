@@ -46,16 +46,18 @@ def main():
         header = f"[{i+1}/{len(runs)}] {name}{step_info}"
         print(f"\n{'='*60}\n{header}\n{'='*60}")
 
-        from sudoku.activations import _acts_npy_path
-        if os.path.exists(_acts_npy_path(cache_path)):
-            print(f"  Skipping (activations already exist: {_acts_npy_path(cache_path)})")
+        from sudoku.activations import _acts_npy_path, ACTIVATION_DESCRIPTORS
+        missing = [desc for desc in ACTIVATION_DESCRIPTORS if not os.path.exists(_acts_npy_path(cache_path, desc))]
+        if not missing:
+            print(f"  Skipping (all activations already exist: {cache_path})")
             continue
         if os.path.exists(cache_path):
             import numpy as _np
-            if "activations" in _np.load(cache_path, allow_pickle=False).files:
+            _npz = _np.load(cache_path, allow_pickle=False)
+            if "activations" in _npz.files:
                 print(f"  Skipping (activations already exist (legacy): {cache_path})")
                 continue
-            # File exists but contains only traces — fall through to collect activations
+            # File exists but missing some activations — fall through to collect them
 
         generate_probe_dataset(
             ckpt_dir=cfg["ckpt_dir"],

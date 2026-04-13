@@ -259,7 +259,7 @@ def sequences_to_traces(sequences: list[list[int]], n_clues: np.ndarray | None =
 
 # Ordered list of activation descriptors produced by TransformerBlock.
 # Determines which _acts_{descriptor}.npy files are written during collection.
-ACTIVATION_DESCRIPTORS = ("post_attn", "post_mlp")
+ACTIVATION_DESCRIPTORS = ("post_attn", "post_mlp", "attn_weights")
 
 
 def make_intermediates_fn(model: GPT2Model):
@@ -286,10 +286,12 @@ def collect_activations(
     """Forward pass on complete sequences to get activations at all layers/tokens.
 
     Returns a dict mapping activation descriptor (e.g. "post_mlp", "post_attn")
-    to an array of shape (n_puzzles, n_layers, max_seq_len, d_model).
+    to an array of shape (n_puzzles, n_layers, max_seq_len, d_model), or for
+    "attn_weights" to (n_puzzles, n_layers, n_heads, max_seq_len, max_seq_len).
 
     If `out` is provided (dict of memmaps keyed by descriptor), writes directly
     into each memmap batch-by-batch to avoid accumulating the full array in RAM.
+    If `out` is provided, only descriptors present in `out.keys()` are collected.
     """
     n = len(sequences)
     max_length = max(len(s) for s in sequences)
@@ -308,16 +310,17 @@ def collect_activations(
         end = min(start + batch_size, n)
         batch = padded[start : start + batch_size]
         _, intermediates = intermediates_fn(params, batch)
-        # intermediates: dict "layer_{i}_{descriptor}" -> (batch, seq_len, d_model)
+        # intermediates: dict "layer_{i}_{descriptor}" -> (batch, ...)
 
         if n_layers is None:
-            n_layers = max(int(k.split("_")[1]) for k in intermediates) + 1
+            n_layers = max(int(k.split("_")[1]) for k in intermediates if "_" in k) + 1
 
-        for desc in ACTIVATION_DESCRIPTORS:
-            # Stack layers: each (batch, seq_len, d_model) -> (n_layers, batch, seq_len, d_model)
-            # then transpose to (batch, n_layers, seq_len, d_model)
+        descriptors_to_process = out.keys() if out is not None else ACTIVATION_DESCRIPTORS
+        for desc in descriptors_to_process:
+            # Stack layers: each (batch, ...) -> (n_layers, batch, ...)
+            # then swap to (batch, n_layers, ...)
             layers = [np.array(intermediates[f"layer_{i}_{desc}"]) for i in range(n_layers)]
-            batch_acts = np.stack(layers, axis=0).transpose(1, 0, 2, 3).astype(np.float32)
+            batch_acts = np.stack(layers, axis=0).swapaxes(0, 1).astype(np.float32)
             actual = batch_acts[:end - start]
             if out is not None:
                 out[desc][start:end] = actual
@@ -493,21 +496,35 @@ def generate_probe_dataset(
         # no temp file needed, and the result is immediately OS-mmappable on load.
         cfg = model.config
         max_length = max(len(s) for s in sequences)
-        shape = (len(sequences), cfg.n_layers, max_length, cfg.d_model)
+
+        # Determine missing activations
+        missing = [desc for desc in ACTIVATION_DESCRIPTORS if not os.path.exists(_acts_npy_path(cache_path, desc))]
+        if not missing:
+            print("All activations already present.")
+            return None, puzzles, sequences, n_clues, solutions
+
+        print(f"Missing activations: {missing}. Collecting...")
+
         memmaps: dict[str, np.ndarray] = {}
+        shapes: dict[str, tuple] = {}
         try:
-            for desc in ACTIVATION_DESCRIPTORS:
+            for desc in missing:
                 acts_path = _acts_npy_path(cache_path, desc)
+                if desc == "attn_weights":
+                    shape = (len(sequences), cfg.n_layers, cfg.n_heads, max_length, max_length)
+                else:
+                    shape = (len(sequences), cfg.n_layers, max_length, cfg.d_model)
                 memmaps[desc] = np.lib.format.open_memmap(acts_path, mode="w+", dtype=np.float32, shape=shape)
+                shapes[desc] = shape
             collect_activations(intermediates_fn, params, sequences, batch_size, out=memmaps)
         finally:
             for mm in memmaps.values():
                 del mm
         save_probe_dataset(cache_path, None, puzzles, sequences, compress=compress, n_clues=n_clues, solutions=solutions)
-        for desc in ACTIVATION_DESCRIPTORS:
+        for desc in missing:
             acts_path = _acts_npy_path(cache_path, desc)
             size_mb = os.path.getsize(acts_path) / 1e6
-            print(f"Saved {acts_path} ({shape}, {size_mb:.0f} MB)")
+            print(f"Saved {acts_path} ({shapes[desc]}, {size_mb:.0f} MB)")
         return None, puzzles, sequences, n_clues, solutions
 
     activations = collect_activations(intermediates_fn, params, sequences, batch_size)

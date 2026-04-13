@@ -62,7 +62,7 @@ class CausalSelfAttention(nn.Module):
             attn = nn.softmax(attn, axis=-1)
             out = (attn @ v_cache).transpose(0, 2, 1, 3).reshape(B, T, C)
             out = nn.Dense(C, dtype=dtype, name="proj")(out)
-            return out, updated_cache
+            return out, updated_cache, attn
 
         scale = head_dim ** -0.5
         attn = (q @ k.transpose(0, 1, 3, 2)) * scale  # (B, nh, T, T)
@@ -77,7 +77,7 @@ class CausalSelfAttention(nn.Module):
 
         out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, T, C)  # (B, T, C)
         out = nn.Dense(C, dtype=dtype, name="proj")(out)
-        return out
+        return out, attn
 
 
 class TransformerBlock(nn.Module):
@@ -90,9 +90,9 @@ class TransformerBlock(nn.Module):
         # Pre-norm: LN -> attention -> residual
         h = nn.LayerNorm(dtype=dtype)(x)
         if cache is not None:
-            h, updated_cache = CausalSelfAttention(cfg)(h, cache=cache, cache_index=cache_index)
+            h, updated_cache, attn = CausalSelfAttention(cfg)(h, cache=cache, cache_index=cache_index)
         else:
-            h = CausalSelfAttention(cfg)(h, attn_mask=attn_mask)
+            h, attn = CausalSelfAttention(cfg)(h, attn_mask=attn_mask)
             updated_cache = None
         x = x + h
         post_attn = x
@@ -103,7 +103,7 @@ class TransformerBlock(nn.Module):
         h = nn.Dense(cfg.d_model, dtype=dtype)(h)
         x = x + h
         if return_intermediates:
-            layer_acts = {"post_attn": post_attn, "post_mlp": x}
+            layer_acts = {"post_attn": post_attn, "post_mlp": x, "attn_weights": attn}
             if updated_cache is not None:
                 return x, updated_cache, layer_acts
             return x, layer_acts
@@ -117,7 +117,10 @@ class GPT2Model(nn.Module):
 
     @nn.compact
     def __call__(self, tokens, cache=None, cache_index=None, return_intermediates=False,
-                 attn_mask=None, positions=None):
+                 attn_mask=None, positions=None, patch=None):
+        # patch: optional dict {"layer": int, "pos": int, "delta": jnp.array(d_model,)}
+        # Adds delta to the post-MLP residual stream of block `layer` at position `pos`,
+        # before block `layer+1` processes it. layer must be a Python int (static for JIT).
         cfg = self.config
         B, T = tokens.shape
 
@@ -150,6 +153,8 @@ class GPT2Model(nn.Module):
                         intermediates[f"layer_{i}_{k}"] = v
                 else:
                     x = TransformerBlock(cfg, name=f"block_{i}")(x, attn_mask=attn_mask)
+            if patch is not None and i == patch["layer"]:
+                x = x.at[:, patch["pos"]].add(patch["delta"])
 
         x = nn.LayerNorm(dtype=dtype)(x)
         logits = nn.Dense(cfg.vocab_size, dtype=dtype, name="lm_head")(x)  # (B, T, vocab_size)
