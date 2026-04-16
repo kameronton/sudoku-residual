@@ -3,6 +3,7 @@
 import numpy as np
 
 
+
 def plot_all_layers(
     all_accuracies: dict[int, list[float]],
     output_path: str = "probe_accuracies.png", metric_name: str = "Accuracy",
@@ -10,6 +11,7 @@ def plot_all_layers(
 ):
     """Plot 9x9 heatmap per layer with shared colorbar."""
     import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = ['Avenir']
 
     n_layers = len(all_accuracies)
     if n_layers == 8:
@@ -30,9 +32,11 @@ def plot_all_layers(
         im = ax.imshow(grid, cmap=cmap, vmin=vmin, vmax=vmax)
         ims.append(im)
         avg = np.mean(accs)
-        ax.set_title(f"Layer {layer} (mean={avg:.3f})")
+        ax.set_title(f"Layer {layer + 1} (mean={avg:.3f})")
         ax.set_xticks(range(9))
+        ax.set_xticklabels(range(1, 10))
         ax.set_yticks(range(9))
+        ax.set_yticklabels(range(1, 10))
         for r in range(9):
             for c in range(9):
                 ax.text(c, r, f"{grid[r, c]:.2f}", ha="center", va="center", fontsize=6)
@@ -44,10 +48,10 @@ def plot_all_layers(
     for idx in range(n_layers, len(axes)):
         axes[idx].set_visible(False)
 
-    fig.suptitle(f"Per-cell probe {metric_name.lower()} by layer", fontsize=14, y=1.02)
+    #fig.suptitle(f"Per-cell probe {metric_name.lower()} by layer", fontsize=14, y=1.02)
     fig.tight_layout()
     fig.colorbar(ims[0], ax=axes[:n_layers].tolist(), shrink=0.6, label=metric_name, pad=0.02)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
     print(f"Saved {output_path}")
     if show:
         plt.show()
@@ -61,6 +65,7 @@ def plot_all_layers_per_digit(
 ):
     """Plot 9x9 grid per layer where each cell contains a 3x3 mini-heatmap of per-digit F1."""
     import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = ['Avenir']
     from matplotlib.colors import Normalize
 
     n_layers = len(all_per_digit)
@@ -85,11 +90,13 @@ def plot_all_layers_per_digit(
         ax.set_ylim(8.5, -0.5)
         ax.set_aspect("equal")
         ax.set_xticks(range(9))
+        ax.set_xticklabels(range(1, 10))
         ax.set_yticks(range(9))
+        ax.set_yticklabels(range(1, 10))
         ax.tick_params(length=0)
 
         avg = np.nanmean(per_digit_arr)
-        ax.set_title(f"Layer {layer} (mean F1={avg:.3f})")
+        ax.set_title(f"Layer {layer + 1} (mean F1={avg:.3f})")
 
         # Draw sudoku box lines
         for i in range(0, 10, 3):
@@ -128,8 +135,8 @@ def plot_all_layers_per_digit(
     # Colorbar
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     fig.colorbar(sm, ax=axes[:n_layers].tolist(), shrink=0.6, label="F1", pad=0.02)
-    fig.suptitle("Per-digit candidate F1 by layer", fontsize=14, y=1.02)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    #fig.suptitle("Per-digit candidate F1 by layer", fontsize=14, y=1.02)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
     print(f"Saved {output_path}")
     if show:
         plt.show()
@@ -147,6 +154,7 @@ def plot_structure(
     Box subtype is shown as a 3x3 heatmap matching the Sudoku grid layout.
     """
     import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = ['Avenir']
 
     n_layers = len(all_scores)
     subtypes = ["row", "col", "box"]
@@ -177,11 +185,64 @@ def plot_structure(
             if layer_idx == 0:
                 ax.set_title(col_titles[col_idx], fontsize=9)
             if col_idx == 0:
-                ax.set_ylabel(f"L{layer}", fontsize=8, rotation=0, labelpad=20, va="center")
+                ax.set_ylabel(f"L{layer + 1}", fontsize=8, rotation=0, labelpad=20, va="center")
 
     fig.colorbar(ims[0], ax=axes.ravel().tolist(), shrink=0.5, pad=0.02)
-    fig.suptitle("Structure probe (row / col / box)", fontsize=11)
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    #fig.suptitle("Structure probe (row / col / box)", fontsize=11)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    print(f"Saved {output_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_structure_single_layer(
+    all_scores: dict[int, dict[str, list[float]]],
+    layer: int,
+    output_path: str = "probe_structure_layer.png",
+    show: bool = True, vmin: float = 0.0, vmax: float = 1.0, cmap: str = "RdYlGn",
+):
+    """Plot structure probe F1 for a single layer (1-indexed): row/col/box side by side."""
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = ['Avenir']
+
+    scores = all_scores[layer - 1]
+    subtypes = ["row", "col", "box"]
+    col_titles = ["Rows", "Columns", "Boxes"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(6.5, 2.5), constrained_layout=True)
+
+    ims = []
+    for col_idx, subtype in enumerate(subtypes):
+        ax = axes[col_idx]
+        vals = np.array(scores[subtype])
+        if subtype == "box":
+            data = vals.reshape(3, 3)
+            tick_labels = range(1, 4)
+            ax.set_xticks(range(3))
+            ax.set_xticklabels(range(1, 4))
+            ax.set_yticks(range(3))
+            ax.set_yticklabels(range(1, 4))
+        elif subtype == "row":
+            data = vals.reshape(9, 1)
+            ax.set_xticks([])
+            ax.set_yticks(range(9))
+            ax.set_yticklabels(range(1, 10))
+        else:  # col
+            data = vals.reshape(1, 9)
+            ax.set_yticks([])
+            ax.set_xticks(range(9))
+            ax.set_xticklabels(range(1, 10))
+        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+        ims.append(im)
+        for r in range(data.shape[0]):
+            for c in range(data.shape[1]):
+                ax.text(c, r, f"{data[r, c]:.2f}", ha="center", va="center", fontsize=6)
+        ax.set_title(col_titles[col_idx], fontsize=9)
+
+    fig.colorbar(ims[0], ax=axes.tolist(), shrink=0.7, pad=0.02)
+    #fig.suptitle(f"Structure probe (row / col / box) — Layer {layer}", fontsize=11)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
     print(f"Saved {output_path}")
     if show:
         plt.show()
@@ -201,6 +262,7 @@ def plot_cell_temporal(
     dashed = full probe (all puzzles, filled cells get zero-candidate targets).
     """
     import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = ['Avenir']
 
     n_layers = len(filtered_results)
     steps = list(range(len(next(iter(filtered_results.values()))["auc"])))
@@ -211,7 +273,7 @@ def plot_cell_temporal(
 
     for layer in range(n_layers):
         color = colors[layer % len(colors)]
-        label = f"L{layer}"
+        label = f"L{layer + 1}"
 
         filt_auc = filtered_results[layer]["auc"]
         filt_brier = filtered_results[layer]["brier"]
@@ -229,17 +291,17 @@ def plot_cell_temporal(
 
     ax_auc.set_ylabel("AUC")
     ax_auc.set_ylim(0, 1)
-    ax_auc.set_title(f"Candidate AUC — cell ({row},{col})")
+    ax_auc.set_title(f"Candidate AUC — cell ({row + 1},{col + 1})")
     ax_brier.set_ylabel("Brier")
     ax_brier.set_ylim(0, 0.25)
-    ax_brier.set_title(f"Candidate Brier — cell ({row},{col})")
+    ax_brier.set_title(f"Candidate Brier — cell ({row + 1},{col + 1})")
 
-    fig.suptitle(
-        f"Cell ({row},{col}) candidate probes  |  solid = filtered (empty at step), dashed = full",
-        fontsize=10,
-    )
+    #fig.suptitle(
+    #     f"Cell ({row + 1},{col + 1}) candidate probes  |  solid = filtered (empty at step), dashed = full",
+    #     fontsize=10,
+    # )
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
     print(f"Saved {output_path}")
     if show:
         plt.show()
@@ -255,6 +317,7 @@ def plot_cross_step(
 ):
     """Line chart of AUC and Brier vs eval step, one line per layer."""
     import matplotlib.pyplot as plt
+    plt.rcParams['font.family'] = ['Avenir']
 
     steps = sorted(auc_by_step.keys())
     n_layers = len(next(iter(auc_by_step.values())))
@@ -264,8 +327,8 @@ def plot_cross_step(
     for layer in range(n_layers):
         aucs = [auc_by_step[s][layer] for s in steps]
         briers = [brier_by_step[s][layer] for s in steps]
-        ax_auc.plot(steps, aucs, marker="o", markersize=3, label=f"L{layer}")
-        ax_brier.plot(steps, briers, marker="o", markersize=3, label=f"L{layer}")
+        ax_auc.plot(steps, aucs, marker="o", markersize=3, label=f"L{layer + 1}")
+        ax_brier.plot(steps, briers, marker="o", markersize=3, label=f"L{layer + 1}")
 
     for ax in (ax_auc, ax_brier):
         ax.axvline(train_step, color="black", linestyle="--", linewidth=1, alpha=0.5, label="train step")
@@ -280,7 +343,7 @@ def plot_cross_step(
     ax_brier.set_title(f"Brier vs eval step (trained at step {train_step})")
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
     print(f"Saved {output_path}")
     if show:
         plt.show()

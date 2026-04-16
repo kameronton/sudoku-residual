@@ -9,7 +9,7 @@ from sudoku.activations import generate_probe_dataset
 
 from .activations import build_grid_at_step
 from .modes import MODES
-from .plotting import plot_all_layers, plot_all_layers_per_digit, plot_structure, plot_cross_step, plot_cell_temporal
+from .plotting import plot_all_layers, plot_all_layers_per_digit, plot_structure, plot_structure_single_layer, plot_cross_step, plot_cell_temporal
 from .probing import (
     filter_by_solve_status,
     run_probe_loop, run_structure_probe_loop, run_cross_step_probe_loop,
@@ -121,6 +121,12 @@ def main():
         plot_structure(all_scores, output)
         plot_structure(all_brier, output.replace(".png", "_brier.png"),
                        vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
+        if len(all_scores) >= 4:
+            plot_structure_single_layer(all_scores, layer=4,
+                output_path=output.replace(".png", "_layer4.png"))
+            plot_structure_single_layer(all_brier, layer=4,
+                output_path=output.replace(".png", "_brier_layer4.png"),
+                vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
     else:
         mode = MODES[args.mode]
         all_accuracies, all_per_digit, all_brier = run_probe_loop(

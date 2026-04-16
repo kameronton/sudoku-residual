@@ -35,6 +35,7 @@ from sudoku.probes.plotting import (
     plot_all_layers,
     plot_all_layers_per_digit,
     plot_structure,
+    plot_structure_single_layer,
     plot_cross_step,
     plot_cell_temporal,
 )
@@ -57,7 +58,7 @@ __all__ = [
     "stack_depth", "cells_filled", "metric_name_for_mode",
     # plotting
     "plot_all_layers", "plot_all_layers_per_digit", "plot_structure",
-    "plot_cross_step", "plot_cell_temporal",
+    "plot_structure_single_layer", "plot_cross_step", "plot_cell_temporal",
     # cli
     "main",
 ]

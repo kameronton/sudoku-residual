@@ -40,7 +40,8 @@ def main():
     from sudoku.activations import load_probe_dataset, derive_n_clues
     from sudoku.probes import (
         prepare_probe_inputs, run_probe_loop, run_structure_probe_loop,
-        plot_all_layers, plot_all_layers_per_digit, plot_structure, metric_name_for_mode,
+        plot_all_layers, plot_all_layers_per_digit, plot_structure, plot_structure_single_layer,
+        metric_name_for_mode,
     )
 
     for i, (name, _, ckpt_step, output_dir) in enumerate(runs):
@@ -82,6 +83,12 @@ def main():
             plot_structure(all_scores, output_path, show=False)
             plot_structure(all_brier_struct, output_path.replace(".png", "_brier.png"),
                            show=False, vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
+            # if len(all_scores) >= 3:
+            #     plot_structure_single_layer(all_scores, layer=3,
+            #         output_path=output_path.replace(".png", "_layer3.png"), show=False)
+            #     plot_structure_single_layer(all_brier_struct, layer=3,
+            #         output_path=output_path.replace(".png", "_brier_layer3.png"),
+            #         show=False, vmin=0.0, vmax=0.25, cmap="RdYlGn_r")
         else:
             all_accuracies, all_per_digit, all_brier = run_probe_loop(
                 activations, probe_grids, probe_positions, mode=mode, keep=keep, use_deltas=use_deltas,
