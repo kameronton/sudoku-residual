@@ -259,7 +259,7 @@ def sequences_to_traces(sequences: list[list[int]], n_clues: np.ndarray | None =
 
 # Ordered list of activation descriptors produced by TransformerBlock.
 # Determines which _acts_{descriptor}.npy files are written during collection.
-ACTIVATION_DESCRIPTORS = ["post_mlp"] # ("post_attn")
+ACTIVATION_DESCRIPTORS = ["post_mlp", "post_attn"]
 
 
 def make_intermediates_fn(model: GPT2Model):

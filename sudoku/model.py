@@ -154,7 +154,7 @@ class GPT2Model(nn.Module):
                 else:
                     x = TransformerBlock(cfg, name=f"block_{i}")(x, attn_mask=attn_mask)
             if patch is not None and i == patch["layer"]:
-                x = x.at[:, patch["pos"]].add(patch["delta"])
+                x = x.at[:, patch["pos"]].add(patch["delta"].astype(x.dtype))
 
         x = nn.LayerNorm(dtype=dtype)(x)
         logits = nn.Dense(cfg.vocab_size, dtype=dtype, name="lm_head")(x)  # (B, T, vocab_size)
