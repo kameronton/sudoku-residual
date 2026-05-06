@@ -51,7 +51,9 @@ def _eval_multilabel(
         for d in range(9)
     ])
     per_digit_brier = np.mean((probas - y_test) ** 2, axis=0)
-    return float(np.nanmean(per_digit_auc)), float(np.mean(per_digit_brier)), per_digit_auc, per_digit_brier
+    with np.errstate(all="ignore"):
+        mean_auc = float(np.nanmean(per_digit_auc))
+    return mean_auc, float(np.mean(per_digit_brier)), per_digit_auc, per_digit_brier
 
 
 def cell_candidates(puzzle: str, cell_idx: int) -> list[int]:
