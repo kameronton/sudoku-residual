@@ -118,10 +118,10 @@ def compute_data(args) -> pd.DataFrame:
         rows += [
             {"Layer": layer + 1, "Metric": "element-wise", "Accuracy": np.nanmean(state_ew),  "Probe": "cell state"},
             {"Layer": layer + 1, "Metric": "element-wise", "Accuracy": np.nanmean(cand_ew),   "Probe": "cell candidates"},
-            {"Layer": layer + 1, "Metric": "element-wise", "Accuracy": np.nanmean(struct_ew), "Probe": "substructure candidates"},
+            {"Layer": layer + 1, "Metric": "element-wise", "Accuracy": np.nanmean(struct_ew), "Probe": "substructure state"},
             {"Layer": layer + 1, "Metric": "exact match",  "Accuracy": np.nanmean(state_em),  "Probe": "cell state"},
             {"Layer": layer + 1, "Metric": "exact match",  "Accuracy": np.nanmean(cand_em),   "Probe": "cell candidates"},
-            {"Layer": layer + 1, "Metric": "exact match",  "Accuracy": np.nanmean(struct_em), "Probe": "substructure candidates"},
+            {"Layer": layer + 1, "Metric": "exact match",  "Accuracy": np.nanmean(struct_em), "Probe": "substructure state"},
         ]
 
     return pd.DataFrame(rows)
