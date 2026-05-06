@@ -116,12 +116,12 @@ def compute_data(args) -> pd.DataFrame:
               f"  struct={np.nanmean(struct_em):.3f}")
 
         rows += [
-            {"Layer": layer + 1, "Metric": "element-wise", "Accuracy": np.nanmean(state_ew),  "Probe": "cell state"},
-            {"Layer": layer + 1, "Metric": "element-wise", "Accuracy": np.nanmean(cand_ew),   "Probe": "cell candidates"},
-            {"Layer": layer + 1, "Metric": "element-wise", "Accuracy": np.nanmean(struct_ew), "Probe": "substructure state"},
-            {"Layer": layer + 1, "Metric": "exact match",  "Accuracy": np.nanmean(state_em),  "Probe": "cell state"},
-            {"Layer": layer + 1, "Metric": "exact match",  "Accuracy": np.nanmean(cand_em),   "Probe": "cell candidates"},
-            {"Layer": layer + 1, "Metric": "exact match",  "Accuracy": np.nanmean(struct_em), "Probe": "substructure state"},
+            {"Layer": "L" + str(layer + 1), "Metric": "element-wise", "Accuracy": np.nanmean(state_ew),  "Probe": "cell state"},
+            {"Layer": "L" + str(layer + 1), "Metric": "element-wise", "Accuracy": np.nanmean(cand_ew),   "Probe": "cell candidates"},
+            {"Layer": "L" + str(layer + 1), "Metric": "element-wise", "Accuracy": np.nanmean(struct_ew), "Probe": "substructure state"},
+            {"Layer": "L" + str(layer + 1), "Metric": "exact match",  "Accuracy": np.nanmean(state_em),  "Probe": "cell state"},
+            {"Layer": "L" + str(layer + 1), "Metric": "exact match",  "Accuracy": np.nanmean(cand_em),   "Probe": "cell candidates"},
+            {"Layer": "L" + str(layer + 1), "Metric": "exact match",  "Accuracy": np.nanmean(struct_em), "Probe": "substructure state"},
         ]
 
     return pd.DataFrame(rows)
