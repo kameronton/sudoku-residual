@@ -13,17 +13,75 @@ solver traces. The analysis then asks questions such as:
 - Which attention heads and MLP components write useful Sudoku information into
   the residual stream?
 
+## Paper Reproduction
+
+### Figures From Released Artifacts
+
+The recommended path avoids retraining. Place the released artifacts in the
+repository with this layout:
+
+```text
+data/bt_traces_3m.npz
+results/3M-backtracking-packing/
+  config.json
+  train_log.json
+  checkpoint/
+  activations.npz
+```
+
+Then install dependencies and regenerate the large activation arrays locally:
+
+```bash
+uv sync --extra probes
+uv run python scripts/collect_activations.py --name 3M-backtracking-packing
+```
+
+This writes the uncompressed companion arrays:
+
+```text
+results/3M-backtracking-packing/activations_acts_post_mlp.npy
+results/3M-backtracking-packing/activations_acts_post_attn.npy
+```
+
+These files are large and intentionally not shipped. Once they exist, regenerate
+the paper figures with:
+
+```bash
+plots/run_figures.sh
+```
+
+Individual paper figure and ablation scripts live in `plots/scripts/` and can
+also be run directly with `uv run python ...`.
+
+Figure data caches are written to `plots/data/`; rendered figures are written to
+`plots/figures/`.
+
+### Optional Retraining
+
+For Colab retraining, use `training-loop.ipynb`. The notebook expects the trace
+dataset at the repository root:
+
+```text
+bt_traces_3m.npz
+```
+
+If you downloaded it under `data/`, copy or symlink it before running training:
+
+```bash
+cp data/bt_traces_3m.npz ./bt_traces_3m.npz
+```
+
+The notebook writes `experiments_local.py` with
+`traces_path="bt_traces_3m.npz"`, trains `3M-backtracking-packing`, and archives
+checkpoints/results to Google Drive.
+
 
 ## What Is In This Repo
 
 - A Flax/JAX transformer implementation for Sudoku traces.
 - Training, evaluation, activation collection, and probe-fitting scripts.
 - A probe framework for cell, candidate, and structure-level linear probes.
-- A set of notebooks for the current analysis workflow.
-
-Large experiment artifacts are not included. Checkpoints, activation caches,
-generated arrays, plots, datasets, and scratch analyses live locally under paths
-such as `results/`, `data/`, and `playground/`. The trace dataset is not included neither, for all of this -- contact me.
+- Paper figure and ablation scripts under `plots/scripts/`.
 
 ## Setup
 
@@ -116,7 +174,6 @@ The probe framework in `sudoku/probes/` includes:
 - `state_filled`: which digit is in a filled cell.
 - `candidates`: candidate digits for empty cells.
 - `structure`: row/column/box digit-presence features.
-- `cell_temporal` and `cell_compare`: cell-specific temporal/comparison probes.
 
 For notebook work, `ProbeSession` is the main entry point:
 
@@ -129,33 +186,3 @@ acts = session.acts(idx, layer=4)
 grids = session.grids(idx)
 train_mask, test_mask = session.split(idx)
 ```
-
-## Notebooks
-
-Tracked notebooks are intended to be the current, cleaned analysis surface. They
-expect local activation caches and checkpoints under `results/`.
-
-- `notebooks/mse_cell_candidate_degradation.ipynb`  
-  Trains cell candidate probes at the initial board state and measures how
-  predictions degrade as the board fills.
-
-- `notebooks/mse_structure_degradation.ipynb`  
-  Repeats the degradation analysis for row, column, and box structure probes.
-
-- `notebooks/probe_prediction_viewers.ipynb`  
-  Interactive viewer for cell candidate probe predictions, including cosine
-  similarity maps between cell-probe weight vectors.
-
-- `notebooks/structure_probe_viewer.ipynb`  
-  Interactive viewer for row/column/box candidate-probe predictions.
-
-- `notebooks/activation_patching_substructure.ipynb`  
-  Uses substructure probe directions as residual-stream interventions.
-
-- `notebooks/logit_lens_unembedding_viewer.ipynb`  
-  Browses layerwise unembedding/logit-lens behavior across puzzle positions.
-
-- `notebooks/head_dla.ipynb`  
-  Computes direct logit attribution for attention heads and includes a
-  selected-head follow-up workflow for signed DLA, conditional structure splits,
-  and head-output probes.
