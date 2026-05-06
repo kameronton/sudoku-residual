@@ -69,18 +69,20 @@ def compute_data(args) -> pd.DataFrame:
         rows += [
             {"Layer": l + 1, "AUC": np.nanmean(state_auc[l]),   "MSE": np.nanmean(state_brier[l]),   "Probe": "cell state"},
             {"Layer": l + 1, "AUC": np.nanmean(cand_auc[l]),    "MSE": np.nanmean(cand_brier[l]),    "Probe": "cell candidates"},
-            {"Layer": l + 1, "AUC": np.nanmean(struct_auc_vals), "MSE": np.nanmean(struct_mse_vals), "Probe": "substructure candidates"},
+            {"Layer": l + 1, "AUC": np.nanmean(struct_auc_vals), "MSE": np.nanmean(struct_mse_vals), "Probe": "substructure state"},
         ]
     return pd.DataFrame(rows)
 
 
 def plot(df: pd.DataFrame):
+    df = df.copy()
     layer_labels = sorted(df["Layer"].unique())
 
     fig_auc, ax_auc = plt.subplots(figsize=(4, 2.2))
     sns.lineplot(data=df, x="Layer", y="AUC", hue="Probe", style="Probe",
                  markers=["o", "s", "^"], dashes=False, ax=ax_auc)
     ax_auc.set_xticks(layer_labels)
+    ax_auc.set_xticklabels([f"L{layer}" for layer in layer_labels])
     ax_auc.set_ylim(0.8, 1.02)
     ax_auc.legend(frameon=False)
     sns.despine(fig_auc)
@@ -92,6 +94,7 @@ def plot(df: pd.DataFrame):
     sns.lineplot(data=df, x="Layer", y="MSE", hue="Probe", style="Probe",
                  markers=["o", "s", "^"], dashes=False, ax=ax_mse)
     ax_mse.set_xticks(layer_labels)
+    ax_mse.set_xticklabels([f"L{layer}" for layer in layer_labels])
     ax_mse.set_ylim(bottom=-0.005)
     ax_mse.legend(frameon=False)
     sns.despine(fig_mse)

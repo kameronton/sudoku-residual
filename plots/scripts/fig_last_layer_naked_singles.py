@@ -269,9 +269,9 @@ def _logit_lens(pi: int, sp: int, session: ProbeSession, session_attn: ProbeSess
     labels = ["Emb"]
     for l in range(n_layers):
         resids.append(session_attn.acts(idx, layer=l))
-        labels.append(f"L{l}_attn")
+        labels.append(f"L{l + 1}_attn")
         resids.append(session.acts(idx, layer=l))
-        labels.append(f"L{l}_mlp")
+        labels.append(f"L{l + 1}_mlp")
 
     all_resids = np.vstack(resids)                              # (2*n_layers+1, d_model)
     return labels, _final_logits(all_resids, params)[:, :729]  # (n_steps, 729)
