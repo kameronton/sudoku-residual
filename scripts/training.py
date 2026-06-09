@@ -21,6 +21,10 @@ from sudoku.data import PAD_TOKEN, SEP_TOKEN, encode_fill, MAX_SEQ_LEN, VOCAB_SI
 from sudoku.data_bt import VOCAB_SIZE_BT
 from sudoku.model import GPT2Model, TransformerConfig
 from sudoku.visualize import print_grid
+from sudoku.activations import collect_activations
+from sudoku.probes.probing import prepare_probe_inputs, run_structure_probe_loop
+from sudoku.activations import make_intermediates_fn
+
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +57,8 @@ class TrainConfig:
     schedule_frac: float = 1.0     # fraction of total_steps over which schedule runs; remainder holds at end_value
     loss_mask: str = "after_clues"  # "all" or "after_clues"
     pack_len: int = 0              # >0 enables sequence packing; sets context window length
+    probe_every : int = 0 
+    n_probe_puzzles : int = 500 
 
 
 class TrainLogger:
@@ -67,6 +73,7 @@ class TrainLogger:
         self.total_meaningful_tokens: int = 0
         self.total_puzzles: int = 0
         self._t0: float = time.time()
+        self.probe_log: list[dict] = []
 
     def log_eval(self, step: int, epoch: float, train_loss: float, val_loss: float):
         self.entries.append({
@@ -76,6 +83,13 @@ class TrainLogger:
             "val_loss": val_loss,
             "total_puzzles": self.total_puzzles,
             "total_meaningful_tokens": self.total_meaningful_tokens,
+        })
+    
+    def log_probes(self, step: int, mean_auc : dict, elapsed_s: float):
+        self.probe_log.append({
+            "step": step,
+            "mean_auc_per_layer" : {str(k): v for k, v in mean_auc.items()},
+            "elapsed_s" : elapsed_s,
         })
 
     def log_checkpoint(self, step: int):
@@ -111,6 +125,7 @@ class TrainLogger:
             "total_meaningful_tokens": self.total_meaningful_tokens,
             "total_puzzles": self.total_puzzles,
             "summary": self.summary(),
+            "probe_log" : self.probe_log, 
         }
         tmp = self.log_path + ".tmp"
         with open(tmp, "w") as f:
@@ -336,6 +351,21 @@ def train_step_packed(state, batch, is_trace, doc_ids, positions):
     state = state.apply_gradients(grads=grads)
     return state, loss
 
+def eval_probes(intermediates_fn, params, probe_seqs, probe_puzzles, n_clues_probe, batch_size=64):
+    """Probe the model at [clues_end] and return (mean_auc_per_layer, timee)."""
+
+    t0 = time.time()
+    activations = collect_activations(intermediates_fn, params, probe_seqs, batch_size)["post_mlp"]
+    acts, probe_grids, probe_positions, keep = prepare_probe_inputs(
+        activations, probe_puzzles, probe_seqs, n_clues_probe, step=0,
+    )
+    all_scores, _ = run_structure_probe_loop(acts, probe_grids, probe_positions, keep=keep)
+    mean_auc = {
+        layer: float(np.nanmean([v for scores in s.values() for v in scores]))
+        for layer, s in all_scores.items()
+    }
+    return mean_auc, time.time() - t0
+
 
 def train(cfg: TrainConfig):
     # Seed everything
@@ -487,6 +517,23 @@ def train(cfg: TrainConfig):
     logger = TrainLogger(log_path=cfg.log_path, tokens_per_step=tokens_per_step)
     logger.total_tokens = start_step * tokens_per_step
 
+    # Setup probes
+    intermediates_fn = probe_seqs = probe_puzzles_list = n_clues_probe = None
+    if cfg.probe_every > 0:
+        model = GPT2Model(model_cfg)
+        intermediates_fn = make_intermediates_fn(model)
+        tp = np.load(cfg.traces_path)
+        # bt_traces_3m.npz has train/val but not necessarily test — fall back to val
+        _seq_key = "sequences_test" if "sequences_test" in tp else "sequences_val"
+        _puz_key = "puzzles_test"   if "puzzles_test"   in tp else "puzzles_val"
+        _nc_key  = "n_clues_test"   if "n_clues_test"   in tp else "n_clues_val"
+        n = min(cfg.n_probe_puzzles, tp[_seq_key].shape[0])
+        probe_puzzles_list = list(tp[_puz_key][:n])
+        n_clues_probe = tp[_nc_key][:n].astype(np.int32)
+        seqs_raw = tp[_seq_key][:n]
+        probe_seqs = [row[row != pad_token].tolist() for row in seqs_raw]
+        print(f"Probes : {n} puzzles ({_seq_key})", flush=True)
+
     # Training loop with tqdm
     print("Compiling train_step...", flush=True)
     pbar = tqdm(
@@ -595,6 +642,16 @@ def train(cfg: TrainConfig):
                         f" | meaningful_tok={logger.total_meaningful_tokens:,}"
                     )
 
+                if cfg.probe_every > 0 and step % cfg.probe_every == 0:
+                    mean_auc, probe_time = eval_probes(
+                        intermediates_fn, state.params,
+                        probe_seqs, probe_puzzles_list, n_clues_probe,
+                    )
+                    logger.log_probes(step, mean_auc, probe_time)
+                    logger.save()
+                    auc_str = "  ".join(f"L{l}={v:.3f}" for l, v in sorted(mean_auc.items()))
+                    tqdm.write(f"  probes ({probe_time:.1f}s) : {auc_str}")
+
                 if ckpt_every > 0 and step % ckpt_every == 0:
                     save_checkpoint(step)
 
@@ -636,6 +693,16 @@ def train(cfg: TrainConfig):
                         f"  step {step:>6d} | train={train_loss:.4f} | val={val_loss:.4f}"
                         f" | epoch={epoch_float:.2f} | puzzles={logger.total_puzzles:,}"
                     )
+
+                if cfg.probe_every > 0 and step % cfg.probe_every == 0:
+                    mean_auc, probe_time = eval_probes(
+                        intermediates_fn, state.params,
+                        probe_seqs, probe_puzzles_list, n_clues_probe,
+                    )
+                    logger.log_probes(step, mean_auc, probe_time)
+                    logger.save()
+                    auc_str = "  ".join(f"L{l}={v:.3f}" for l, v in sorted(mean_auc.items()))
+                    tqdm.write(f"  probes ({probe_time:.1f}s) : {auc_str}")
 
                 if ckpt_every > 0 and step % ckpt_every == 0:
                     save_checkpoint(step)
