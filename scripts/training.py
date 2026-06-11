@@ -349,6 +349,9 @@ def train_step_packed(state, batch, is_trace, doc_ids, positions):
 
 def eval_probes(intermediates_fn, params, probe_seqs, probe_puzzles, n_clues_probe, batch_size=64):
     """Structure + cell probes at [clues_end]. Returns a result dict with AUC and timing breakdown."""
+    import io, warnings
+    from sklearn.exceptions import ConvergenceWarning
+
     times = {}
 
     t0 = time.time()
@@ -358,13 +361,20 @@ def eval_probes(intermediates_fn, params, probe_seqs, probe_puzzles, n_clues_pro
     )
     times["forward_pass_s"] = round(time.time() - t0, 2)
 
-    t0 = time.time()
-    struct_scores, _ = run_structure_probe_loop(acts, probe_grids, probe_positions, keep=keep)
-    times["structure_probes_s"] = round(time.time() - t0, 2)
+    # Silence sklearn convergence warnings and per-layer print spam
+    with warnings.catch_warnings(), io.StringIO() as _sink:
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        import sys; _old, sys.stdout = sys.stdout, _sink
 
-    t0 = time.time()
-    cell_auc, _, _ = run_probe_loop(acts, probe_grids, probe_positions, mode="state_filled", keep=keep)
-    times["cell_probes_s"] = round(time.time() - t0, 2)
+        t0 = time.time()
+        struct_scores, _ = run_structure_probe_loop(acts, probe_grids, probe_positions, keep=keep)
+        times["structure_probes_s"] = round(time.time() - t0, 2)
+
+        t0 = time.time()
+        cell_auc, _, _ = run_probe_loop(acts, probe_grids, probe_positions, mode="state_filled", keep=keep)
+        times["cell_probes_s"] = round(time.time() - t0, 2)
+
+        sys.stdout = _old
 
     times["total_s"] = round(sum(times.values()), 2)
 
