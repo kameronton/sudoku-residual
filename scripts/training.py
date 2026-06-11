@@ -22,7 +22,7 @@ from sudoku.data_bt import VOCAB_SIZE_BT
 from sudoku.model import GPT2Model, TransformerConfig
 from sudoku.visualize import print_grid
 from sudoku.activations import collect_activations
-from sudoku.probes.probing import prepare_probe_inputs, run_structure_probe_loop
+from sudoku.probes.probing import prepare_probe_inputs, run_structure_probe_loop, run_probe_loop
 from sudoku.activations import make_intermediates_fn
 
 
@@ -85,12 +85,8 @@ class TrainLogger:
             "total_meaningful_tokens": self.total_meaningful_tokens,
         })
     
-    def log_probes(self, step: int, mean_auc : dict, elapsed_s: float):
-        self.probe_log.append({
-            "step": step,
-            "mean_auc_per_layer" : {str(k): v for k, v in mean_auc.items()},
-            "elapsed_s" : elapsed_s,
-        })
+    def log_probes(self, step: int, result: dict):
+        self.probe_log.append({"step": step, **result})
 
     def log_checkpoint(self, step: int):
         self.checkpoints.append(step)
@@ -352,19 +348,40 @@ def train_step_packed(state, batch, is_trace, doc_ids, positions):
     return state, loss
 
 def eval_probes(intermediates_fn, params, probe_seqs, probe_puzzles, n_clues_probe, batch_size=64):
-    """Probe the model at [clues_end] and return (mean_auc_per_layer, timee)."""
+    """Structure + cell probes at [clues_end]. Returns a result dict with AUC and timing breakdown."""
+    times = {}
 
     t0 = time.time()
     activations = collect_activations(intermediates_fn, params, probe_seqs, batch_size)["post_mlp"]
     acts, probe_grids, probe_positions, keep = prepare_probe_inputs(
         activations, probe_puzzles, probe_seqs, n_clues_probe, step=0,
     )
-    all_scores, _ = run_structure_probe_loop(acts, probe_grids, probe_positions, keep=keep)
-    mean_auc = {
-        layer: float(np.nanmean([v for scores in s.values() for v in scores]))
-        for layer, s in all_scores.items()
+    times["forward_pass_s"] = round(time.time() - t0, 2)
+
+    t0 = time.time()
+    struct_scores, _ = run_structure_probe_loop(acts, probe_grids, probe_positions, keep=keep)
+    times["structure_probes_s"] = round(time.time() - t0, 2)
+
+    t0 = time.time()
+    cell_auc, _, _ = run_probe_loop(acts, probe_grids, probe_positions, mode="state_filled", keep=keep)
+    times["cell_probes_s"] = round(time.time() - t0, 2)
+
+    times["total_s"] = round(sum(times.values()), 2)
+
+    return {
+        "times": times,
+        "structure_auc": {
+            str(layer): {
+                subtype: [round(v, 4) for v in scores]
+                for subtype, scores in s.items()
+            }
+            for layer, s in struct_scores.items()
+        },
+        "cell_auc": {
+            str(layer): [round(float(v), 4) for v in aucs]
+            for layer, aucs in cell_auc.items()
+        },
     }
-    return mean_auc, time.time() - t0
 
 
 def train(cfg: TrainConfig):
@@ -523,7 +540,6 @@ def train(cfg: TrainConfig):
         model = GPT2Model(model_cfg)
         intermediates_fn = make_intermediates_fn(model)
         tp = np.load(cfg.traces_path)
-        # bt_traces_3m.npz has train/val but not necessarily test — fall back to val
         _seq_key = "sequences_test" if "sequences_test" in tp else "sequences_val"
         _puz_key = "puzzles_test"   if "puzzles_test"   in tp else "puzzles_val"
         _nc_key  = "n_clues_test"   if "n_clues_test"   in tp else "n_clues_val"
@@ -643,14 +659,19 @@ def train(cfg: TrainConfig):
                     )
 
                 if cfg.probe_every > 0 and step % cfg.probe_every == 0:
-                    mean_auc, probe_time = eval_probes(
+                    result = eval_probes(
                         intermediates_fn, state.params,
                         probe_seqs, probe_puzzles_list, n_clues_probe,
                     )
-                    logger.log_probes(step, mean_auc, probe_time)
+                    logger.log_probes(step, result)
                     logger.save()
-                    auc_str = "  ".join(f"L{l}={v:.3f}" for l, v in sorted(mean_auc.items()))
-                    tqdm.write(f"  probes ({probe_time:.1f}s) : {auc_str}")
+                    t = result["times"]
+                    tqdm.write(
+                        f"  probes (total={t['total_s']}s : "
+                        f"forward={t['forward_pass_s']}s "
+                        f"structure={t['structure_probes_s']}s "
+                        f"cell={t['cell_probes_s']}s)"
+                    )
 
                 if ckpt_every > 0 and step % ckpt_every == 0:
                     save_checkpoint(step)
@@ -695,14 +716,19 @@ def train(cfg: TrainConfig):
                     )
 
                 if cfg.probe_every > 0 and step % cfg.probe_every == 0:
-                    mean_auc, probe_time = eval_probes(
+                    result = eval_probes(
                         intermediates_fn, state.params,
                         probe_seqs, probe_puzzles_list, n_clues_probe,
                     )
-                    logger.log_probes(step, mean_auc, probe_time)
+                    logger.log_probes(step, result)
                     logger.save()
-                    auc_str = "  ".join(f"L{l}={v:.3f}" for l, v in sorted(mean_auc.items()))
-                    tqdm.write(f"  probes ({probe_time:.1f}s) : {auc_str}")
+                    t = result["times"]
+                    tqdm.write(
+                        f"  probes (total={t['total_s']}s : "
+                        f"forward={t['forward_pass_s']}s "
+                        f"structure={t['structure_probes_s']}s "
+                        f"cell={t['cell_probes_s']}s)"
+                    )
 
                 if ckpt_every > 0 and step % ckpt_every == 0:
                     save_checkpoint(step)
