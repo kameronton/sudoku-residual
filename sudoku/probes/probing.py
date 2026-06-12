@@ -16,9 +16,7 @@ Public API:
 """
 
 import numpy as np
-from joblib import Parallel, delayed
 from sklearn.model_selection import train_test_split
-from threadpoolctl import threadpool_limits
 
 from sudoku.data import SEP_TOKEN
 from sudoku.data_bt import PUSH_TOKEN, POP_TOKEN
@@ -161,16 +159,13 @@ def probe_layer(
     if isinstance(mode, str):
         mode = MODES[mode]
     acts = get_activations_at_positions(activations, positions, layer, keep=keep, use_deltas=use_deltas)
-
-    def _one_cell(cell):
+    accs, briers, per_digit = [], [], []
+    for cell in range(81):
         auc, brier, _, pda, _ = probe_cell(acts, grids, cell, mode)
-        return auc, brier, pda
-
-    with threadpool_limits(limits=1):
-        results = Parallel(n_jobs=-1, prefer="threads")(delayed(_one_cell)(c) for c in range(81))
-    accs = [r[0] for r in results]
-    briers = [r[1] for r in results]
-    per_digit = [r[2] for r in results if r[2] is not None]
+        accs.append(auc)
+        briers.append(brier)
+        if pda is not None:
+            per_digit.append(pda)
     return accs, (per_digit if per_digit else None), briers
 
 
@@ -185,21 +180,13 @@ def probe_structure_layer(
 ) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
     """Probe all rows/cols/boxes for one layer. Returns (scores, briers)."""
     acts = get_activations_at_positions(activations, positions, layer, keep=keep, use_deltas=use_deltas)
-
-    def _one(subtype, idx):
-        auc, brier = probe_structure(acts, grids, subtype, idx)
-        return subtype, idx, auc, brier
-
-    tasks = [(st, i) for st in ("row", "col", "box") for i in range(9)]
-    with threadpool_limits(limits=1):
-        raw = Parallel(n_jobs=-1, prefer="threads")(delayed(_one)(st, i) for st, i in tasks)
-
-    _order = {"row": 0, "col": 1, "box": 2}
     scores: dict[str, list[float]] = {"row": [], "col": [], "box": []}
     briers: dict[str, list[float]] = {"row": [], "col": [], "box": []}
-    for subtype, idx, auc, brier in sorted(raw, key=lambda x: _order[x[0]] * 9 + x[1]):
-        scores[subtype].append(auc)
-        briers[subtype].append(brier)
+    for subtype in ("row", "col", "box"):
+        for idx in range(9):
+            auc, brier = probe_structure(acts, grids, subtype, idx)
+            scores[subtype].append(auc)
+            briers[subtype].append(brier)
     return scores, briers
 
 
