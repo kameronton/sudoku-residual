@@ -18,6 +18,7 @@ Public API:
 import numpy as np
 from joblib import Parallel, delayed
 from sklearn.model_selection import train_test_split
+from threadpoolctl import threadpool_limits
 
 from sudoku.data import SEP_TOKEN
 from sudoku.data_bt import PUSH_TOKEN, POP_TOKEN
@@ -165,7 +166,8 @@ def probe_layer(
         auc, brier, _, pda, _ = probe_cell(acts, grids, cell, mode)
         return auc, brier, pda
 
-    results = Parallel(n_jobs=-1, prefer="threads")(delayed(_one_cell)(c) for c in range(81))
+    with threadpool_limits(limits=1):
+        results = Parallel(n_jobs=-1, prefer="threads")(delayed(_one_cell)(c) for c in range(81))
     accs = [r[0] for r in results]
     briers = [r[1] for r in results]
     per_digit = [r[2] for r in results if r[2] is not None]
@@ -189,7 +191,8 @@ def probe_structure_layer(
         return subtype, idx, auc, brier
 
     tasks = [(st, i) for st in ("row", "col", "box") for i in range(9)]
-    raw = Parallel(n_jobs=-1, prefer="threads")(delayed(_one)(st, i) for st, i in tasks)
+    with threadpool_limits(limits=1):
+        raw = Parallel(n_jobs=-1, prefer="threads")(delayed(_one)(st, i) for st, i in tasks)
 
     _order = {"row": 0, "col": 1, "box": 2}
     scores: dict[str, list[float]] = {"row": [], "col": [], "box": []}
