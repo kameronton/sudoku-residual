@@ -34,7 +34,7 @@ def _cell_labels(puzzles: list[str], cell_idx: int) -> np.ndarray:
 
 
 def _fit_multilabel(X_train: np.ndarray, y_train: np.ndarray):
-    clf = MultiOutputClassifier(_make_lr(), n_jobs=-1)
+    clf = MultiOutputClassifier(_make_lr(), n_jobs=1)
     clf.fit(X_train, y_train.astype(int))
     return clf
 
