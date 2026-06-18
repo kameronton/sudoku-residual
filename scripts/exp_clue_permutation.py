@@ -32,7 +32,7 @@ def cos(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def _plot(res: dict, path: str) -> None:
-    """Figure : cos(perm), cos(autre) et score d'invariance par couche."""
+    """Figure 2 panneaux : cos par couche (avec std intra-classe) + std intra-classe seule."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -40,22 +40,32 @@ def _plot(res: dict, path: str) -> None:
     except ImportError:
         print("matplotlib non installe -- figure ignoree (uv pip install matplotlib).")
         return
-    layers = [d["layer"] for d in res["layers"]]
-    cp = [d["cos_perm"] for d in res["layers"]]
-    co = [d["cos_other"] for d in res["layers"]]
-    inv = [d["invariance"] for d in res["layers"]]
-    plt.figure(figsize=(7, 4.5))
-    plt.plot(layers, cp, "o-", label="cos(perm) -- meme grille, ordre permute")
-    plt.plot(layers, co, "s--", label="cos(autre) -- autre grille, meme #indices")
-    plt.plot(layers, inv, "^:", color="green", label="score d'invariance")
-    plt.xlabel("couche")
-    plt.ylabel("similarite cosinus")
-    plt.ylim(-0.05, 1.05)
-    plt.title("Invariance a l'ordre des indices (residual stream, position SEP)")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
+    L = res["layers"]
+    layers = [d["layer"] for d in L]
+    cp = np.array([d["cos_perm"] for d in L])
+    co = np.array([d["cos_other"] for d in L])
+    inv = np.array([d["invariance"] for d in L])
+    istd = np.array([d["intra_std"] for d in L])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
+    ax1.errorbar(layers, cp, yerr=istd, fmt="o-", capsize=3,
+                 label="cos(perm) +/- std intra-classe")
+    ax1.plot(layers, co, "s--", label="cos(autre) -- autre grille, meme #indices")
+    ax1.plot(layers, inv, "^:", color="green", label="score d'invariance")
+    ax1.set_ylabel("similarite cosinus")
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.set_title("Invariance a l'ordre des indices (position SEP)")
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+
+    ax2.plot(layers, istd, "o-", color="purple")
+    ax2.set_xlabel("couche")
+    ax2.set_ylabel("std intra-classe de cos(perm)")
+    ax2.set_title("Dispersion intra-classe (sur les K permutations d'une meme grille)")
+    ax2.grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
     print(f"Figure : {path}")
 
 
@@ -114,6 +124,18 @@ def main() -> None:
         [cos(canon_by_idx[gi], v) for gi, v in zip(perm_owner, sep_perm)], 0
     )  # (n_perm, n_layers)
 
+    # variance INTRA-CLASSE (Roman) : pour chaque grille, variance des K cosinus
+    # sur ses permutations, puis moyenne sur les grilles. D'autant mieux estimee
+    # que K (permutations par grille) est grand.
+    rows_by_grid: dict[int, list[np.ndarray]] = {}
+    for i, gi in enumerate(perm_owner):
+        rows_by_grid.setdefault(gi, []).append(within[i])     # (n_layers,)
+    per_grid_var = np.stack(
+        [np.stack(rows, 0).var(axis=0) for rows in rows_by_grid.values()], 0
+    )  # (n_grilles, n_layers)
+    intra_var = per_grid_var.mean(0)              # (n_layers,) variance intra-classe moyenne
+    intra_std = np.sqrt(per_grid_var).mean(0)     # (n_layers,) ecart-type intra-classe moyen
+
     # across-puzzle : cos entre grilles DIFFÉRENTES mais de MÊME nombre d'indices
     # (sinon la position du SEP / le compte d'indices biaiserait la baseline).
     canon_arr = np.stack([v for _, v, _ in sep_canon], 0)   # (n, n_layers, d)
@@ -137,16 +159,19 @@ def main() -> None:
     across = cos(canon_arr[pairs[:, 0]], canon_arr[pairs[:, 1]])   # (4000, n_layers)
 
     res = {"n_layers": int(n_layers), "n_puzzles": len(puzzles), "k": args.k, "layers": []}
-    print(f"\n{'couche':>6} | {'cos(perm)':>10} | {'cos(autre)':>11} | {'invariance':>11}")
-    print("-" * 48)
+    print(f"\n{'couche':>6} | {'cos(perm)':>10} | {'std intra':>10} | {'cos(autre)':>11} | {'invariance':>11}")
+    print("-" * 60)
     for layer in range(n_layers):
         w = float(within[:, layer].mean())
         a = float(across[:, layer].mean())
-        score = (w - a) / (1 - a + 1e-9)   
-        res["layers"].append(
-            {"layer": layer, "cos_perm": w, "cos_other": a, "invariance": score}
-        )
-        print(f"{layer:>6} | {w:>10.3f} | {a:>11.3f} | {score:>11.3f}")
+        isd = float(intra_std[layer])
+        score = (w - a) / (1 - a + 1e-9)
+        res["layers"].append({
+            "layer": layer, "cos_perm": w,
+            "intra_var": float(intra_var[layer]), "intra_std": isd,
+            "cos_other": a, "invariance": score,
+        })
+        print(f"{layer:>6} | {w:>10.3f} | {isd:>10.4f} | {a:>11.3f} | {score:>11.3f}")
 
     with open(args.out, "w") as f:
         json.dump(res, f, indent=2)
